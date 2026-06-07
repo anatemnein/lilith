@@ -1,0 +1,31 @@
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Engagement data — never commit real target config
+engagement.yaml
+
+# Built artifacts — workspace outputs
+*.enc
+*.dat
+*.bin
+*.ps1
+stager_*.ps1
+runner_c.meta
+server.crt
+server.key
+byovd.exe
+
+# Personal session notes — not part of the framework
+session.txt
+session2.txt
+todo.txt
+reverse_shell_example.md
+find_payload.txt
+
+# Third-party tool collections — users supply their own binaries after cloning
+# See README: "Binary not found for a tool" → place .exe in ./windows/ or ./potatoes/
+windows/
+potatoes/
+windows-binaries/

