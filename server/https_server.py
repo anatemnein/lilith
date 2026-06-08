@@ -29,6 +29,7 @@ import time
 import secrets
 import threading
 import collections
+import hashlib
 import socketserver
 from datetime import datetime, timedelta
 
@@ -204,7 +205,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type",   mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Last-Modified",  "Tue, 15 Jan 2025 08:00:00 GMT")
-        self.send_header("ETag",           f'"{len(data):x}-{hash(data) & 0xFFFFFFFF:x}"')
+        self.send_header("ETag",           f'"{len(data):x}-{hashlib.md5(data).hexdigest()[:8]}"')
         self.end_headers()
         self.wfile.write(data)
 
