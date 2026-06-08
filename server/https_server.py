@@ -64,6 +64,11 @@ _MIME = {
     ".xml":  "application/xml",
     ".json": "application/json",
     ".msi":  "application/x-msi",
+    ".html": "text/html; charset=utf-8",
+    ".js":   "application/javascript",
+    ".apk":  "application/vnd.android.package-archive",
+    ".sh":   "text/plain; charset=utf-8",
+    ".elf":  "application/octet-stream",
 }
 
 _EXFIL_LOG: list[tuple[str, str, str]] = []

