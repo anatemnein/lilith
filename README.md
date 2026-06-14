@@ -698,7 +698,7 @@ Install from an active C2 session. Each trigger re-downloads and re-executes the
 | `--persist schtask` | Scheduled task | User logon, HighestAvailable | None |
 | `--persist wmi` | WMI CommandLine Event Consumer | Interactive logon (explorer.exe start) | Admin / SYSTEM |
 
-All three embed the payload as base64 `-enc` — no plaintext URLs or PowerShell in registry/WMI at rest. Random name per install. Embedded payload is a compact XOR-obfuscated one-liner (<300 bytes base64).
+All three embed the payload as base64 `-enc` — no plaintext URLs or PowerShell in registry/WMI at rest. Random name per install. Embedded payload is a compact XOR-obfuscated one-liner (~1.5 KB base64) that fetches and executes the C2 stager via `Net.Sockets.TcpClient` + `Net.Security.SslStream` — no WinHTTP COM activation event.
 
 ```bash
 python3 lilith.py c2 --session <ID> --persist run
@@ -923,7 +923,7 @@ The watchdog immediately injects a backup agent. Expected behavior. Kill unwante
 - Config strings re-encrypted in memory immediately after use
 - PPID-spoofed spawn target rotates per invocation
 - WMI persistence uses `Win32_ProcessStartTrace` logon trigger (not the commonly-swept uptime trigger)
-- Persistence values stored as base64 `-enc` — no plaintext URLs or commands in registry/WMI at rest
+- Persistence values stored as base64 `-enc` — no plaintext URLs or commands in registry/WMI at rest; payload fetches stager via SslStream (no WinHTTP COM, no COM activation event in telemetry)
 - Potato chain spawns `powershell.exe` directly — no `cmd.exe` intermediary
 - USB HID payloads contain no hardcoded URLs or tool names — stager URL is XOR-encoded in the keystroke payload
 
