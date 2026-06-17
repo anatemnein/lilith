@@ -10,6 +10,7 @@ _HERE     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WIN_BINS = os.path.join(_HERE, "windows")
 _POT_BINS = os.path.join(_HERE, "potatoes")
 _LEGACY   = os.path.join(_HERE, "windows-binaries")
+_RP_BINS  = os.path.join(_HERE, "RoguePlanet")
 
 
 def _win(*name):
@@ -100,6 +101,11 @@ TOOL_CATALOG: dict[str, dict] = {
         "default_params": "-r LHOST -e cmd.exe -l 9999",
         "desc": "SeImpersonate → SYSTEM via OXID resolver",
         "lhost_placeholder": True,
+    },
+    "RoguePlanet": {
+        "paths": [os.path.join(_RP_BINS, "RoguePlanet.exe"), *_pot("RoguePlanet.exe")],
+        "default_params": "",
+        "desc": "WD race condition → SYSTEM (Win10/11, no Server, race-condition LPE)",
     },
     "KrbRelayUp": {
         "paths": _win("KrbRelayUp.exe"),
