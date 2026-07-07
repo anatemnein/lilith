@@ -34,6 +34,7 @@ import socketserver
 from datetime import datetime, timedelta
 
 from server.certs import ensure_certs
+from server.ui import handle_ui_request as _handle_ui
 
 # ── IIS/Schannel TLS cipher preference ──────────────────────────────────────
 _IIS_CIPHERS = (
@@ -192,6 +193,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._handle_agent_sc()
             return
 
+        # Purple team web UI
+        if raw_path.startswith("/ui"):
+            db = _ENGAGE_DB
+            if db is None:
+                body = b'{"error":"db not initialized"}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            status, ct, resp = _handle_ui("GET", self.path, b"", db)
+            self.send_response(status)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
         # File serve: any CDN-like path resolves to workspace basename
         basename = os.path.basename(raw_path)
         full = os.path.join(self.workspace, basename)
@@ -229,6 +249,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", 0))
         body_raw = self.rfile.read(length) if length else b""
+
+        # Purple team web UI (POST — label endpoint)
+        if raw_path.startswith("/ui"):
+            db = _ENGAGE_DB
+            if db is None:
+                body = b'{"error":"db not initialized"}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            status, ct, resp = _handle_ui("POST", raw_path, body_raw, db)
+            self.send_response(status)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
 
         # C2 agent registration: POST .../c2/register
         if raw_path.endswith("/c2/register"):
@@ -585,6 +624,7 @@ def start_server(
     print(f"    Mgmt API  : http://127.0.0.1:{mgmt_port}/mgmt/...")
     print(f"    Headers   : Server: Microsoft-IIS/10.0")
     print(f"    Ciphers   : IIS/Schannel order (JA3S mimicry)")
+    print(f"    UI        : https://{lhost}:{port}/ui/")
     print(f"    Ctrl+C to stop\n")
 
     try:
