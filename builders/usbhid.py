@@ -202,7 +202,7 @@ def build_usb_payload(
 
     stager_url    : full HTTPS URL to the stager .ps1 served by 'lilith serve'
     output_dir    : directory to write the payload file(s) into
-    device        : 'duck' | 'pico' | 'digispark' | 'all'
+    device        : 'duck' | 'pico' | 'digispark' | 'teembed' | 'all'
     boot_delay_ms : USB enumeration + HID driver wait (increase for slow targets)
     """
     os.makedirs(output_dir, exist_ok=True)
