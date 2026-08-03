@@ -75,7 +75,8 @@ _MIME = {
 }
 
 _EXFIL_LOG: list[tuple[str, str, str]] = []
-_START_TIME = time.time()
+_START_TIME  = time.time()
+_SERVER_BASE = "https://localhost:8443"   # overwritten by start_server
 
 # ── Web UI auth ──────────────────────────────────────────────────────────────
 _UI_TOKEN    = ""           # empty → auth disabled
@@ -778,9 +779,11 @@ def start_server(
         print("[!] TLS cert generation failed — cannot start server")
         return
 
+    global _SERVER_BASE
     _Handler.workspace       = workspace
     _Handler.callback_prefix = callback_prefix
     _set_ui_workspace(workspace)
+    _SERVER_BASE = f"https://{lhost if lhost != '0.0.0.0' else 'localhost'}:{port}"
 
     class _ThreadedHTTPS(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True
