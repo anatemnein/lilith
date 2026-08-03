@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import shutil
 
-from core.encoding import pack_enc
+from core.encoding import pack_enc, find_donut as _find_donut
 
 _HERE     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WIN_BINS = os.path.join(_HERE, "windows")
@@ -220,16 +220,6 @@ def find_tool_icase(name: str) -> str | None:
     for k in TOOL_CATALOG:
         if k.lower() == name.lower():
             return k
-    return None
-
-
-def _find_donut() -> str | None:
-    for candidate in ("donut", "/opt/donut/donut", "/usr/bin/donut"):
-        found = shutil.which(candidate)
-        if found:
-            return found
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
     return None
 
 

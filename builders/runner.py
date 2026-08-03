@@ -19,6 +19,8 @@ import tempfile
 import argparse
 import sys
 
+from core.encoding import find_donut as _find_donut
+
 _TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates", "runner_template.c")
 _CC       = "x86_64-w64-mingw32-gcc"
 
@@ -454,15 +456,6 @@ def build_runner(
     shutil.rmtree(tmpdir)
     return True, xor_key
 
-
-def _find_donut() -> str | None:
-    for candidate in ("donut", "/opt/donut/donut", "/usr/bin/donut"):
-        found = shutil.which(candidate)
-        if found:
-            return found
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
 
 
 def _donut_shellcode(runner_exe: str, params: str | None) -> bytes | None:

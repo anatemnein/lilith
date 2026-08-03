@@ -1,5 +1,7 @@
 import base64
+import os
 import random
+import shutil
 
 
 def xor_encode(data: bytes, key: int) -> bytes:
@@ -23,3 +25,14 @@ def unpack_enc(data: bytes) -> bytes:
     mid  = xor_encode(raw[1:], k1)
     k2   = mid[0]
     return xor_encode(mid[1:], k2)
+
+
+def find_donut() -> str | None:
+    """Locate the donut binary, checking PATH then common fixed paths."""
+    for candidate in ("donut", "/opt/donut/donut", "/usr/bin/donut"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
