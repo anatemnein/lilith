@@ -284,6 +284,54 @@ def _api_admin_engagement_save(body: bytes) -> dict:
         json.dump(clean, f, indent=2)
     return {"ok": True}
 
+# ── Astaroth AI consultant ────────────────────────────────────────────────────
+
+def _api_astaroth(body: bytes, db) -> tuple:
+    try:
+        req = json.loads(body or b"{}")
+    except Exception:
+        return _j({"error": "bad json"}, 400)
+
+    question = str(req.get("question", "")).strip()[:2000]
+    if not question:
+        return _j({"error": "empty question"}, 400)
+
+    sid = req.get("session_id", "")
+
+    # Build context from live + DB
+    context: dict = {}
+    if sid:
+        sessions = [s for s in db.get_sessions() if s["id"] == sid]
+        if sessions:
+            context["session"] = sessions[0]
+        live = _srv().get_c2_sessions()
+        context["live"] = live.get(sid)
+        tasks   = db.get_tasks(sid)
+        results = db.get_results_for_session(sid)
+        rmap    = {r["task_id"]: r for r in results}
+        outputs = []
+        for t in tasks:
+            r = rmap.get(t["id"]) or {}
+            out = r.get("output")
+            if t.get("command") and out:
+                outputs.append({"command": t["command"], "output": out})
+        context["recent_outputs"] = outputs[-6:]
+        cred_tasks = [t for t in tasks if rmap.get(t["id"], {}).get("has_creds")]
+        creds = []
+        for t in cred_tasks:
+            try:
+                hints = json.loads(rmap[t["id"]].get("cred_hints") or "[]")
+                creds.extend(hints)
+            except Exception:
+                pass
+        context["credentials"] = creds
+        techs = list({t.get("technique_id") for t in tasks if t.get("technique_id")})
+        context["techniques"] = techs
+
+    from server.astaroth import consult
+    answer = consult(question, context)
+    return _j({"answer": answer})
+
 # ── Router ────────────────────────────────────────────────────────────────────
 
 def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
@@ -324,6 +372,9 @@ def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
             return _j(_api_admin_engagement_get())
 
     if method == "POST":
+        if path == "/ui/api/astaroth/consult":
+            return _api_astaroth(body, db)
+
         m = re.fullmatch(r"/ui/api/sessions/([^/]+)/label", path)
         if m:
             return _j(_label_session(db, m.group(1), body))
@@ -627,6 +678,50 @@ input[type=text] {
   font:11px var(--mono); padding:4px 8px; border-radius:2px;
 }
 input[type=text]:focus { outline:none; border-color:var(--red); }
+
+/* ── Astaroth chat panel ── */
+#astaroth-panel {
+  position:fixed; right:0; top:38px; bottom:0; width:380px;
+  background:var(--surf); border-left:1px solid var(--border);
+  display:none; flex-direction:column; z-index:50;
+  transform:translateX(100%); transition:transform .2s ease;
+}
+#astaroth-panel.open { display:flex; transform:translateX(0); }
+#ast-hdr {
+  padding:10px 14px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:8px; flex-shrink:0;
+}
+#ast-hdr-title { font-size:11px; color:var(--red2); letter-spacing:.1em; flex:1; }
+#ast-hdr-ctx { font-size:9px; color:var(--dim); }
+#ast-close { cursor:pointer; color:var(--dim); font-size:14px; padding:2px 4px; }
+#ast-close:hover { color:var(--text); }
+#ast-msgs { flex:1; overflow-y:auto; padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
+.ast-msg { border-radius:3px; padding:8px 10px; font-size:11px; line-height:1.6; }
+.ast-msg-user { background:var(--red4); border:1px solid var(--red3); color:var(--text);
+                align-self:flex-end; max-width:90%; }
+.ast-msg-ai   { background:var(--surf2); border:1px solid var(--border); color:var(--text);
+                align-self:flex-start; white-space:pre-wrap; word-break:break-word; }
+.ast-msg-sys  { color:var(--dim); font-size:10px; font-style:italic; text-align:center; }
+.ast-thinking { color:var(--amber); font-size:10px; animation: blink 1s step-start infinite; }
+@keyframes blink { 50% { opacity:0; } }
+#ast-input-bar {
+  display:flex; gap:6px; align-items:flex-end;
+  padding:8px 12px; border-top:1px solid var(--border); flex-shrink:0;
+}
+#ast-input {
+  flex:1; background:var(--surf3); border:1px solid var(--bord2); color:var(--text);
+  font:11px var(--mono); padding:6px 8px; border-radius:2px; resize:none;
+  min-height:36px; max-height:120px; outline:none;
+}
+#ast-input:focus { border-color:var(--red); }
+#ast-toggle {
+  display:flex; align-items:center; gap:4px;
+  padding:3px 8px; border:1px solid var(--red); border-radius:2px;
+  background:transparent; color:var(--red2); font:10px var(--mono);
+  cursor:pointer; letter-spacing:.08em; transition:all .1s;
+}
+#ast-toggle:hover { background:var(--red3); }
+#ast-toggle.active { background:var(--red3); }
 </style>
 </head>
 <body>
@@ -694,6 +789,7 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
             </div>
             <div id="sess-hdr-actions">
               <button class="btn btn-sm" onclick="refreshSession()">↺</button>
+              <button id="ast-toggle" onclick="toggleAstaroth()">⟁ ASTAROTH</button>
               <button class="btn btn-sm btn-red" onclick="killSession()">KILL</button>
             </div>
           </div>
@@ -861,6 +957,28 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
 
   </div><!-- #main -->
 </div><!-- #body -->
+<!-- Astaroth chat panel (slide-in from right) -->
+<div id="astaroth-panel">
+  <div id="ast-hdr">
+    <span style="font-size:13px">⟁</span>
+    <span id="ast-hdr-title">ASTAROTH</span>
+    <span id="ast-hdr-ctx">no session</span>
+    <span id="ast-close" onclick="toggleAstaroth()">✕</span>
+  </div>
+  <div id="ast-msgs">
+    <div class="ast-msg ast-msg-sys">
+      Astaroth — red team AI consultant.<br>
+      I have full context of the selected session.<br>
+      Ask me about attack paths, credential abuse, lateral movement.
+    </div>
+  </div>
+  <div id="ast-input-bar">
+    <textarea id="ast-input" placeholder="what's the shortest path to DA?" rows="2"
+      onkeydown="astKey(event)"></textarea>
+    <button class="btn btn-red btn-sm" onclick="astSend()" style="flex-shrink:0;align-self:flex-end">ASK</button>
+  </div>
+</div>
+
 </div><!-- #app -->
 
 <script>
@@ -1027,6 +1145,7 @@ async function selectSession(sid) {
   shellClear();
   setTab('shell');
   document.getElementById('shell-input').focus();
+  updateAstCtx();
 }
 
 function deselectSession() {
@@ -1424,6 +1543,77 @@ async function saveL(sid) {
   const l = document.getElementById('lbl-'+sid)?.value||'';
   const n = document.getElementById('nte-'+sid)?.value||'';
   await fetch('/ui/api/sessions/'+sid+'/label',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:l,note:n})});
+}
+
+// ── Astaroth ──────────────────────────────────────────────────────────────
+let astOpen = false;
+
+function toggleAstaroth() {
+  astOpen = !astOpen;
+  const panel = document.getElementById('astaroth-panel');
+  const btn   = document.getElementById('ast-toggle');
+  if (astOpen) {
+    panel.classList.add('open');
+    btn?.classList.add('active');
+    updateAstCtx();
+    document.getElementById('ast-input').focus();
+  } else {
+    panel.classList.remove('open');
+    btn?.classList.remove('active');
+  }
+}
+
+function updateAstCtx() {
+  const el = document.getElementById('ast-hdr-ctx');
+  if (!el) return;
+  if (!selectedSid) { el.textContent = 'no session'; return; }
+  const live = liveSessions[selectedSid];
+  el.textContent = live ? live.host : selectedSid.slice(0,14);
+}
+
+function astKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); astSend(); }
+}
+
+async function astSend() {
+  const inp = document.getElementById('ast-input');
+  const q   = (inp?.value || '').trim();
+  if (!q) return;
+  inp.value = '';
+
+  astAppend('user', q);
+  const thinking = astAppend('thinking', '⟁ thinking…');
+
+  try {
+    const r = await fetch('/ui/api/astaroth/consult', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question: q, session_id: selectedSid || ''}),
+    });
+    thinking.remove();
+    if (!r.ok) {
+      astAppend('sys', `[error ${r.status}]`);
+      return;
+    }
+    const {answer} = await r.json();
+    astAppend('ai', answer || '[no response]');
+  } catch(e) {
+    thinking.remove();
+    astAppend('sys', `[${e.message}]`);
+  }
+}
+
+function astAppend(type, text) {
+  const msgs = document.getElementById('ast-msgs');
+  const d    = document.createElement('div');
+  if (type === 'user')     d.className = 'ast-msg ast-msg-user';
+  else if (type === 'ai')  d.className = 'ast-msg ast-msg-ai';
+  else if (type === 'thinking') d.className = 'ast-msg ast-thinking';
+  else                     d.className = 'ast-msg ast-msg-sys';
+  d.textContent = text;
+  msgs.appendChild(d);
+  msgs.scrollTop = msgs.scrollHeight;
+  return d;
 }
 
 // ── Admin ──────────────────────────────────────────────────────────────────
