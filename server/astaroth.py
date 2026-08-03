@@ -1,14 +1,13 @@
 """
 server/astaroth.py — Astaroth red team AI consultant.
 
-Backend for the Lilith web UI chat panel. Sends engagement context +
-operator question to a configured AI (Claude API or local Ollama).
+Tokens are streamed via the existing SSE channel (ast_token / ast_done events).
 
 Config via environment variables:
-  ANTHROPIC_API_KEY    → uses Claude (preferred)
-  ASTAROTH_MODEL       → Claude model ID (default: claude-sonnet-5)
-  ASTAROTH_OLLAMA_URL  → Ollama base URL (default: http://localhost:11434)
-  ASTAROTH_OLLAMA_MODEL→ Ollama model (default: llama3.2)
+  ANTHROPIC_API_KEY     → uses Claude streaming (preferred)
+  ASTAROTH_MODEL        → Claude model ID (default: claude-sonnet-5)
+  ASTAROTH_OLLAMA_URL   → Ollama base URL (default: http://localhost:11434)
+  ASTAROTH_OLLAMA_MODEL → Ollama model (default: llama3.2)
 """
 
 import json
@@ -32,12 +31,14 @@ Guidelines:
 """
 
 
-def consult(question: str, context: dict) -> str:
-    prompt = _build_prompt(question, context)
+def consult_stream(question: str, context: dict, stream_id: str, publish) -> None:
+    """Stream tokens to all SSE clients via publish(event). Runs in a background thread."""
+    prompt  = _build_prompt(question, context)
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if api_key:
-        return _call_claude(prompt, api_key)
-    return _call_ollama(prompt)
+        _stream_claude(prompt, api_key, stream_id, publish)
+    else:
+        _stream_ollama(prompt, stream_id, publish)
 
 
 def _build_prompt(question: str, ctx: dict) -> str:
@@ -82,11 +83,47 @@ def _build_prompt(question: str, ctx: dict) -> str:
     return "\n".join(lines)
 
 
-def _call_claude(prompt: str, api_key: str) -> str:
+def _stream_ollama(prompt: str, stream_id: str, publish) -> None:
+    base  = os.environ.get("ASTAROTH_OLLAMA_URL",    "http://localhost:11434")
+    model = os.environ.get("ASTAROTH_OLLAMA_MODEL",  "llama3.2")
+    body  = json.dumps({
+        "model":  model,
+        "prompt": _SYSTEM + "\n\n" + prompt,
+        "stream": True,
+    }).encode()
+    req = urllib.request.Request(
+        f"{base}/api/generate",
+        data=body,
+        headers={"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            for line in r:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                    tok = chunk.get("response", "")
+                    if tok:
+                        publish({"type": "ast_token", "id": stream_id, "token": tok})
+                    if chunk.get("done"):
+                        break
+                except Exception:
+                    pass
+        publish({"type": "ast_done", "id": stream_id})
+    except Exception as e:
+        publish({"type": "ast_done", "id": stream_id,
+                 "error": f"Ollama error: {e}\n\nSet ANTHROPIC_API_KEY for Claude, "
+                          f"or ensure Ollama is running at {base}"})
+
+
+def _stream_claude(prompt: str, api_key: str, stream_id: str, publish) -> None:
     model = os.environ.get("ASTAROTH_MODEL", "claude-sonnet-5")
     body  = json.dumps({
         "model":      model,
         "max_tokens": 1500,
+        "stream":     True,
         "system":     _SYSTEM,
         "messages":   [{"role": "user", "content": prompt}],
     }).encode()
@@ -94,37 +131,34 @@ def _call_claude(prompt: str, api_key: str) -> str:
         "https://api.anthropic.com/v1/messages",
         data=body,
         headers={
-            "x-api-key":          api_key,
-            "anthropic-version":  "2023-06-01",
-            "content-type":       "application/json",
+            "x-api-key":         api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type":      "application/json",
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=45) as r:
-            return json.loads(r.read())["content"][0]["text"]
+        with urllib.request.urlopen(req, timeout=60) as r:
+            for raw in r:
+                line = raw.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(data_str)
+                    if chunk.get("type") == "content_block_delta":
+                        tok = chunk.get("delta", {}).get("text", "")
+                        if tok:
+                            publish({"type": "ast_token", "id": stream_id, "token": tok})
+                    if chunk.get("type") == "message_stop":
+                        break
+                except Exception:
+                    pass
+        publish({"type": "ast_done", "id": stream_id})
     except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:300]
-        return f"[Astaroth — Claude API error {e.code}: {detail}]"
+        detail = e.read().decode(errors="replace")[:200]
+        publish({"type": "ast_done", "id": stream_id,
+                 "error": f"Claude API {e.code}: {detail}"})
     except Exception as e:
-        return f"[Astaroth — error: {e}]"
-
-
-def _call_ollama(prompt: str) -> str:
-    base  = os.environ.get("ASTAROTH_OLLAMA_URL",   "http://localhost:11434")
-    model = os.environ.get("ASTAROTH_OLLAMA_MODEL",  "llama3.2")
-    full_prompt = _SYSTEM + "\n\n" + prompt
-    body = json.dumps({"model": model, "prompt": full_prompt, "stream": False}).encode()
-    req  = urllib.request.Request(
-        f"{base}/api/generate",
-        data=body,
-        headers={"content-type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            return json.loads(r.read()).get("response", "[no response]")
-    except Exception as e:
-        return (
-            f"[Astaroth — no backend available]\n\n"
-            f"Set ANTHROPIC_API_KEY for Claude, or run Ollama locally.\n"
-            f"Error: {e}"
-        )
+        publish({"type": "ast_done", "id": stream_id, "error": str(e)})

@@ -328,9 +328,15 @@ def _api_astaroth(body: bytes, db) -> tuple:
         techs = list({t.get("technique_id") for t in tasks if t.get("technique_id")})
         context["techniques"] = techs
 
-    from server.astaroth import consult
-    answer = consult(question, context)
-    return _j({"answer": answer})
+    import threading, secrets as _sec
+    from server.astaroth import consult_stream
+    stream_id = _sec.token_hex(8)
+
+    def _run():
+        consult_stream(question, context, stream_id, _srv()._sse_publish)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return _j({"stream_id": stream_id})
 
 # ── Router ────────────────────────────────────────────────────────────────────
 
@@ -702,7 +708,7 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
 .ast-msg-ai   { background:var(--surf2); border:1px solid var(--border); color:var(--text);
                 align-self:flex-start; white-space:pre-wrap; word-break:break-word; }
 .ast-msg-sys  { color:var(--dim); font-size:10px; font-style:italic; text-align:center; }
-.ast-thinking { color:var(--amber); font-size:10px; animation: blink 1s step-start infinite; }
+.ast-streaming::after { content:'▋'; color:var(--red2); animation:blink .8s step-start infinite; }
 @keyframes blink { 50% { opacity:0; } }
 #ast-input-bar {
   display:flex; gap:6px; align-items:flex-end;
@@ -1045,6 +1051,26 @@ function handleSSE(ev) {
       break;
     case 'file_served':
       break;
+    case 'ast_token': {
+      const b = astPending[ev.id];
+      if (b) {
+        b.classList.remove('ast-streaming');
+        b.textContent += ev.token;
+        const msgs = document.getElementById('ast-msgs');
+        if (msgs) msgs.scrollTop = msgs.scrollHeight;
+      }
+      break;
+    }
+    case 'ast_done': {
+      const b = astPending[ev.id];
+      if (b) {
+        b.classList.remove('ast-streaming');
+        if (ev.error) b.textContent = (b.textContent || '') + '\n\n[' + ev.error + ']';
+        if (!b.textContent.trim()) b.textContent = '[no response]';
+        delete astPending[ev.id];
+      }
+      break;
+    }
   }
 }
 
@@ -1546,7 +1572,8 @@ async function saveL(sid) {
 }
 
 // ── Astaroth ──────────────────────────────────────────────────────────────
-let astOpen = false;
+let astOpen    = false;
+let astPending = {};   // stream_id → DOM element
 
 function toggleAstaroth() {
   astOpen = !astOpen;
@@ -1582,7 +1609,8 @@ async function astSend() {
   inp.value = '';
 
   astAppend('user', q);
-  const thinking = astAppend('thinking', '⟁ thinking…');
+  const bubble = astAppend('ai', '');
+  bubble.classList.add('ast-streaming');
 
   try {
     const r = await fetch('/ui/api/astaroth/consult', {
@@ -1590,26 +1618,26 @@ async function astSend() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({question: q, session_id: selectedSid || ''}),
     });
-    thinking.remove();
     if (!r.ok) {
-      astAppend('sys', `[error ${r.status}]`);
+      bubble.classList.remove('ast-streaming');
+      bubble.textContent = `[error ${r.status}]`;
       return;
     }
-    const {answer} = await r.json();
-    astAppend('ai', answer || '[no response]');
+    const {stream_id} = await r.json();
+    astPending[stream_id] = bubble;
+    // ast_token / ast_done events arrive via existing SSE connection
   } catch(e) {
-    thinking.remove();
-    astAppend('sys', `[${e.message}]`);
+    bubble.classList.remove('ast-streaming');
+    bubble.textContent = `[${e.message}]`;
   }
 }
 
 function astAppend(type, text) {
   const msgs = document.getElementById('ast-msgs');
   const d    = document.createElement('div');
-  if (type === 'user')     d.className = 'ast-msg ast-msg-user';
-  else if (type === 'ai')  d.className = 'ast-msg ast-msg-ai';
-  else if (type === 'thinking') d.className = 'ast-msg ast-thinking';
-  else                     d.className = 'ast-msg ast-msg-sys';
+  d.className = type === 'user' ? 'ast-msg ast-msg-user'
+              : type === 'ai'   ? 'ast-msg ast-msg-ai'
+              :                   'ast-msg ast-msg-sys';
   d.textContent = text;
   msgs.appendChild(d);
   msgs.scrollTop = msgs.scrollHeight;
