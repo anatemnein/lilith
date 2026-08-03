@@ -34,7 +34,7 @@ import socketserver
 from datetime import datetime, timedelta
 
 from server.certs import ensure_certs
-from server.ui import handle_ui_request as _handle_ui
+from server.ui import handle_ui_request as _handle_ui, set_workspace as _set_ui_workspace
 
 # ── IIS/Schannel TLS cipher preference ──────────────────────────────────────
 _IIS_CIPHERS = (
@@ -285,6 +285,27 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._handle_c2_result(session_id, token, body_raw)
         else:
             self._handle_callback(token, body_raw)
+
+    def do_DELETE(self):
+        raw_path = self.path.rstrip("/")
+        if raw_path.startswith("/ui"):
+            db = _ENGAGE_DB
+            if db is None:
+                body = b'{"error":"db not initialized"}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            status, ct, resp = _handle_ui("DELETE", raw_path, b"", db)
+            self.send_response(status)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+        else:
+            self._send_iis_404()
 
     # ── C2 handlers ───────────────────────────────────────────────────────────
 
@@ -573,6 +594,7 @@ def start_server(
 
     _Handler.workspace       = workspace
     _Handler.callback_prefix = callback_prefix
+    _set_ui_workspace(workspace)
 
     class _ThreadedHTTPS(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True
