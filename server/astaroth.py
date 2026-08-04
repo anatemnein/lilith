@@ -85,7 +85,7 @@ def _build_prompt(question: str, ctx: dict) -> str:
 
 def _stream_ollama(prompt: str, stream_id: str, publish) -> None:
     base  = os.environ.get("ASTAROTH_OLLAMA_URL",    "http://localhost:11434")
-    model = os.environ.get("ASTAROTH_OLLAMA_MODEL",  "llama3.2")
+    model = os.environ.get("ASTAROTH_OLLAMA_MODEL",  "mistral:7b-instruct-q4_K_M")
     body  = json.dumps({
         "model":  model,
         "prompt": _SYSTEM + "\n\n" + prompt,

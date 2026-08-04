@@ -202,6 +202,13 @@ class EngagementDB:
                       (label, note, session_id))
         return True
 
+    def delete_session(self, session_id: str) -> None:
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            c.execute("DELETE FROM tasks WHERE session_id=?", (session_id,))
+            c.execute("DELETE FROM results WHERE session_id=?", (session_id,))
+            c.execute("DELETE FROM events WHERE session_id=?", (session_id,))
+
     def log_task(self, task_id: str, session_id: str, command: str) -> None:
         tid, desc = map_attack(command)
         with self._lock, self._conn() as c:

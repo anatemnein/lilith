@@ -922,6 +922,7 @@ def cmd_serve(args, cfg, ws):
         port            = port,
         mgmt_port       = mgmt_port,
         callback_prefix = cfg.get("callback_path", "/api/diagnostics/v1/telemetry"),
+        callback_host   = cfg.get("lhost", ""),
     )
 
 

