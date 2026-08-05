@@ -209,6 +209,10 @@ def _read_manifest() -> dict:
     except Exception:
         return {}
 
+def _write_manifest(data: dict) -> None:
+    with open(os.path.join(_workspace, "manifest.json"), "w") as f:
+        json.dump(data, f, indent=2)
+
 def _api_arsenal_tools() -> dict:
     from builders.encoder import TOOL_CATALOG, find_tool
     manifest = _read_manifest()
@@ -242,10 +246,25 @@ def _api_arsenal_run(body: bytes) -> tuple:
     params    = req.get("params")   # None → use manifest default
     if not sid or not tool_name:
         return _j({"error": "session_id and tool_name required"}, 400)
+    from builders.encoder import TOOL_CATALOG, find_tool, encode_tool, is_dotnet_assembly
     manifest = _read_manifest()
     enc_name = manifest.get(f"enc_{tool_name}")
     if not enc_name or not os.path.exists(os.path.join(_workspace, enc_name)):
-        return _j({"error": f"{tool_name} not encoded — run: lilith build --tool {tool_name}"}, 404)
+        # Auto-encode on first run — no manual `lilith build --tool` needed
+        binary_path = find_tool(tool_name)
+        if not binary_path:
+            return _j({"error": f"{tool_name} binary not found — copy to windows/{tool_name}.exe"}, 404)
+        import secrets as _sec2
+        enc_name  = f"{tool_name.lower()}_{_sec2.token_hex(4)}.enc"
+        enc_path  = os.path.join(_workspace, enc_name)
+        cat_entry = TOOL_CATALOG.get(tool_name, {})
+        def_params = cat_entry.get("default_params", "")
+        if not encode_tool(binary_path, def_params or None, enc_path):
+            return _j({"error": f"failed to encode {tool_name} — is donut installed?"}, 500)
+        clr = is_dotnet_assembly(binary_path)
+        manifest[f"enc_{tool_name}"]  = enc_name
+        manifest[f"meta_{tool_name}"] = {"clr": clr, "args": def_params}
+        _write_manifest(manifest)
     meta = manifest.get(f"meta_{tool_name}", {})
     clr  = meta.get("clr", False)
     if params is None:
@@ -358,7 +377,7 @@ def _api_admin_status() -> dict:
         "uptime_s":     int(_time.time() - getattr(srv, "_START_TIME", _STARTUP)),
         "live_sessions": len(srv.get_c2_sessions()),
         "callbacks":     len(srv._EXFIL_LOG),
-        "auth_enabled":  bool(srv._UI_TOKEN),
+        "auth_enabled":  bool(srv._UI_TOKENS),
     }
 
 def _api_admin_engagement_get() -> dict:
@@ -397,6 +416,14 @@ def _api_astaroth(body: bytes, db) -> tuple:
 
     # Build context from live + DB
     context: dict = {}
+
+    # Engagement meta (objective, scope, client) — always included if available
+    try:
+        with open(os.path.join(_workspace, "engagement_meta.json")) as _f:
+            context["engagement"] = json.load(_f)
+    except Exception:
+        pass
+
     if sid:
         sessions = [s for s in db.get_sessions() if s["id"] == sid]
         if sessions:

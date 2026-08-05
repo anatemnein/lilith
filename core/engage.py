@@ -174,6 +174,11 @@ class EngagementDB:
     def _init(self) -> None:
         with self._lock, self._conn() as c:
             c.executescript(_SCHEMA)
+            # migration: c2_key added after initial schema
+            try:
+                c.execute("ALTER TABLE sessions ADD COLUMN c2_key INTEGER DEFAULT 0")
+            except Exception:
+                pass
 
     def _now(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -187,6 +192,18 @@ class EngagementDB:
                 "INSERT OR IGNORE INTO sessions(id,host,registered_at,last_seen) VALUES(?,?,?,?)",
                 (session_id, host, now, now),
             )
+
+    def set_c2_key(self, session_id: str, key: int) -> None:
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE sessions SET c2_key=? WHERE id=?", (key, session_id))
+
+    def get_live_sessions(self) -> list[dict]:
+        """Return sessions that have a c2_key set (i.e. were live C2 sessions)."""
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT id, host, c2_key, last_seen FROM sessions WHERE c2_key > 0"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def touch_session(self, session_id: str) -> None:
         with self._lock, self._conn() as c:

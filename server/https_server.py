@@ -79,16 +79,17 @@ _START_TIME  = time.time()
 _SERVER_BASE = "https://localhost:8443"   # overwritten by start_server
 
 # ── Web UI auth ──────────────────────────────────────────────────────────────
-_UI_TOKEN    = ""           # empty → auth disabled
-_UI_SESSIONS: dict = {}     # cookie_val → expiry datetime
-_UI_SESS_TTL = 28800        # 8h
+_UI_TOKENS: set[str] = set()   # empty → auth disabled; supports multiple operator tokens
+_UI_SESSIONS: dict   = {}      # cookie_val → expiry datetime
+_UI_SESS_TTL = 28800           # 8h
 
 def set_ui_token(token: str) -> None:
-    global _UI_TOKEN
-    _UI_TOKEN = token.strip()
+    t = token.strip()
+    if t:
+        _UI_TOKENS.add(t)
 
 def _ui_auth_ok(headers) -> bool:
-    if not _UI_TOKEN:
+    if not _UI_TOKENS:
         return True
     for part in headers.get("Cookie", "").split(";"):
         k, _, v = part.strip().partition("=")
@@ -165,7 +166,28 @@ def _c2_new_session(session_id: str, host: str) -> int:
             "results":   {},
             "last_seen": datetime.now(),
         }
+    if _ENGAGE_DB:
+        _ENGAGE_DB.set_c2_key(session_id, key)
     return key
+
+
+def restore_c2_sessions_from_db(db) -> int:
+    """Reload live C2 sessions from the engagement DB after a server restart.
+    The agent still holds its XOR key; this restores it so new tasks can be dispatched."""
+    count = 0
+    for row in db.get_live_sessions():
+        sid = row["id"]
+        with _C2_LOCK:
+            if sid not in _C2_SESSIONS:
+                _C2_SESSIONS[sid] = {
+                    "host":      row.get("host", "?"),
+                    "key":       row.get("c2_key", 0),
+                    "tasks":     collections.deque(),
+                    "results":   {},
+                    "last_seen": datetime.now(),
+                }
+                count += 1
+    return count
 
 
 def _c2_push_task(session_id: str, command: str) -> str | None:
@@ -507,7 +529,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             pw = dict(urllib.parse.parse_qsl(body.decode())).get("password", "").strip()
         except Exception:
             pw = ""
-        if _UI_TOKEN and pw == _UI_TOKEN:
+        if _UI_TOKENS and pw in _UI_TOKENS:
             tok = secrets.token_urlsafe(32)
             _UI_SESSIONS[tok] = datetime.now() + timedelta(seconds=_UI_SESS_TTL)
             self.send_response(302)

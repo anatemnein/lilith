@@ -903,7 +903,7 @@ def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | Non
 
 def cmd_serve(args, cfg, ws):
     from core.engage import EngagementDB
-    from server.https_server import set_ui_token
+    from server.https_server import set_ui_token, restore_c2_sessions_from_db
     port      = args.port      or cfg.get("http_port",   8443)
     mgmt_port = args.mgmt_port or cfg.get("mgmt_port",   8444)
     db_path   = ws.path("engagement.db")
@@ -911,10 +911,15 @@ def cmd_serve(args, cfg, ws):
     set_engage_db(db)
     ui_tok = getattr(args, "ui_token", "") or cfg.get("ui_token", "")
     if ui_tok:
-        set_ui_token(ui_tok)
-        print(f"[+] UI auth       : enabled")
+        tokens = [t.strip() for t in ui_tok.split(",") if t.strip()]
+        for t in tokens:
+            set_ui_token(t)
+        print(f"[+] UI auth       : enabled ({len(tokens)} token(s))")
     else:
         print(f"[+] UI auth       : disabled (pass --ui-token to enable)")
+    restored = restore_c2_sessions_from_db(db)
+    if restored:
+        print(f"[+] C2 sessions   : {restored} restored from DB")
     print(f"[+] Engagement DB : {db_path}")
     start_server(
         workspace       = ws.directory,

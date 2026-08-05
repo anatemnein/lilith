@@ -44,6 +44,16 @@ def consult_stream(question: str, context: dict, stream_id: str, publish) -> Non
 def _build_prompt(question: str, ctx: dict) -> str:
     lines = ["## Current Engagement State\n"]
 
+    eng = ctx.get("engagement") or {}
+    if eng:
+        parts = []
+        if eng.get("name"):    parts.append(f"**Op**: {eng['name']}")
+        if eng.get("client"):  parts.append(f"**Client**: {eng['client']}")
+        if eng.get("scope"):   parts.append(f"**Scope**: {eng['scope']}")
+        if eng.get("notes"):   parts.append(f"**Notes**: {eng['notes'][:300]}")
+        if parts:
+            lines.append("  ".join(parts))
+
     sess = ctx.get("session") or {}
     if sess:
         lines.append(f"**Session**: `{(sess.get('id') or '')[:16]}` | Host: `{sess.get('host','?')}`")

