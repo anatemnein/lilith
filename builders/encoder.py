@@ -159,6 +159,11 @@ TOOL_CATALOG: dict[str, dict] = {
         "default_params": "",
         "desc": "Kerberos user enum / password spray (x64)",
     },
+    "HiveLoader": {
+        "paths": _win("HiveLoader.exe"),
+        "default_params": "",
+        "desc": "Hive planting: offline reg + oplock → UsrClass.dat hijack (req offreg.dll)",
+    },
 }
 
 
