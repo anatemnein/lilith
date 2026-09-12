@@ -44,6 +44,12 @@ Rules:
     or CsFalcon* processes/services → surface FalconFlank (Arsenal) immediately as priority escalation:
     "FalconFlank: TxF+oplock race → bcrypt.dll plant in PowerShell v1.0 dir → MareBackup COM task (SYSTEM).
     Requires Win11 25H2+ with Falcon Phase 3. Run with no args: `FalconFlank` — spawns SYSTEM process on pipe."
+12. Windows Defender + Server 2025 / Win11 25H2: if OS is Server 2025 or Win11 25H2 and MsMpEng/WD is active
+    → surface ShieldBreak over RoguePlanet:
+    "ShieldBreak: WD 0day (CVE-2026-50656 patch bypass) — Cloud Files API + CLFS symlink race → WD plants
+    payload as phoneinfo.dll → WER\\QueueReporting COM task → SYSTEM. 100% rate, no prerequisites.
+    Pre-check: phoneinfo.dll must not exist in System32. Run no args: `ShieldBreak`."
+    For Win10/Win11 (not 25H2) with WD → prefer RoguePlanet instead.
 """
 
 

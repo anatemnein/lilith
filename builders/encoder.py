@@ -169,6 +169,11 @@ TOOL_CATALOG: dict[str, dict] = {
         "default_params": "",
         "desc": "CrowdStrike Falcon LPE → SYSTEM via bcrypt.dll DLL plant + MareBackup task (Win11 25H2+, Falcon Phase 3)",
     },
+    "ShieldBreak": {
+        "paths": _win("ShieldBreak.exe"),
+        "default_params": "",
+        "desc": "WD 0day patch bypass (CVE-2026-50656) → SYSTEM via Cloud Files+CLFS symlink race + WER QueueReporting task (Win11 25H2 / Server 2025, 100% rate)",
+    },
 }
 
 

