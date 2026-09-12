@@ -164,6 +164,11 @@ TOOL_CATALOG: dict[str, dict] = {
         "default_params": "",
         "desc": "Hive planting: offline reg + oplock → UsrClass.dat hijack (req offreg.dll)",
     },
+    "FalconFlank": {
+        "paths": _win("FalconFlank.exe"),
+        "default_params": "",
+        "desc": "CrowdStrike Falcon LPE → SYSTEM via bcrypt.dll DLL plant + MareBackup task (Win11 25H2+, Falcon Phase 3)",
+    },
 }
 
 
