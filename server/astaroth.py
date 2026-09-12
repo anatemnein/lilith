@@ -115,14 +115,27 @@ Rules:
 """
 
 
-def consult_stream(question: str, context: dict, stream_id: str, publish) -> None:
+_SESSION_HISTORY: dict[str, list[dict]] = {}
+_HISTORY_MAX = 6  # max past exchanges kept per session
+
+
+def consult_stream(question: str, context: dict, stream_id: str, publish,
+                   session_id: str = "") -> None:
     """Stream tokens to all SSE clients via publish(event). Runs in a background thread."""
     prompt  = _build_prompt(question, context)
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    history = _SESSION_HISTORY.get(session_id, []) if session_id else []
     if api_key:
-        _stream_claude(prompt, api_key, stream_id, publish)
+        answer = _stream_claude(prompt, api_key, stream_id, publish, history)
     else:
-        _stream_ollama(prompt, stream_id, publish)
+        answer = _stream_ollama(prompt, stream_id, publish)
+    # Persist exchange to history
+    if session_id and answer:
+        hist = _SESSION_HISTORY.setdefault(session_id, [])
+        hist.append({"role": "user",      "content": prompt})
+        hist.append({"role": "assistant", "content": answer})
+        if len(hist) > _HISTORY_MAX * 2:
+            _SESSION_HISTORY[session_id] = hist[-(  _HISTORY_MAX * 2):]
 
 
 def _build_prompt(question: str, ctx: dict) -> str:
@@ -181,7 +194,7 @@ def _build_prompt(question: str, ctx: dict) -> str:
     return "\n".join(lines)
 
 
-def _stream_ollama(prompt: str, stream_id: str, publish) -> None:
+def _stream_ollama(prompt: str, stream_id: str, publish) -> str:
     base  = os.environ.get("ASTAROTH_OLLAMA_URL",    "http://localhost:11434")
     model = os.environ.get("ASTAROTH_OLLAMA_MODEL",  "mistral:7b-instruct-q4_K_M")
     body  = json.dumps({
@@ -194,6 +207,7 @@ def _stream_ollama(prompt: str, stream_id: str, publish) -> None:
         data=body,
         headers={"content-type": "application/json"},
     )
+    collected: list[str] = []
     try:
         with urllib.request.urlopen(req, timeout=180) as r:
             for line in r:
@@ -204,6 +218,7 @@ def _stream_ollama(prompt: str, stream_id: str, publish) -> None:
                     chunk = json.loads(line)
                     tok = chunk.get("response", "")
                     if tok:
+                        collected.append(tok)
                         publish({"type": "ast_token", "id": stream_id, "token": tok})
                     if chunk.get("done"):
                         break
@@ -214,16 +229,19 @@ def _stream_ollama(prompt: str, stream_id: str, publish) -> None:
         publish({"type": "ast_done", "id": stream_id,
                  "error": f"Ollama error: {e}\n\nSet ANTHROPIC_API_KEY for Claude, "
                           f"or ensure Ollama is running at {base}"})
+    return "".join(collected)
 
 
-def _stream_claude(prompt: str, api_key: str, stream_id: str, publish) -> None:
-    model = os.environ.get("ASTAROTH_MODEL", "claude-sonnet-5")
+def _stream_claude(prompt: str, api_key: str, stream_id: str, publish,
+                   history: list[dict] | None = None) -> str:
+    model    = os.environ.get("ASTAROTH_MODEL", "claude-sonnet-5")
+    messages = list(history or []) + [{"role": "user", "content": prompt}]
     body  = json.dumps({
         "model":      model,
         "max_tokens": 1500,
         "stream":     True,
         "system":     _SYSTEM,
-        "messages":   [{"role": "user", "content": prompt}],
+        "messages":   messages,
     }).encode()
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -234,6 +252,7 @@ def _stream_claude(prompt: str, api_key: str, stream_id: str, publish) -> None:
             "content-type":      "application/json",
         },
     )
+    collected: list[str] = []
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             for raw in r:
@@ -248,6 +267,7 @@ def _stream_claude(prompt: str, api_key: str, stream_id: str, publish) -> None:
                     if chunk.get("type") == "content_block_delta":
                         tok = chunk.get("delta", {}).get("text", "")
                         if tok:
+                            collected.append(tok)
                             publish({"type": "ast_token", "id": stream_id, "token": tok})
                     if chunk.get("type") == "message_stop":
                         break
@@ -260,3 +280,4 @@ def _stream_claude(prompt: str, api_key: str, stream_id: str, publish) -> None:
                  "error": f"Claude API {e.code}: {detail}"})
     except Exception as e:
         publish({"type": "ast_done", "id": stream_id, "error": str(e)})
+    return "".join(collected)
