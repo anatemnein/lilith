@@ -207,6 +207,7 @@ def _c2_new_session(session_id: str, host: str) -> int:
             "last_seen": datetime.now(),
         }
     if _ENGAGE_DB:
+        _ENGAGE_DB.log_session(session_id, host)   # ensure row exists before UPDATE
         _ENGAGE_DB.set_c2_key(session_id, key)
     return key
 
