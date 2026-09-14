@@ -462,6 +462,44 @@ def _api_admin_engagement_save(body: bytes) -> dict:
         json.dump(clean, f, indent=2)
     return {"ok": True}
 
+# ── Lateral tool runner ───────────────────────────────────────────────────────
+
+def _api_lateral_run(body: bytes) -> tuple:
+    import secrets as _sec
+    try:
+        req = json.loads(body or b"{}")
+    except Exception:
+        return _j({"error": "bad json"}, 400)
+
+    tpl_id  = req.get("template_id", "")
+    params  = req.get("params", {})   # {target, domain, user, password, hash, dc_ip, extra}
+    stealth = bool(req.get("stealth", True))
+    raw_args = req.get("raw_args", "")  # free-form string overrides template
+
+    from server.lateral import TEMPLATE_MAP, run_tool, TOOLS
+    run_id = _sec.token_hex(8)
+
+    if raw_args:
+        # free-form mode: parse tool name from first token of raw_args
+        parts = raw_args.split()
+        tool  = parts[0] if parts else ""
+        args  = parts[1:]
+        if not TOOLS.get(tool):
+            return _j({"error": f"unknown tool: {tool}"}, 400)
+    elif tpl_id in TEMPLATE_MAP:
+        tpl  = TEMPLATE_MAP[tpl_id]
+        tool = tpl["tool"]
+        try:
+            args = tpl["build"](params)
+        except Exception as ex:
+            return _j({"error": f"template build error: {ex}"}, 400)
+    else:
+        return _j({"error": "template_id or raw_args required"}, 400)
+
+    run_tool(run_id, tool, [a for a in args if a is not None],
+             stealth, _srv()._sse_publish)
+    return _j({"run_id": run_id})
+
 # ── Astaroth AI consultant ────────────────────────────────────────────────────
 
 def _api_astaroth(body: bytes, db) -> tuple:
@@ -610,6 +648,25 @@ def handle_ui_request(method: str, path: str, body: bytes, db, headers=None) -> 
             if db:
                 db.delete_session(sid)
             return _j({"deleted": sid})
+
+    # ── Lateral tool endpoints ────────────────────────────────────────────────
+    if path == "/ui/api/lateral/tools" and method == "GET":
+        from server.lateral import tool_status
+        return _j(tool_status())
+
+    if path == "/ui/api/lateral/templates" and method == "GET":
+        from server.lateral import TEMPLATES
+        return _j([{"id": t["id"], "label": t["label"],
+                    "tool": t["tool"], "category": t["category"]} for t in TEMPLATES])
+
+    if path == "/ui/api/lateral/run" and method == "POST":
+        return _api_lateral_run(body)
+
+    m = re.fullmatch(r"/ui/api/lateral/kill/([^/]+)", path)
+    if m and method == "POST":
+        from server.lateral import kill_run
+        ok = kill_run(m.group(1))
+        return _j({"ok": ok})
 
     # ── SOCKS5 endpoints ──────────────────────────────────────────────────────
     if path == "/ui/api/socks5/status":
@@ -865,6 +922,32 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
 .qbtn:hover { border-color:var(--red); color:var(--red2); }
 /* ── Astaroth inline strip ── */
 /* ast-strip removed — Astaroth is manual-only */
+/* ── tool runner form inputs ── */
+.form-inp {
+  width:100%; background:var(--surf2); border:1px solid var(--border); color:var(--text);
+  font:11px var(--mono); padding:5px 8px; outline:none; border-radius:2px;
+  transition:border-color .15s;
+}
+.form-inp:focus { border-color:var(--red); }
+.form-inp::placeholder { color:var(--dim); }
+/* ── tool template list ── */
+.tl-cat { font-size:8px; letter-spacing:.14em; color:var(--dim); margin-top:8px; margin-bottom:2px; padding:0 2px; }
+.tl-tpl {
+  font-size:10px; color:var(--dim2); padding:4px 7px; cursor:pointer;
+  border-radius:2px; border:1px solid transparent; transition:all .1s;
+  font-family:var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.tl-tpl:hover { background:var(--surf3); color:var(--text); border-color:var(--border); }
+.tl-tpl.active { background:var(--red4); color:var(--red2); border-color:var(--red); }
+/* ── tool output lines ── */
+.tl-line { white-space:pre-wrap; word-break:break-all; line-height:1.5; }
+.tl-line.tl-ok   { color:#4ade80; }
+.tl-line.tl-err  { color:#f87171; }
+.tl-line.tl-warn { color:#fbbf24; }
+.tl-line.tl-info { color:var(--dim2); font-style:italic; }
+.tl-line.tl-hash { color:#818cf8; font-weight:600; }
+.tl-avail-dot { display:inline-block; width:5px; height:5px; border-radius:50%; margin-right:4px; }
+
 /* ── shell output ── */
 #shell-out {
   flex:1; overflow-y:auto; padding:10px 14px;
@@ -1130,6 +1213,7 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
     <div class="tnav active" data-gv="ops"      onclick="setGV('ops')">OPERATIONS</div>
     <div class="tnav"        data-gv="arsenal"  onclick="setGV('arsenal')">ARSENAL</div>
     <div class="tnav"        data-gv="attack"   onclick="setGV('attack')">ATT&amp;CK</div>
+    <div class="tnav"        data-gv="tools"    onclick="setGV('tools');if(!tlTemplates.length)loadToolsView()">TOOLS</div>
     <div class="tnav"        data-gv="report"   onclick="setGV('report')">REPORT</div>
     <div class="tnav"        data-gv="admin"    onclick="setGV('admin')">ADMIN</div>
   </div>
@@ -1369,6 +1453,50 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
       </div>
     </div>
 
+    <!-- Tools view -->
+    <div class="gview" id="gv-tools">
+      <div class="gview-hdr">
+        <div class="gview-title"><span>AD / LATERAL</span><strong>Tool Runner</strong></div>
+        <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+          <label style="font-size:9px;color:var(--dim2);display:flex;gap:5px;align-items:center;cursor:pointer">
+            <input type="checkbox" id="tools-stealth" checked style="accent-color:var(--red2)">
+            OPSEC mode
+          </label>
+          <div id="tools-status-dot" style="width:7px;height:7px;border-radius:50%;background:var(--dim)"></div>
+        </div>
+      </div>
+      <div class="gview-body" style="padding:0;display:flex;height:100%;overflow:hidden">
+        <!-- Left: auth + template picker -->
+        <div style="width:280px;min-width:280px;border-right:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;padding:14px 12px;gap:10px">
+          <div style="font-size:9px;letter-spacing:.12em;color:var(--dim)">AUTH</div>
+          <input id="tl-target"   class="form-inp" placeholder="Target / IP" autocomplete="off">
+          <input id="tl-domain"   class="form-inp" placeholder="Domain (CORP.LOCAL)" autocomplete="off">
+          <input id="tl-dcip"     class="form-inp" placeholder="DC IP (optional)" autocomplete="off">
+          <input id="tl-user"     class="form-inp" placeholder="Username" autocomplete="off">
+          <input id="tl-pass"     class="form-inp" placeholder="Password" type="password" autocomplete="off">
+          <input id="tl-hash"     class="form-inp" placeholder="NTLM Hash (overrides pass)" autocomplete="off">
+          <input id="tl-extra"    class="form-inp" placeholder="Extra / command / template" autocomplete="off">
+          <button class="btn btn-sm" onclick="tlFillFromSession()" style="font-size:9px;letter-spacing:.08em">↳ fill from session creds</button>
+          <div style="border-top:1px solid var(--border);padding-top:10px;font-size:9px;letter-spacing:.12em;color:var(--dim)">TEMPLATES</div>
+          <div id="tl-tpl-list" style="display:flex;flex-direction:column;gap:1px"></div>
+          <button class="btn btn-red btn-sm" onclick="tlRunSelected()" style="font-size:9px;letter-spacing:.1em">▶ RUN SELECTED</button>
+          <div style="border-top:1px solid var(--border);padding-top:10px;font-size:9px;letter-spacing:.12em;color:var(--dim)">RAW COMMAND</div>
+          <input id="tl-raw"  class="form-inp" placeholder="tool arg1 arg2 …" autocomplete="off" spellcheck="false">
+          <button class="btn btn-red btn-sm" onclick="tlRunRaw()">▶ RUN RAW</button>
+          <div id="tools-avail" style="margin-top:4px"></div>
+        </div>
+        <!-- Right: output terminal -->
+        <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+          <div id="tl-out" style="flex:1;overflow-y:auto;padding:10px 14px;font:11px/1.55 var(--mono);background:var(--bg)"></div>
+          <div style="padding:6px 12px;background:var(--surf);border-top:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-shrink:0">
+            <span id="tl-run-id" style="font-size:9px;color:var(--dim);font-family:var(--mono)"></span>
+            <button class="btn btn-sm" id="tl-kill-btn" onclick="tlKill()" style="display:none;font-size:9px">■ KILL</button>
+            <button class="btn btn-sm" onclick="document.getElementById(\'tl-out\').innerHTML=\'\'" style="font-size:9px;margin-left:auto">CLR</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Report view -->
     <div class="gview" id="gv-report">
       <div class="gview-hdr">
@@ -1584,6 +1712,10 @@ function handleSSE(ev) {
       }
       break;
     case 'file_served':
+      break;
+    case 'lat_start':
+    case 'lat_line':
+      _handleLateralSSE(ev);
       break;
     case 'ast_auto_start':
       // auto-analysis disabled — Astaroth is manual-only
@@ -2790,6 +2922,186 @@ async function loadDB() {
   // Light fallback poll for live session state (stale detection etc.)
   setInterval(loadLive, 10000);
 })();
+
+// ── Tool runner (TOOLS tab) ──────────────────────────────────────────────────
+let tlTemplates   = [];
+let tlSelectedTpl = null;
+let tlRunId       = null;
+
+async function loadToolsView() {
+  // load templates
+  try {
+    tlTemplates = await fetch('/ui/api/lateral/templates').then(r=>r.json());
+    renderTlTemplates();
+  } catch(_) {}
+  // load tool availability
+  try {
+    const status = await fetch('/ui/api/lateral/tools').then(r=>r.json());
+    renderTlAvail(status);
+  } catch(_) {}
+}
+
+function renderTlTemplates() {
+  const el = document.getElementById('tl-tpl-list');
+  if (!el) return;
+  const cats = [...new Set(tlTemplates.map(t=>t.category))];
+  el.innerHTML = cats.map(cat => {
+    const items = tlTemplates.filter(t=>t.category===cat).map(t =>
+      `<div class="tl-tpl ${t.id===tlSelectedTpl?'active':''}" onclick="tlSelectTpl('${esc(t.id)}')" title="${esc(t.label)}">${esc(t.label)}</div>`
+    ).join('');
+    return `<div class="tl-cat">${esc(cat)}</div>${items}`;
+  }).join('');
+}
+
+function renderTlAvail(status) {
+  const el = document.getElementById('tools-avail');
+  if (!el) return;
+  el.innerHTML = '<div style="font-size:8px;letter-spacing:.1em;color:var(--dim);margin-bottom:4px">TOOL STATUS</div>' +
+    Object.entries(status).map(([name, info]) =>
+      `<div style="font-size:9px;color:${info.available?'var(--dim2)':'var(--dim)'};display:flex;align-items:center;gap:4px;margin-bottom:1px">
+        <span class="tl-avail-dot" style="background:${info.available?'#4ade80':'#374151'}"></span>${esc(name)}
+      </div>`
+    ).join('');
+}
+
+function tlSelectTpl(id) {
+  tlSelectedTpl = id;
+  renderTlTemplates();
+}
+
+function tlParams() {
+  return {
+    target:   document.getElementById('tl-target')?.value.trim()  || '',
+    domain:   document.getElementById('tl-domain')?.value.trim()  || '',
+    dc_ip:    document.getElementById('tl-dcip')?.value.trim()    || '',
+    user:     document.getElementById('tl-user')?.value.trim()    || '',
+    password: document.getElementById('tl-pass')?.value           || '',
+    hash:     document.getElementById('tl-hash')?.value.trim()    || '',
+    extra:    document.getElementById('tl-extra')?.value.trim()   || '',
+  };
+}
+
+async function tlRun(tplId) {
+  const stealth = document.getElementById('tools-stealth')?.checked ?? true;
+  const body = {template_id: tplId, params: tlParams(), stealth};
+  await _tlExec(body);
+}
+
+async function tlRunRaw() {
+  const raw = document.getElementById('tl-raw')?.value.trim();
+  if (!raw) return;
+  const stealth = document.getElementById('tools-stealth')?.checked ?? true;
+  await _tlExec({raw_args: raw, stealth});
+}
+
+async function _tlExec(payload) {
+  if (!payload.raw_args && !payload.template_id) {
+    if (!tlSelectedTpl) { tlAppend('err', '[!] select a template or use raw command'); return; }
+    payload.template_id = tlSelectedTpl;
+    if (!payload.params) payload.params = tlParams();
+  }
+  try {
+    const r = await fetch('/ui/api/lateral/run', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if (d.error) { tlAppend('err', '[!] ' + d.error); return; }
+    tlRunId = d.run_id;
+    document.getElementById('tl-run-id').textContent = 'run: ' + tlRunId;
+    document.getElementById('tl-kill-btn').style.display = '';
+    document.getElementById('tools-status-dot').style.background = '#fbbf24';
+    tlAppend('info', '[*] started run_id=' + tlRunId);
+  } catch(e) {
+    tlAppend('err', '[!] ' + e.message);
+  }
+}
+
+// Run currently selected template
+async function tlRunSelected() {
+  if (!tlSelectedTpl) { tlAppend('err', '[!] select a template'); return; }
+  await tlRun(tlSelectedTpl);
+}
+
+async function tlKill() {
+  if (!tlRunId) return;
+  await fetch('/ui/api/lateral/kill/' + tlRunId, {method:'POST'});
+  tlAppend('warn', '[*] kill signal sent');
+}
+
+function tlAppend(type, text) {
+  const out = document.getElementById('tl-out');
+  if (!out) return;
+  const d = document.createElement('div');
+  d.className = 'tl-line tl-' + type;
+  d.textContent = text;
+  out.appendChild(d);
+  out.scrollTop = out.scrollHeight;
+}
+
+function tlColorLine(line) {
+  if (/HASH|:aad3b435|:31d6cfe0|\$krb5|error|FAILED|ACCESS.DENIED|[-]$/i.test(line)) {
+    if (/\$krb5|\$DCC2|\$NT\$|:aad3b435/i.test(line)) return 'tl-hash';
+    if (/error|FAILED|ACCESS.DENIED/i.test(line)) return 'tl-err';
+  }
+  if (/\[\+\]|pwned!|SUCCESS|STATUS_SUCCESS|[+]/i.test(line)) return 'tl-ok';
+  if (/\[!\]|CRITICAL|ERROR/i.test(line)) return 'tl-err';
+  if (/\[\*\]|INFO/i.test(line)) return 'tl-info';
+  if (/WARNING|WARN/i.test(line)) return 'tl-warn';
+  if (/\$krb5|\$DCC2|\$NT\$/i.test(line)) return 'tl-hash';
+  return '';
+}
+
+function tlFillFromSession() {
+  // pull from session DB creds if available
+  if (!sessDetail) return;
+  const creds = sessDetail.creds || [];
+  if (!creds.length) { tlAppend('warn', '[!] no creds in session'); return; }
+  // pick first usable cred set
+  for (const c of creds) {
+    const text = c.output || c.text || '';
+    // NTLM hash pattern
+    const hashM = text.match(/[a-fA-F0-9]{32}(?::[a-fA-F0-9]{32})?/);
+    const userM = text.match(/Username\s*:\s*(\S+)/i) || text.match(/User\s*:\s*(\S+)/i);
+    const domM  = text.match(/Domain\s*:\s*(\S+)/i);
+    if (hashM) document.getElementById('tl-hash').value = hashM[0];
+    if (userM) document.getElementById('tl-user').value = userM[1];
+    if (domM)  document.getElementById('tl-domain').value = domM[1];
+    if (hashM || userM) { tlAppend('ok', '[+] filled from session creds'); break; }
+  }
+  // also fill target from live session host
+  const live = liveSessions[selectedSid];
+  if (live?.host && !document.getElementById('tl-target').value)
+    document.getElementById('tl-target').value = live.host;
+}
+
+// Handle SSE lateral events
+function _handleLateralSSE(ev) {
+  switch (ev.type) {
+    case 'lat_start':
+      tlAppend('info', '[>] ' + ev.cmd);
+      break;
+    case 'lat_line': {
+      const cls = tlColorLine(ev.line);
+      tlAppend(cls || 'tl-base', ev.line);
+      if (ev.done) {
+        document.getElementById('tools-status-dot').style.background =
+          (ev.rc === 0) ? '#4ade80' : '#f87171';
+        document.getElementById('tl-kill-btn').style.display = 'none';
+        if (ev.rc === 0) tlRunId = null;
+      }
+      break;
+    }
+  }
+}
+
+// loadToolsView is called from the TOOLS tab onclick
+
+// Add double-click on template to execute immediately
+document.addEventListener('dblclick', e => {
+  const tpl = e.target.closest('.tl-tpl');
+  if (tpl) tlRunSelected();
+});
 </script>
 </body>
 </html>"""
