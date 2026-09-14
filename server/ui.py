@@ -594,6 +594,13 @@ def handle_ui_request(method: str, path: str, body: bytes, db, headers=None) -> 
             return 200, "application/json", json.dumps(db.export_json(), indent=2, default=str).encode()
         if path == "/ui/api/export/markdown":
             return 200, "text/markdown; charset=utf-8", db.export_markdown().encode()
+        if path == "/ui/api/findings":
+            return _j(db.get_findings() if db else [])
+        m = re.fullmatch(r"/ui/api/findings/session/([^/]+)", path)
+        if m:
+            return _j(db.get_findings(m.group(1)) if db else [])
+        if path == "/ui/api/timeline":
+            return _j(db.get_timeline() if db else [])
         if path == "/ui/api/c2/sessions":
             return _j(_api_c2_sessions())
         m = re.fullmatch(r"/ui/api/c2/([^/]+)/result/([^/]+)", path)
@@ -623,6 +630,24 @@ def handle_ui_request(method: str, path: str, body: bytes, db, headers=None) -> 
         m = re.fullmatch(r"/ui/api/sessions/([^/]+)/label", path)
         if m:
             return _j(_label_session(db, m.group(1), body))
+        m = re.fullmatch(r"/ui/api/sessions/([^/]+)/narrative", path)
+        if m and db:
+            payload = json.loads(body)
+            db.set_narrative(m.group(1), payload.get("narrative", ""), bool(payload.get("pwned", False)))
+            return _j({"ok": True})
+        if path == "/ui/api/findings" and db:
+            op = _srv()._get_operator(headers) if headers else None
+            op_name = op["username"] if op else "unknown"
+            payload = json.loads(body)
+            fid = db.add_finding(
+                payload.get("session_id", ""),
+                payload.get("task_id") or None,
+                payload.get("title", ""),
+                payload.get("severity", "MED"),
+                payload.get("recommendation", ""),
+                op_name,
+            )
+            return _j({"id": fid})
         m = re.fullmatch(r"/ui/api/c2/([^/]+)/task", path)
         if m:
             op = _srv()._get_operator(headers) if headers else None
@@ -640,6 +665,10 @@ def handle_ui_request(method: str, path: str, body: bytes, db, headers=None) -> 
             return _j(_api_operator_create(body, role))
 
     if method == "DELETE":
+        m = re.fullmatch(r"/ui/api/findings/([0-9]+)", path)
+        if m and db:
+            db.delete_finding(int(m.group(1)))
+            return _j({"ok": True})
         m = re.fullmatch(r"/ui/api/admin/operators/([^/]+)", path)
         if m:
             op = _srv()._get_operator(headers) if headers else None
@@ -1507,15 +1536,63 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
     <!-- Report view -->
     <div class="gview" id="gv-report">
       <div class="gview-hdr">
-        <div class="gview-title"><span>EXPORT</span><strong>Report</strong></div>
-      </div>
-      <div class="gview-body">
-        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px">
-          <a class="btn" href="/ui/api/export/json" download="lilith.json">↓ JSON</a>
-          <a class="btn" href="/ui/api/export/markdown" download="lilith.md">↓ Markdown</a>
+        <div class="gview-title"><span>REPORT</span><strong>Findings &amp; Export</strong></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-sm" onclick="reportAddFinding()">+ Finding</button>
+          <a class="btn btn-sm" href="/ui/api/export/markdown" download="lilith_report.md">↓ Markdown</a>
+          <a class="btn btn-sm" href="/ui/api/export/json" download="lilith.json">↓ JSON</a>
+          <button class="btn btn-sm" onclick="loadReport()">↺</button>
         </div>
-        <div style="font-size:9px;letter-spacing:.1em;color:var(--dim);margin-bottom:10px">SESSION LABELS</div>
-        <div id="label-editor"></div>
+      </div>
+      <div class="gview-body" style="display:flex;gap:0;flex-direction:column;height:100%;overflow:hidden">
+
+        <!-- Report sub-nav -->
+        <div style="display:flex;gap:0;border-bottom:1px solid var(--border);flex-shrink:0">
+          <div class="stab" id="rtab-findings" data-rtab="findings" onclick="setRTab('findings')" style="padding:7px 14px">FINDINGS <span id="badge-findings" class="tab-badge" style="display:none"></span></div>
+          <div class="stab" id="rtab-timeline" data-rtab="timeline" onclick="setRTab('timeline')" style="padding:7px 14px">TIMELINE</div>
+          <div class="stab" id="rtab-labels"   data-rtab="labels"   onclick="setRTab('labels')"   style="padding:7px 14px">LABELS</div>
+        </div>
+
+        <!-- Findings panel -->
+        <div id="rpanel-findings" style="flex:1;overflow-y:auto;padding:14px;display:none">
+          <div id="findings-board"></div>
+        </div>
+
+        <!-- Timeline panel -->
+        <div id="rpanel-timeline" style="flex:1;overflow-y:auto;padding:14px;display:none">
+          <div id="timeline-board"></div>
+        </div>
+
+        <!-- Labels panel -->
+        <div id="rpanel-labels" style="flex:1;overflow-y:auto;padding:14px;display:none">
+          <div style="font-size:9px;letter-spacing:.1em;color:var(--dim);margin-bottom:10px">SESSION LABELS</div>
+          <div id="label-editor"></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Finding modal -->
+    <div id="finding-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:900;align-items:center;justify-content:center">
+      <div style="background:var(--surf2);border:1px solid var(--bord2);padding:24px;min-width:420px;max-width:580px;width:90%">
+        <div style="font-size:9px;letter-spacing:.15em;color:var(--dim);margin-bottom:14px">NEW FINDING</div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <input id="fm-title" class="form-inp" placeholder="Finding title (e.g. Kerberoastable service account)">
+          <div style="display:flex;gap:8px">
+            <select id="fm-severity" style="background:var(--surf3);border:1px solid var(--bord2);color:var(--text);font:11px var(--mono);padding:6px 8px;flex:1">
+              <option value="CRIT">CRITICAL</option>
+              <option value="HIGH">HIGH</option>
+              <option value="MED" selected>MEDIUM</option>
+              <option value="LOW">LOW</option>
+            </select>
+            <div style="flex:1;font-size:10px;color:var(--dim);display:flex;align-items:center;padding:0 6px" id="fm-session-label">Session: —</div>
+          </div>
+          <textarea id="fm-rec" class="form-inp" placeholder="Recommendation…" style="resize:vertical;min-height:72px"></textarea>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
+            <button class="btn btn-sm" onclick="closeFindingModal()">Cancel</button>
+            <button class="btn btn-sm btn-red" onclick="submitFinding()">Save Finding</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1975,17 +2052,19 @@ function renderHistory() {
   el.innerHTML = tasks.map((t,i) => {
     const hasOut = t.output && t.output.trim();
     const credBadge = t.has_creds ? '<span style="color:var(--glow);font-size:9px">⚷ CREDS</span>' : '';
+    const techBadge = t.technique_id ? `<span style="color:var(--dim);font-size:9px;margin-left:4px">${esc(t.technique_id)}</span>` : '';
+    const findBtn = `<button class="cbtn" onclick="event.stopPropagation();openFindingFromTask('${esc(t.id)}','${esc((t.command||'').slice(0,60)).replace(/'/g,"\\'")}')">⚑ finding</button>`;
     const out = hasOut ? `<div class="hist-out">${esc(t.output.slice(0,4000))}${t.output.length>4000?'\n…truncated':''}
-      <button class="cbtn" onclick="copyText(this,'${i}')" style="margin-top:6px">copy output</button></div>` : '';
+      <div style="display:flex;gap:6px;margin-top:6px">${findBtn}<button class="cbtn" onclick="event.stopPropagation();copyText(this,'${i}')">copy output</button></div></div>` : '';
     return `<div class="hist-row" onclick="this.classList.toggle('expanded')">
-      <span class="hist-ts">${fmtTs(t.created_at||'')}</span>
-      <span class="hist-cmd">${esc(t.command||'')}</span>
+      <span class="hist-ts">${fmtTs(t.dispatched_at||t.created_at||'')}</span>
+      <span class="hist-cmd">${esc(t.command||'')}${techBadge}</span>
       <span class="hist-status">${credBadge}${hasOut?'<span style="color:var(--dim);font-size:10px">▼</span>':''}</span>
       ${out}
     </div>`;
   }).join('');
-  // store outputs for copy
   window._histOutputs = tasks.map(t => t.output||'');
+  window._histTasks   = tasks;
 }
 
 function copyText(btn, idx) {
@@ -2018,37 +2097,83 @@ function renderSessionCreds() {
 }
 
 // ── info tab ───────────────────────────────────────────────────────────────
-function renderInfo() {
+async function renderInfo() {
   const el   = document.getElementById('tab-info');
   const s    = sessDetail.session || {};
   const live = liveSessions[selectedSid] || null;
   const tasks = sessDetail.tasks || [];
   const techs = [...new Set(tasks.map(t=>t.technique_id).filter(Boolean))];
   const rows = [
-    ['Session ID',   selectedSid],
-    ['Host / IP',    live ? live.host : (s.host||'—')],
-    ['First seen',   fmtTs(s.created_at||'')],
-    ['Last seen',    live ? live.last_seen : '—'],
-    ['Tasks',        tasks.length],
-    ['Label',        s.label||'—'],
-    ['Note',         s.note||'—'],
+    ['Session ID',  selectedSid],
+    ['Host / IP',   live ? live.host : (s.host||'—')],
+    ['Registered',  fmtTs(s.registered_at||'')],
+    ['Last seen',   live ? fmtTs(live.last_seen) : fmtTs(s.last_seen||'')],
+    ['Tasks run',   tasks.length],
+    ['Operator',    s.label||'—'],
   ];
   const techHtml = techs.length
     ? techs.map(t => `<span style="display:inline-block;padding:1px 6px;border:1px solid var(--border);border-radius:2px;font-size:10px;margin:2px">${esc(t)}</span>`).join(' ')
     : '<span style="color:var(--dim)">none</span>';
 
+  // Load findings for this session
+  let sessionFindings = [];
+  try {
+    const r = await fetch('/ui/api/findings/session/' + selectedSid);
+    sessionFindings = await r.json();
+  } catch(_) {}
+
+  const isPwned = s.pwned === 1 || s.pwned === true;
+  const _sevColor = {CRIT:'#ef4444',HIGH:'#f97316',MED:'#eab308',LOW:'#4ade80'};
+  const findingsHtml = sessionFindings.length
+    ? sessionFindings.map(f => `
+        <div style="display:flex;gap:8px;align-items:baseline;padding:5px 0;border-bottom:1px solid var(--border)">
+          <span style="font-size:9px;font-weight:700;color:${_sevColor[f.severity]||'var(--dim)'};min-width:34px">${esc(f.severity)}</span>
+          <span style="flex:1;font-size:11px">${esc(f.title)}</span>
+          <button class="cbtn" onclick="deleteFinding(${f.id})">✕</button>
+        </div>`).join('')
+    : '<div style="color:var(--dim);font-size:11px">No findings yet — use ⚑ button in HISTORY</div>';
+
   el.innerHTML = `
-    <div class="info-grid">${rows.map(([k,v]) =>
+    <div class="info-grid" style="margin-bottom:14px">${rows.map(([k,v]) =>
       `<div class="info-key">${k}</div><div class="info-val">${esc(String(v))}</div>`
     ).join('')}</div>
-    <div style="font-size:9px;letter-spacing:.1em;color:var(--dim);margin-bottom:8px">ATT&CK TECHNIQUES</div>
-    <div>${techHtml}</div>
-    <div style="margin-top:16px;font-size:9px;letter-spacing:.1em;color:var(--dim);margin-bottom:6px">LABEL EDITOR</div>
+
+    <div style="font-size:9px;letter-spacing:.1em;color:var(--dim);margin-bottom:6px">ATT&CK TECHNIQUES</div>
+    <div style="margin-bottom:14px">${techHtml}</div>
+
+    <div style="font-size:9px;letter-spacing:.1em;color:var(--dim);margin-bottom:6px">FINDINGS</div>
+    <div style="margin-bottom:14px">${findingsHtml}</div>
+
+    <div style="font-size:9px;letter-spacing:.1em;color:var(--dim);margin-bottom:6px">NARRATIVE</div>
+    <textarea id="info-narrative" style="width:100%;background:var(--surf3);border:1px solid var(--bord2);
+      color:var(--text);font:11px var(--mono);padding:8px;resize:vertical;min-height:80px;
+      border-radius:2px;outline:none;margin-bottom:8px" placeholder="Describe what was achieved in this session…">${esc(s.narrative||'')}</textarea>
+
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <label style="display:flex;gap:6px;align-items:center;font-size:11px;cursor:pointer">
+        <input type="checkbox" id="info-pwned" ${isPwned?'checked':''}>
+        <span style="color:${isPwned?'#ef4444':'var(--dim)'}">Mark as PWNED</span>
+      </label>
+      <button class="btn btn-sm" onclick="saveNarrative()">Save</button>
+    </div>
+
+    <div style="margin-top:16px;font-size:9px;letter-spacing:.1em;color:var(--dim);margin-bottom:6px">LABEL / NOTE</div>
     <div style="display:flex;gap:6px;flex-wrap:wrap">
       <input type="text" id="edit-label" placeholder="label" value="${esc(s.label||'')}" style="flex:1;min-width:120px">
       <input type="text" id="edit-note"  placeholder="note"  value="${esc(s.note||'')}"  style="flex:2;min-width:200px">
       <button class="btn btn-sm" onclick="saveLabel()">Save</button>
     </div>`;
+}
+
+async function saveNarrative() {
+  if (!selectedSid) return;
+  const narrative = document.getElementById('info-narrative').value;
+  const pwned     = document.getElementById('info-pwned').checked;
+  await fetch('/ui/api/sessions/'+selectedSid+'/narrative', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({narrative, pwned}),
+  });
+  await refreshSession();
 }
 
 async function saveLabel() {
@@ -2060,6 +2185,145 @@ async function saveLabel() {
     body: JSON.stringify({label, note}),
   });
   await refreshSession();
+}
+
+// ── findings & report ─────────────────────────────────────────────────────
+
+let _fmTaskId = null;
+
+function openFindingFromTask(taskId, cmdPreview) {
+  _fmTaskId = taskId;
+  document.getElementById('fm-title').value = cmdPreview ? 'Finding: ' + cmdPreview : '';
+  document.getElementById('fm-rec').value = '';
+  document.getElementById('fm-severity').value = 'MED';
+  document.getElementById('fm-session-label').textContent = 'Session: ' + (selectedSid||'—').slice(0,10);
+  const m = document.getElementById('finding-modal');
+  m.style.display = 'flex';
+}
+
+function reportAddFinding() {
+  _fmTaskId = null;
+  document.getElementById('fm-title').value = '';
+  document.getElementById('fm-rec').value = '';
+  document.getElementById('fm-severity').value = 'MED';
+  document.getElementById('fm-session-label').textContent = 'Session: ' + (selectedSid||'global').slice(0,10);
+  const m = document.getElementById('finding-modal');
+  m.style.display = 'flex';
+}
+
+function closeFindingModal() {
+  document.getElementById('finding-modal').style.display = 'none';
+}
+
+async function submitFinding() {
+  const title = document.getElementById('fm-title').value.trim();
+  if (!title) { document.getElementById('fm-title').style.borderColor='#ef4444'; return; }
+  const payload = {
+    session_id:     selectedSid || '',
+    task_id:        _fmTaskId || null,
+    title,
+    severity:       document.getElementById('fm-severity').value,
+    recommendation: document.getElementById('fm-rec').value.trim(),
+  };
+  await fetch('/ui/api/findings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  closeFindingModal();
+  if (curTab === 'info') renderInfo();
+  if (document.getElementById('rpanel-findings').style.display !== 'none') loadFindings();
+}
+
+async function deleteFinding(id) {
+  await fetch('/ui/api/findings/'+id, {method:'DELETE'});
+  if (curTab === 'info') renderInfo();
+  if (document.getElementById('rpanel-findings').style.display !== 'none') loadFindings();
+}
+
+// ── report tab sub-navigation ─────────────────────────────────────────────
+
+let curRTab = '';
+
+function setRTab(name) {
+  curRTab = name;
+  document.querySelectorAll('[data-rtab]').forEach(el => {
+    el.classList.toggle('active', el.dataset.rtab === name);
+  });
+  document.querySelectorAll('[id^="rpanel-"]').forEach(el => { el.style.display = 'none'; });
+  document.getElementById('rpanel-' + name).style.display = 'block';
+  if (name === 'findings')  loadFindings();
+  if (name === 'timeline')  loadTimeline();
+  if (name === 'labels')    loadLabels();
+}
+
+async function loadReport() {
+  setRTab(curRTab || 'findings');
+}
+
+const _sevColor = {CRIT:'#ef4444',HIGH:'#f97316',MED:'#eab308',LOW:'#4ade80'};
+const _sevOrder = {CRIT:0,HIGH:1,MED:2,LOW:3};
+
+async function loadFindings() {
+  const el = document.getElementById('findings-board');
+  el.innerHTML = '<div style="color:var(--dim);font-size:11px">Loading…</div>';
+  const findings = await fetch('/ui/api/findings').then(r=>r.json()).catch(()=>[]);
+  const badge = document.getElementById('badge-findings');
+  if (findings.length) { badge.style.display=''; badge.textContent=findings.length; }
+  else badge.style.display='none';
+
+  if (!findings.length) {
+    el.innerHTML = '<div style="color:var(--dim);font-size:11px;padding:8px 0">No findings yet.<br>Use the ⚑ button on any task result in the HISTORY tab.</div>';
+    return;
+  }
+
+  const grouped = {CRIT:[],HIGH:[],MED:[],LOW:[]};
+  for (const f of findings) { (grouped[f.severity] || grouped.LOW).push(f); }
+
+  el.innerHTML = ['CRIT','HIGH','MED','LOW'].filter(s=>grouped[s].length).map(sev => `
+    <div style="margin-bottom:20px">
+      <div style="font-size:9px;letter-spacing:.12em;color:${_sevColor[sev]};margin-bottom:8px;font-weight:700">${sev} (${grouped[sev].length})</div>
+      ${grouped[sev].map(f => `
+        <div style="border:1px solid var(--border);border-left:3px solid ${_sevColor[f.severity]};
+                    padding:10px 12px;margin-bottom:6px;background:var(--surf2)">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+            <div>
+              <div style="font-size:12px;font-weight:600;margin-bottom:3px">${esc(f.title)}</div>
+              <div style="font-size:10px;color:var(--dim)">
+                Session <code>${esc(f.session_id.slice(0,10))}</code>
+                ${f.task_id ? ' · Task <code>'+esc(f.task_id.slice(0,10))+'</code>' : ''}
+                · ${esc(f.operator||'—')} · ${esc((f.created_at||'').slice(5,16))}
+              </div>
+            </div>
+            <button class="cbtn" onclick="deleteFinding(${f.id})" style="flex-shrink:0">✕</button>
+          </div>
+          ${f.recommendation ? `<div style="margin-top:7px;font-size:11px;color:var(--dim);border-top:1px solid var(--border);padding-top:7px">${esc(f.recommendation)}</div>` : ''}
+        </div>`).join('')}
+    </div>`).join('');
+}
+
+async function loadTimeline() {
+  const el = document.getElementById('timeline-board');
+  el.innerHTML = '<div style="color:var(--dim);font-size:11px">Loading…</div>';
+  const rows = await fetch('/ui/api/timeline').then(r=>r.json()).catch(()=>[]);
+  if (!rows.length) { el.innerHTML='<div style="color:var(--dim);font-size:11px">No tasks yet.</div>'; return; }
+
+  // group by session for color coding
+  const sids = [...new Set(rows.map(r=>r.session_id))];
+  const sidColor = {};
+  const palette = ['#ef4444','#f97316','#eab308','#4ade80','#38bdf8','#a78bfa'];
+  sids.forEach((s,i)=>{ sidColor[s]=palette[i%palette.length]; });
+
+  el.innerHTML = '<div style="position:relative;padding-left:18px;border-left:1px solid var(--border)">' +
+    rows.map(r => {
+      const ts    = (r.dispatched_at||'').slice(5,16);
+      const cred  = r.has_creds ? '<span style="color:var(--glow);font-size:9px;margin-left:6px">⚷</span>' : '';
+      const color = sidColor[r.session_id] || 'var(--dim)';
+      const host  = r.host || r.session_id.slice(0,8);
+      const label = r.label ? ` (${r.label})` : '';
+      return `<div style="margin-bottom:5px;font-size:11px;display:flex;gap:8px;align-items:baseline">
+        <span style="color:var(--dim);font-size:10px;min-width:90px;flex-shrink:0">${esc(ts)}</span>
+        <span style="color:${color};font-size:9px;min-width:80px;flex-shrink:0">${esc(host+label)}</span>
+        <span style="flex:1;color:var(--text)">${esc((r.command||'').slice(0,80))}</span>
+        ${cred}
+      </div>`;
+    }).join('') + '</div>';
 }
 
 // ── shell ──────────────────────────────────────────────────────────────────
@@ -2629,8 +2893,7 @@ async function loadAttack() {
   } catch(_) {}
 }
 
-// ── Report ─────────────────────────────────────────────────────────────────
-async function loadReport() {
+async function loadLabels() {
   try {
     const sessions = await fetch('/ui/api/sessions').then(r=>r.json());
     document.getElementById('label-editor').innerHTML = sessions.map(s => `

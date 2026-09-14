@@ -205,6 +205,17 @@ CREATE TABLE IF NOT EXISTS events (
     detail          TEXT,
     extra           TEXT
 );
+
+CREATE TABLE IF NOT EXISTS findings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT,
+    task_id         TEXT,
+    title           TEXT,
+    severity        TEXT,
+    recommendation  TEXT,
+    created_at      TEXT,
+    operator        TEXT
+);
 """
 
 
@@ -222,9 +233,15 @@ class EngagementDB:
     def _init(self) -> None:
         with self._lock, self._conn() as c:
             c.executescript(_SCHEMA)
-            for col, default in [("c2_key", "0"), ("sysinfo", "NULL")]:
+            migrations = [
+                ("c2_key",    "INTEGER", "0"),
+                ("sysinfo",   "TEXT",    "NULL"),
+                ("narrative", "TEXT",    "NULL"),
+                ("pwned",     "INTEGER", "0"),
+            ]
+            for col, typ, default in migrations:
                 try:
-                    c.execute(f"ALTER TABLE sessions ADD COLUMN {col} {'INTEGER' if col=='c2_key' else 'TEXT'} DEFAULT {default}")
+                    c.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typ} DEFAULT {default}")
                 except Exception:
                     pass
 
@@ -257,6 +274,51 @@ class EngagementDB:
     def set_c2_key(self, session_id: str, key: int) -> None:
         with self._lock, self._conn() as c:
             c.execute("UPDATE sessions SET c2_key=? WHERE id=?", (key, session_id))
+
+    def set_narrative(self, session_id: str, narrative: str, pwned: bool) -> None:
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE sessions SET narrative=?, pwned=? WHERE id=?",
+                      (narrative, 1 if pwned else 0, session_id))
+
+    def add_finding(self, session_id: str, task_id: str | None, title: str,
+                    severity: str, recommendation: str, operator: str) -> int:
+        now = self._now()
+        with self._lock, self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO findings(session_id,task_id,title,severity,recommendation,created_at,operator)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (session_id, task_id, title, severity, recommendation, now, operator),
+            )
+            return cur.lastrowid
+
+    def get_findings(self, session_id: str | None = None) -> list[dict]:
+        with self._conn() as c:
+            if session_id:
+                rows = c.execute(
+                    "SELECT * FROM findings WHERE session_id=? ORDER BY created_at", (session_id,)
+                ).fetchall()
+            else:
+                rows = c.execute("SELECT * FROM findings ORDER BY severity,created_at").fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_finding(self, finding_id: int) -> None:
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM findings WHERE id=?", (finding_id,))
+
+    def get_timeline(self) -> list[dict]:
+        """All tasks across all sessions sorted chronologically."""
+        with self._conn() as c:
+            rows = c.execute("""
+                SELECT t.id, t.session_id, t.command, t.dispatched_at,
+                       t.technique_id, t.technique_desc,
+                       r.has_creds, r.received_at,
+                       s.host, s.label
+                FROM tasks t
+                LEFT JOIN results r ON r.task_id=t.id
+                LEFT JOIN sessions s ON s.id=t.session_id
+                ORDER BY t.dispatched_at
+            """).fetchall()
+        return [dict(r) for r in rows]
 
     def get_live_sessions(self) -> list[dict]:
         """Return sessions that have a c2_key set (i.e. were live C2 sessions)."""
@@ -469,10 +531,14 @@ class EngagementDB:
         }
 
     def export_markdown(self) -> str:
-        data = self.export_json()
-        s    = data["summary"]
-        now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        data     = self.export_json()
+        s        = data["summary"]
+        now      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        findings = self.get_findings()
         lines: list[str] = []
+
+        _sev_order = {"CRIT": 0, "HIGH": 1, "MED": 2, "LOW": 3}
+        findings_sorted = sorted(findings, key=lambda f: _sev_order.get(f.get("severity","LOW"), 9))
 
         lines += [
             "# Lilith Engagement Report",
@@ -480,6 +546,34 @@ class EngagementDB:
             "",
             "---",
             "",
+        ]
+
+        # Findings executive summary (most valuable for the client)
+        if findings_sorted:
+            sev_counts = {}
+            for f in findings_sorted:
+                sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
+            sev_str = " · ".join(f"{v} {k}" for k, v in sev_counts.items())
+            lines += [
+                f"## Findings ({len(findings_sorted)}) — {sev_str}",
+                "",
+            ]
+            for f in findings_sorted:
+                sev = f.get("severity", "LOW")
+                lines += [
+                    f"### [{sev}] {f['title']}",
+                    "",
+                    f"**Session:** `{f['session_id']}`" + (f"  |  **Task:** `{f['task_id']}`" if f.get('task_id') else ""),
+                    f"**Reported by:** {f.get('operator','—')}  |  **At:** {f.get('created_at','—')}",
+                    "",
+                    "**Recommendation:**",
+                    "",
+                    f"> {f.get('recommendation','—')}",
+                    "",
+                ]
+            lines += ["---", ""]
+
+        lines += [
             "## Summary",
             "",
             "| Metric | Value |",
