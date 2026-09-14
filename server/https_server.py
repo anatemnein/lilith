@@ -267,7 +267,8 @@ def _c2_store_result(session_id: str, task_id: str, output: str) -> None:
 
 
 def _auto_analyze_result(session_id: str, task_id: str, output: str, has_creds: bool) -> None:
-    """Fire Astaroth auto-analysis in a background thread when a C2 result arrives."""
+    """Disabled — Astaroth is manual-only. History is absorbed when operator consults."""
+    return
     clean = output.strip()
     if len(clean) < 80:
         return
