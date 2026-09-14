@@ -639,24 +639,34 @@ _UI_HTML = r"""<!doctype html>
 <title>LILITH // C2</title>
 <style>
 :root {
-  --bg:      #060606;
-  --surf:    #0d0d0d;
-  --surf2:   #111111;
-  --surf3:   #181818;
-  --border:  #1a1a1a;
-  --bord2:   #252525;
-  --red:     #c81e1e;
+  --bg:      #050505;
+  --surf:    #0a0a0a;
+  --surf2:   #0e0e0e;
+  --surf3:   #141414;
+  --border:  #1c1c1c;
+  --bord2:   #272727;
+  --red:     #b91c1c;
   --red2:    #ef4444;
-  --red3:    rgba(200,30,30,.18);
-  --red4:    rgba(200,30,30,.07);
-  --text:    #cccccc;
-  --dim:     #555555;
-  --dim2:    #777777;
+  --red3:    rgba(185,28,28,.22);
+  --red4:    rgba(185,28,28,.08);
+  --text:    #d4d4d4;
+  --dim:     #4a4a4a;
+  --dim2:    #6b6b6b;
   --green:   #16a34a;
   --glow:    #4ade80;
   --yellow:  #ca8a04;
   --amber:   #fbbf24;
+  --crimson: #7f1d1d;
   --mono:    'Cascadia Code','Consolas','JetBrains Mono',monospace;
+  /* integrity level colors */
+  --int-low:    #374151;
+  --int-med:    #1e3a5f;
+  --int-high:   #78350f;
+  --int-sys:    #7f1d1d;
+  --int-low-t:  #9ca3af;
+  --int-med-t:  #60a5fa;
+  --int-high-t: #fbbf24;
+  --int-sys-t:  #f87171;
 }
 *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
 html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 var(--mono); overflow:hidden; }
@@ -665,23 +675,32 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
 #topbar {
   height:38px; display:flex; align-items:center; gap:0;
   background:var(--surf); border-bottom:1px solid var(--border);
-  flex-shrink:0; overflow:hidden;
+  box-shadow: 0 1px 0 rgba(185,28,28,.3), 0 2px 8px rgba(185,28,28,.05);
+  flex-shrink:0; overflow:hidden; position:relative; z-index:10;
 }
 .logo {
-  padding:0 16px; font-size:13px; font-weight:700; color:var(--red2);
-  letter-spacing:.05em; border-right:1px solid var(--border); height:100%;
-  display:flex; align-items:center; gap:6px; flex-shrink:0;
+  padding:0 18px; font-size:13px; font-weight:700; color:var(--red2);
+  letter-spacing:.08em; border-right:1px solid var(--border); height:100%;
+  display:flex; align-items:center; gap:8px; flex-shrink:0;
+  text-shadow:0 0 12px rgba(239,68,68,.4);
 }
-.logo span { color:var(--dim2); font-weight:400; }
+.logo span { color:var(--dim2); font-weight:400; letter-spacing:.04em; }
+.logo::before {
+  content:'⬡'; font-size:10px; color:var(--red); opacity:.7;
+  animation: logopulse 3s ease-in-out infinite;
+}
+@keyframes logopulse {
+  0%,100% { opacity:.4; } 50% { opacity:.9; text-shadow:0 0 8px var(--red2); }
+}
 #topnav { display:flex; height:100%; }
 .tnav {
-  padding:0 14px; height:100%; display:flex; align-items:center;
-  font-size:10px; letter-spacing:.12em; color:var(--dim2); cursor:pointer;
+  padding:0 16px; height:100%; display:flex; align-items:center;
+  font-size:10px; letter-spacing:.14em; color:var(--dim2); cursor:pointer;
   border-right:1px solid var(--border); border-bottom:2px solid transparent;
-  transition:all .1s; user-select:none;
+  transition:color .15s, background .15s; user-select:none;
 }
 .tnav:hover { color:var(--text); background:var(--surf3); }
-.tnav.active { color:var(--red2); border-bottom-color:var(--red); }
+.tnav.active { color:var(--red2); border-bottom-color:var(--red); text-shadow:0 0 8px rgba(239,68,68,.3); }
 #topbar-right {
   margin-left:auto; display:flex; align-items:center; gap:12px;
   padding:0 14px; font-size:10px; color:var(--dim);
@@ -703,29 +722,40 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
 
 /* ── session sidebar ── */
 #sess-sidebar {
-  width:220px; min-width:220px; background:var(--surf);
+  width:240px; min-width:240px; background:var(--surf);
   border-right:1px solid var(--border); display:flex; flex-direction:column;
   overflow:hidden;
 }
 #sess-sidebar-hdr {
-  padding:8px 12px; font-size:9px; letter-spacing:.12em; color:var(--dim);
+  padding:7px 12px; font-size:9px; letter-spacing:.14em; color:var(--dim);
   border-bottom:1px solid var(--border); display:flex; justify-content:space-between;
-  align-items:center; flex-shrink:0;
+  align-items:center; flex-shrink:0; text-transform:uppercase;
 }
 #sess-list { flex:1; overflow-y:auto; }
 .sess-item {
-  padding:8px 12px; cursor:pointer; border-bottom:1px solid var(--border);
-  border-left:2px solid transparent; transition:all .1s;
+  padding:9px 12px 8px; cursor:pointer; border-bottom:1px solid var(--border);
+  border-left:3px solid transparent; transition:background .1s, border-color .1s;
+  position:relative;
 }
 .sess-item:hover { background:var(--surf3); }
 .sess-item.active { border-left-color:var(--red); background:var(--red4); }
-.sess-item-id { font-size:10px; color:var(--dim2); margin-bottom:2px; }
-.sess-item-host { font-size:11px; color:var(--text); }
-.sess-item-meta { display:flex; align-items:center; gap:6px; margin-top:3px; }
+.sess-item-meta { display:flex; align-items:center; gap:5px; margin-bottom:4px; }
+.sess-item-id { font-size:9px; color:var(--dim); font-family:var(--mono); }
+.sess-item-host { font-size:12px; color:var(--text); font-weight:600; margin-bottom:3px; line-height:1.3; }
+.sess-item-sub { font-size:10px; color:var(--dim2); display:flex; gap:6px; align-items:center; }
+.int-badge {
+  font-size:8px; letter-spacing:.06em; padding:1px 4px; border-radius:2px;
+  font-weight:700; flex-shrink:0;
+}
+.int-low  { background:var(--int-low);  color:var(--int-low-t);  }
+.int-med  { background:var(--int-med);  color:var(--int-med-t);  }
+.int-high { background:var(--int-high); color:var(--int-high-t); }
+.int-sys  { background:var(--int-sys);  color:var(--int-sys-t);  box-shadow:0 0 4px rgba(248,113,113,.3); }
 .sess-del { margin-left:auto; background:none; border:none; color:var(--dim); cursor:pointer;
-            font-size:13px; line-height:1; padding:0 2px; }
+            font-size:13px; line-height:1; padding:0 2px; opacity:0; transition:opacity .1s; }
+.sess-item:hover .sess-del { opacity:1; }
 .sess-del:hover { color:var(--red2); }
-.sess-empty { padding:16px 12px; font-size:11px; color:var(--dim); text-align:center; }
+.sess-empty { padding:20px 12px; font-size:10px; color:var(--dim); text-align:center; letter-spacing:.06em; }
 
 /* ── main panel ── */
 #main { flex:1; overflow:hidden; display:flex; flex-direction:column; }
@@ -747,20 +777,41 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
 #sess-detail { flex:1; overflow:hidden; display:flex; flex-direction:column; }
 #no-session {
   flex:1; display:flex; align-items:center; justify-content:center;
-  color:var(--dim); font-size:11px; flex-direction:column; gap:8px;
+  color:var(--dim); font-size:11px; flex-direction:column; gap:16px;
 }
-#no-session .big { font-size:32px; opacity:.2; }
+#no-session .big { font-size:32px; opacity:.15; }
+.ascii-lilith {
+  font-size:10px; line-height:1.4; color:var(--crimson); opacity:.35;
+  white-space:pre; pointer-events:none; text-shadow:0 0 6px var(--red);
+  animation: asciifade 4s ease-in-out infinite;
+}
+@keyframes asciifade {
+  0%,100% { opacity:.2; } 50% { opacity:.45; }
+}
 #session-panel { flex:1; overflow:hidden; display:none; flex-direction:column; }
 
 /* ── session header ── */
 #sess-hdr {
-  padding:10px 16px; background:var(--surf); border-bottom:1px solid var(--border);
-  display:flex; align-items:center; gap:12px; flex-shrink:0; flex-wrap:wrap;
+  padding:8px 16px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:10px; flex-shrink:0; flex-wrap:wrap;
+  background: linear-gradient(to right, var(--surf), var(--bg));
 }
-#sess-hdr-host { font-size:14px; color:var(--text); font-weight:600; }
-#sess-hdr-ip   { font-size:11px; color:var(--dim2); }
-#sess-hdr-badges { display:flex; gap:6px; align-items:center; }
-#sess-hdr-stats { margin-left:auto; display:flex; gap:12px; font-size:10px; color:var(--dim); }
+#sess-hdr-host { font-size:15px; color:var(--text); font-weight:700; letter-spacing:.01em; }
+#sess-hdr-ip   { font-size:10px; color:var(--dim2); font-family:var(--mono); }
+#sess-hdr-badges { display:flex; gap:5px; align-items:center; }
+#sess-hdr-dossier {
+  display:flex; gap:0; align-items:stretch; margin-left:8px;
+  border:1px solid var(--border); border-radius:3px; overflow:hidden;
+  font-size:10px;
+}
+.doss-cell {
+  padding:3px 8px; display:flex; flex-direction:column; gap:1px;
+  border-right:1px solid var(--border); background:var(--surf2);
+}
+.doss-cell:last-child { border-right:none; }
+.doss-label { font-size:8px; letter-spacing:.1em; color:var(--dim); text-transform:uppercase; }
+.doss-val { color:var(--text); font-size:10px; font-family:var(--mono); white-space:nowrap; }
+#sess-hdr-stats { margin-left:auto; display:flex; gap:10px; font-size:10px; color:var(--dim); align-items:center; }
 .hdr-stat strong { color:var(--text); }
 #sess-hdr-actions { display:flex; gap:6px; }
 
@@ -824,23 +875,54 @@ html,body { height:100%; background:var(--bg); color:var(--text); font:12px/1.5 
 #shell-out:empty::before {
   content:"run a command to begin";
   position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
-  color:var(--bord2); font-size:11px; letter-spacing:.06em; pointer-events:none;
+  color:var(--border); font-size:11px; letter-spacing:.1em; pointer-events:none;
 }
-.sl { word-break:break-all; }
-.sl-cmd-line { display:flex; gap:6px; margin-top:8px; margin-bottom:2px; align-items:baseline; }
-.sl-prompt { color:var(--red); flex-shrink:0; }
+.sl { word-break:break-all; position:relative; }
+.sl-cmd-line {
+  display:flex; gap:6px; margin-top:10px; margin-bottom:2px; align-items:baseline;
+  padding-bottom:4px; border-bottom:1px solid var(--border);
+}
+.sl-prompt { color:var(--red); flex-shrink:0; font-weight:700; }
 .sl-cmd    { color:#e5e7eb; flex:1; }
-.sl-ts     { font-size:9px; color:var(--bord2); flex-shrink:0; margin-left:auto; }
-.sl-output { color:#9ca3af; white-space:pre-wrap; padding-left:2px; }
+.sl-ts     { font-size:9px; color:var(--dim); flex-shrink:0; margin-left:auto; }
+.sl-op     { font-size:9px; color:var(--dim); flex-shrink:0; }
+.sl-output { color:#a0a0a0; white-space:pre-wrap; padding-left:2px; line-height:1.6; }
+.sl-output-block {
+  position:relative; margin:2px 0;
+}
+.sl-output-block .copy-out {
+  position:absolute; right:0; top:0;
+  font-size:9px; padding:1px 5px; opacity:0; transition:opacity .15s;
+  background:var(--surf3); border:1px solid var(--bord2); border-radius:2px;
+  color:var(--dim2); cursor:pointer; font-family:var(--mono);
+}
+.sl-output-block:hover .copy-out { opacity:1; }
+.sl-output-block .copy-out:hover { color:var(--text); border-color:var(--red); }
+.sl-out-collapse {
+  color:var(--dim); font-size:10px; cursor:pointer; padding:2px 0;
+  display:block; text-decoration:underline; text-decoration-style:dotted;
+}
+.sl-out-collapse:hover { color:var(--text); }
+/* output line colorization */
+.sl-output .err-line { color:#f87171; }
+.sl-output .ok-line  { color:#4ade80; }
+.sl-output .warn-line { color:#fbbf24; }
 .sl-err    { color:#f87171; }
-.sl-info   { color:var(--dim2); font-style:italic; }
-.sl-pending { color:var(--amber); }
-.sl-cred   { color:var(--glow); }
+.sl-info   { color:var(--dim2); font-style:italic; font-size:11px; }
+.sl-sys    { color:var(--dim2); font-style:italic; font-size:11px; }
+.sl-ok     { color:#4ade80; }
+.sl-pending { color:var(--amber); animation:blink .8s step-start infinite; }
+@keyframes blink { 50% { opacity:.4; } }
+.sl-cred   { color:var(--glow); font-weight:600; }
+/* shell input bar */
 #shell-input-bar {
   display:flex; gap:8px; align-items:center;
-  padding:8px 14px; background:var(--surf); border-top:1px solid var(--border); flex-shrink:0;
+  padding:8px 14px; background:var(--surf);
+  border-top:1px solid var(--border);
+  box-shadow: 0 -1px 0 rgba(185,28,28,.15);
+  flex-shrink:0;
 }
-#shell-prompt-lbl { color:var(--red); flex-shrink:0; }
+#shell-prompt-lbl { color:var(--red); flex-shrink:0; font-weight:700; }
 #shell-input {
   flex:1; background:transparent; border:none; outline:none;
   color:var(--text); font:12px var(--mono); caret-color:var(--red2);
@@ -1089,8 +1171,13 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
       <div id="sess-detail">
         <!-- Nothing selected -->
         <div id="no-session">
-          <div class="big">◈</div>
-          <div>select a session</div>
+          <div class="ascii-lilith"> ██╗     ██╗██╗     ██╗████████╗██╗  ██╗
+ ██║     ██║██║     ██║╚══██╔══╝██║  ██║
+ ██║     ██║██║     ██║   ██║   ███████║
+ ██║     ██║██║     ██║   ██║   ██╔══██║
+ ███████╗██║███████╗██║   ██║   ██║  ██║
+ ╚══════╝╚═╝╚══════╝╚═╝   ╚═╝   ╚═╝  ╚═╝</div>
+          <div style="font-size:10px;letter-spacing:.16em;color:var(--dim)">SELECT A SESSION</div>
         </div>
 
         <!-- Session panel -->
@@ -1102,6 +1189,13 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
               <div id="sess-hdr-ip" style="margin-top:1px"></div>
             </div>
             <div id="sess-hdr-badges"></div>
+            <div id="sess-hdr-dossier">
+              <div class="doss-cell"><span class="doss-label">USER</span><span class="doss-val" id="doss-user">—</span></div>
+              <div class="doss-cell"><span class="doss-label">INTEGRITY</span><span class="doss-val" id="doss-int">—</span></div>
+              <div class="doss-cell"><span class="doss-label">ARCH</span><span class="doss-val" id="doss-arch">—</span></div>
+              <div class="doss-cell"><span class="doss-label">SLEEP</span><span class="doss-val" id="doss-sleep">—</span></div>
+              <div class="doss-cell"><span class="doss-label">PID</span><span class="doss-val" id="doss-pid">—</span></div>
+            </div>
             <div id="sess-hdr-stats">
               <div class="hdr-stat">Tasks <strong id="hdr-tasks">0</strong></div>
               <div class="hdr-stat">Creds <strong id="hdr-creds">0</strong></div>
@@ -1419,6 +1513,17 @@ let curTab       = 'shell';
 let curGV        = 'ops';
 
 // ── utils ──────────────────────────────────────────────────────────────────
+function timeAgo(ts) {
+  if (!ts) return '';
+  try {
+    const d = new Date(ts); const now = new Date();
+    const s = Math.floor((now - d) / 1000);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s/60) + 'm ago';
+    if (s < 86400) return Math.floor(s/3600) + 'h ago';
+    return Math.floor(s/86400) + 'd ago';
+  } catch(_) { return ''; }
+}
 const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const fmtSize = b => b < 1024 ? b+'B' : b < 1048576 ? (b/1024).toFixed(1)+'KB' : (b/1048576).toFixed(2)+'MB';
 const fmtTs   = s => s ? s.slice(11,19) : '';
@@ -1599,16 +1704,28 @@ function renderSessList() {
     const live = liveSessions[sid] || null;
     const host = live ? live.host : (db.host||'?');
     const dot  = live ? (live.stale ? 'dot-y':'dot-g') : 'dot-d';
-    const label = db.label ? `<div style="font-size:9px;color:var(--dim);margin-top:1px">${esc(db.label)}</div>` : '';
+    const label = db.label ? `<div style="font-size:9px;color:var(--red2);margin-top:2px;letter-spacing:.04em">${esc(db.label)}</div>` : '';
+    const intStr = db.sysinfo_integrity || live?.integrity || '';
+    let intClass = 'int-low', intLabel = 'LOW';
+    if (/system/i.test(intStr))      { intClass='int-sys';  intLabel='SYSTEM'; }
+    else if (/high/i.test(intStr))   { intClass='int-high'; intLabel='HIGH'; }
+    else if (/medium/i.test(intStr)) { intClass='int-med';  intLabel='MED'; }
+    const intBadge = intStr ? `<span class="int-badge ${intClass}">${intLabel}</span>` : '';
+    const user = db.sysinfo_user || live?.user || '';
+    const userStr = user ? `<span>${esc(user.split('\\\\').pop())}</span>` : '';
+    const elapsed = live ? '' : (db.last_seen ? `<span style="color:var(--dim)">${esc(timeAgo(db.last_seen))}</span>` : '');
     return `<div class="sess-item ${sid===selectedSid?'active':''}" onclick="selectSession('${esc(sid)}')">
       <div class="sess-item-meta">
         <span class="dot ${dot}"></span>
-        <span class="sess-item-id">${esc(sid.slice(0,14))}</span>
-        <button class="sess-del" title="Remove from history" onclick="event.stopPropagation();dismissSession('${esc(sid)}')">×</button>
+        <span class="sess-item-id">${esc(sid.slice(0,12))}</span>
+        <button class="sess-del" title="Remove" onclick="event.stopPropagation();dismissSession('${esc(sid)}')">×</button>
       </div>
       <div class="sess-item-host">${esc(host)}</div>
+      <div class="sess-item-sub">
+        ${intBadge}${userStr}
+        ${live ? `<span style="color:var(--dim)">${esc(live.last_seen)}</span>` : elapsed}
+      </div>
       ${label}
-      ${live ? `<div style="font-size:9px;color:var(--dim);margin-top:1px">${esc(live.last_seen)}</div>` : ''}
     </div>`;
   });
   el.innerHTML = rows.join('');
@@ -1655,7 +1772,23 @@ function renderSessionHeader() {
   const s    = sessDetail.session || {};
   const live = liveSessions[selectedSid] || null;
   document.getElementById('sess-hdr-host').textContent = live ? live.host : (s.host||'—');
-  document.getElementById('sess-hdr-ip').textContent   = selectedSid.slice(0,20);
+  document.getElementById('sess-hdr-ip').textContent   = live ? (live.ip||'') : '';
+  const si = s.sysinfo || {};
+  const setD = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v||'—'; };
+  setD('doss-user', si.username || live?.user || s.username || '');
+  const intStr = si.integrity || live?.integrity || s.integrity || '';
+  const dossInt = document.getElementById('doss-int');
+  if (dossInt) {
+    dossInt.textContent = intStr || '—';
+    dossInt.className = 'doss-val';
+    if (/system/i.test(intStr)) dossInt.style.color='var(--int-sys-t)';
+    else if (/high/i.test(intStr)) dossInt.style.color='var(--int-high-t)';
+    else if (/medium/i.test(intStr)) dossInt.style.color='var(--int-med-t)';
+    else dossInt.style.color='';
+  }
+  setD('doss-arch', si.arch || s.arch || '');
+  setD('doss-sleep', live ? (live.sleep_ms != null ? (live.sleep_ms/1000)+'s' : '—') : '—');
+  setD('doss-pid', si.pid || live?.pid || s.pid || '');
 
   const tasks  = sessDetail.tasks || [];
   const creds  = tasks.filter(t => t.has_creds).length;
@@ -1817,6 +1950,13 @@ function shellKey(e) {
     document.getElementById('shell-input').value = shellHist[shellHist.length-1-histIdx]||'';
   }
 }
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey||e.metaKey) && e.key==='k') {
+    e.preventDefault();
+    const inp = document.getElementById('shell-input');
+    if (inp) { inp.focus(); inp.select(); }
+  }
+});
 
 const _CMD_ALIASES = {
   'ps':      'tasklist /V /FO TABLE',
@@ -1915,10 +2055,40 @@ function shellAppend(type, text) {
   const out = document.getElementById('shell-out');
   const d   = document.createElement('div');
   d.className = 'sl sl-'+type;
-  d.textContent = text;
-  out.appendChild(d);
-  shellScroll();
-  return d;
+  if (type === 'output') {
+    const lines = text.split('\\n');
+    const LIMIT = 30;
+    const colorLine = l => {
+      const le = esc(l);
+      if (/access.denied|error:|exception:|failed|not found|cannot|refused|denied|0x[0-9a-f]{8}/i.test(l)) return `<span class="err-line">${le}</span>`;
+      if (/success|complete|enabled|started|true|ok\\b|\\[\\+\\]/i.test(l)) return `<span class="ok-line">${le}</span>`;
+      if (/warning|warn:|deprecated|\\[!\\]/i.test(l)) return `<span class="warn-line">${le}</span>`;
+      return le;
+    };
+    const wrap = document.createElement('div');
+    wrap.className = 'sl-output-block';
+    wrap._rawText = text;
+    if (lines.length > LIMIT) {
+      const visible = lines.slice(0, LIMIT).map(colorLine).join('\\n');
+      const hidden  = lines.slice(LIMIT).map(colorLine).join('\\n');
+      const more = lines.length - LIMIT;
+      wrap.innerHTML = `<button class="copy-out" onclick="navigator.clipboard.writeText(this.parentNode._rawText)">copy</button>
+        <pre class="sl-output">${visible}</pre>
+        <pre class="sl-output" style="display:none">${hidden}</pre>
+        <span class="sl-out-collapse" onclick="const h=this.previousElementSibling;const v=h.style.display===\\'none\\';h.style.display=v?\\'block\\':\\'none\\';this.textContent=v?\\'▲ collapse\\':\\'▼ ${more} more lines\\'">▼ ${more} more lines</span>`;
+    } else {
+      wrap.innerHTML = `<button class="copy-out" onclick="navigator.clipboard.writeText(this.parentNode._rawText)">copy</button>
+        <pre class="sl-output">${lines.map(colorLine).join('\\n')}</pre>`;
+    }
+    out.appendChild(wrap);
+    shellScroll();
+    return wrap;
+  } else {
+    d.textContent = text;
+    out.appendChild(d);
+    shellScroll();
+    return d;
+  }
 }
 
 // Injection-friendly targets — highlight in process table
