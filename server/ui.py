@@ -130,6 +130,13 @@ def _api_session(db, session_id: str) -> dict:
     sessions = [s for s in db.get_sessions() if s["id"] == session_id]
     if not sessions:
         return {}
+    sess = sessions[0]
+    # Unpack sysinfo JSON into the session object for the UI
+    si_raw = sess.pop("sysinfo", None)
+    try:
+        sess["sysinfo"] = json.loads(si_raw) if si_raw else {}
+    except Exception:
+        sess["sysinfo"] = {}
     tasks   = db.get_tasks(session_id)
     results = db.get_results_for_session(session_id)
     events  = db.get_events(session_id)
@@ -143,7 +150,7 @@ def _api_session(db, session_id: str) -> dict:
             t["cred_hints"] = json.loads(hints) if hints else []
         except Exception:
             t["cred_hints"] = []
-    return {"session": sessions[0], "tasks": tasks, "events": events}
+    return {"session": sess, "tasks": tasks, "events": events}
 
 def _api_credentials(db) -> list:
     rows = db.get_cred_results()

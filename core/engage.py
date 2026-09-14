@@ -222,11 +222,11 @@ class EngagementDB:
     def _init(self) -> None:
         with self._lock, self._conn() as c:
             c.executescript(_SCHEMA)
-            # migration: c2_key added after initial schema
-            try:
-                c.execute("ALTER TABLE sessions ADD COLUMN c2_key INTEGER DEFAULT 0")
-            except Exception:
-                pass
+            for col, default in [("c2_key", "0"), ("sysinfo", "NULL")]:
+                try:
+                    c.execute(f"ALTER TABLE sessions ADD COLUMN {col} {'INTEGER' if col=='c2_key' else 'TEXT'} DEFAULT {default}")
+                except Exception:
+                    pass
 
     def _now(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -240,6 +240,19 @@ class EngagementDB:
                 "INSERT OR IGNORE INTO sessions(id,host,registered_at,last_seen) VALUES(?,?,?,?)",
                 (session_id, host, now, now),
             )
+
+    def update_sysinfo(self, session_id: str, data: dict) -> None:
+        import json as _json
+        with self._lock, self._conn() as c:
+            existing = c.execute("SELECT sysinfo FROM sessions WHERE id=?", (session_id,)).fetchone()
+            merged = {}
+            if existing and existing[0]:
+                try:
+                    merged = _json.loads(existing[0])
+                except Exception:
+                    pass
+            merged.update({k: v for k, v in data.items() if v})
+            c.execute("UPDATE sessions SET sysinfo=? WHERE id=?", (_json.dumps(merged), session_id))
 
     def set_c2_key(self, session_id: str, key: int) -> None:
         with self._lock, self._conn() as c:
@@ -322,6 +335,7 @@ class EngagementDB:
     # ── readers ───────────────────────────────────────────────────────────────
 
     def get_sessions(self) -> list[dict]:
+        import json as _json
         with self._conn() as c:
             rows = c.execute("""
                 SELECT s.*,
@@ -333,7 +347,18 @@ class EngagementDB:
                 GROUP BY s.id
                 ORDER BY s.registered_at
             """).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            si_raw = d.get("sysinfo")  # keep sysinfo in dict for _api_session
+            try:
+                si = _json.loads(si_raw) if si_raw else {}
+            except Exception:
+                si = {}
+            d["sysinfo_user"]      = si.get("username", "")
+            d["sysinfo_integrity"] = si.get("integrity", "")
+            result.append(d)
+        return result
 
     def get_tasks(self, session_id: str | None = None) -> list[dict]:
         with self._conn() as c:
