@@ -133,9 +133,9 @@ TOOL_CATALOG: dict[str, dict] = {
         "desc": "MSSQL enumeration + RCE",
     },
     "winPEAS": {
-        "paths": _win("winPEAS.exe"),
+        "paths": _win("winPEASany.exe") + _win("winPEAS.exe"),
         "default_params": "",
-        "desc": "Privilege escalation scanner",
+        "desc": "Privilege escalation scanner (auto-patched: AV/EDR signatures stripped at encode time)",
     },
     "RunasCs": {
         "paths": _win("RunasCs.exe"),
@@ -245,13 +245,24 @@ def is_dotnet_assembly(binary_path: str) -> bool:
 
 def encode_tool_clr(binary_path: str, output_path: str) -> bool:
     """Pack a .NET assembly as a two-layer XOR .enc without donut.
-    The runner loads this via Assembly.Load() — no native CLR COM calls."""
+    The runner loads this via Assembly.Load() — no native CLR COM calls.
+    winPEAS binaries are auto-patched to strip all static AV/EDR signatures
+    before encoding."""
     try:
         with open(binary_path, "rb") as f:
             raw = f.read()
     except OSError as e:
         print(f"[!] Cannot read {binary_path}: {e}")
         return False
+
+    # Auto-patch winPEAS-family binaries before encoding
+    try:
+        from builders.winpeas_patcher import patch_winpeas
+        if b"BSJB" in raw and (b"winPEAS" in raw or b"winpeas" in raw):
+            print(f"[*] winPEAS detected — stripping static signatures before encode...")
+            raw = patch_winpeas(raw)
+    except Exception as e:
+        print(f"[!] winPEAS patcher error (continuing without patch): {e}")
 
     encoded = pack_enc(raw)
     with open(output_path, "wb") as f:
