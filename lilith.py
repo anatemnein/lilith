@@ -312,7 +312,7 @@ from builders.blehid   import build_ble_payload, DEVICES as BLE_DEVICES
 from builders.nfc_tag  import build_nfc_payload
 from builders.smuggle    import build_smuggle_payload, LURE_PRESETS as SMUGGLE_LURES, load_inject_js
 from builders.ntlm_trigger import build_ntlm_triggers
-from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result, set_engage_db
+from server.https_server import start_server, get_c2_sessions, _c2_push_task, _c2_get_result, set_engage_db, set_linux_dir
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -901,6 +901,39 @@ def _build_persist_cmd(persist_type: str, cfg: dict, ws: Workspace) -> str | Non
     return None
 
 
+def cmd_linux(args, cfg, ws):
+    from builders.linux_tools import LINUX_TOOL_CATALOG, find_linux_tool, get_linux_dir
+    lhost    = getattr(args, "lhost", "") or cfg.get("lhost", "LHOST")
+    cat_filt = getattr(args, "cat",   "").lower()
+
+    lx_dir = get_linux_dir()
+    print(f"\n  Linux arsenal: {lx_dir}")
+    if not os.path.isdir(lx_dir):
+        print(f"  [!] Directory not found — create it:\n      mkdir -p {lx_dir}")
+
+    items = LINUX_TOOL_CATALOG.items()
+    if cat_filt:
+        items = [(n, v) for n, v in items if v.get("category") == cat_filt]
+        items = iter(items)
+
+    cat_order = ["recon", "privesc", "container", "creds", "lateral", "evasion", "persist"]
+    cats: dict = {}
+    for name, info in items:
+        cats.setdefault(info["category"], []).append((name, info))
+
+    for cat in cat_order:
+        entries = cats.get(cat)
+        if not entries:
+            continue
+        print(f"\n  [{cat.upper()}]")
+        for name, info in entries:
+            found    = "✓" if find_linux_tool(name) else "✗"
+            one_line = info.get("default_run", "").replace("LHOST", lhost)
+            print(f"  [{found}] {name:<26} {info['desc']}")
+            print(f"       \033[2m{one_line}\033[0m")
+    print()
+
+
 def cmd_serve(args, cfg, ws):
     from core.engage import EngagementDB
     from server.https_server import set_ui_token, restore_c2_sessions_from_db
@@ -930,6 +963,14 @@ def cmd_serve(args, cfg, ws):
         print(f"[+] Astaroth      : {'enabled (' + _ast_backend + ')' if _ast_on else 'disabled'}")
     except Exception:
         pass
+    from builders.linux_tools import get_linux_dir
+    _lx_dir = get_linux_dir()
+    if os.path.isdir(_lx_dir):
+        set_linux_dir(_lx_dir)
+        _lx_count = len([f for f in os.listdir(_lx_dir) if os.path.isfile(os.path.join(_lx_dir, f))])
+        print(f"[+] Linux arsenal : {_lx_dir} ({_lx_count} files)")
+    else:
+        print(f"[!] Linux arsenal : {_lx_dir} not found — create it and populate binaries")
     start_server(
         workspace       = ws.directory,
         lhost           = "0.0.0.0",
@@ -1615,6 +1656,12 @@ def main():
     webdav_p.add_argument("--webdav-port", metavar="PORT", dest="webdav_port", type=int, default=None,
                           help="HTTP port for WebDAV server (default: webdav_port from config, or 8080)")
 
+    linux_p = sub.add_parser("linux", help="Linux post-exploitation arsenal — list tools and delivery one-liners")
+    linux_p.add_argument("--lhost", metavar="IP", default="",
+                         help="LHOST to embed in curl one-liners (default: engagement lhost)")
+    linux_p.add_argument("--cat", metavar="CATEGORY", default="",
+                         help="Filter by category: recon|privesc|container|creds|lateral|evasion|persist")
+
     xdr_p = sub.add_parser("xdr", help="Parse Cortex XDR agent_settings.db for exclusions and uninstall hash")
     xdr_p.add_argument("--parse", metavar="DB_DIR", dest="db_dir", required=True,
                        help="Path to agent_settings.db directory (e.g. pulled from target via 'download')")
@@ -1653,6 +1700,7 @@ def main():
         "network": cmd_network,
         "xdr":     cmd_xdr,
         "engage":  cmd_engage,
+        "linux":   cmd_linux,
     }
     dispatch[args.command](args, cfg, ws)
 
