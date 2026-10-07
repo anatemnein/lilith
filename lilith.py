@@ -2173,7 +2173,6 @@ def cmd_patch(args, cfg, ws):
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
-    _banner()
     parser = argparse.ArgumentParser(
         prog="lilith",
         description="polymorphic AV/AMSI bypass framework",
