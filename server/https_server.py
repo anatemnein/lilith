@@ -839,6 +839,53 @@ class _MgmtHandler(http.server.BaseHTTPRequestHandler):
             body = json.dumps(_api_arsenal_versions(), indent=2).encode()
             self._json(body); return
 
+        # GET /mgmt/socks5  — active SOCKS5 proxies
+        if parts == ["mgmt", "socks5"]:
+            self._json(json.dumps(socks5_status()).encode()); return
+
+        # GET /mgmt/findings
+        if parts == ["mgmt", "findings"]:
+            if not _ENGAGE_DB:
+                self._json(json.dumps([]).encode()); return
+            try:
+                rows = _ENGAGE_DB.get_findings()
+            except Exception:
+                rows = []
+            self._json(json.dumps(rows, default=str).encode()); return
+
+        # GET /mgmt/{sid}/dossier
+        if len(parts) == 3 and parts[0] == "mgmt" and parts[2] == "dossier":
+            sid = parts[1]
+            info: dict = {}
+            with _C2_LOCK:
+                sess = _C2_SESSIONS.get(sid, {})
+                if sess:
+                    info["host"] = sess.get("host", "?")
+                    info["last_seen"] = sess.get("last_seen", "").strftime("%H:%M:%S") if hasattr(sess.get("last_seen"), "strftime") else str(sess.get("last_seen", ""))
+                    info["pending"] = len(sess.get("tasks", []))
+            if _ENGAGE_DB:
+                try:
+                    sessions = [s for s in _ENGAGE_DB.get_sessions() if s["id"] == sid]
+                    if sessions:
+                        info["label"] = sessions[0].get("label", "")
+                    tasks = _ENGAGE_DB.get_tasks(sid)
+                    results = _ENGAGE_DB.get_results_for_session(sid)
+                    rmap = {r["task_id"]: r for r in results}
+                    cred_outputs = []
+                    for t in tasks:
+                        if rmap.get(t["id"], {}).get("has_creds"):
+                            cred_outputs.append({
+                                "cmd": t.get("command", ""),
+                                "output": (rmap[t["id"]].get("output") or "")[:500],
+                            })
+                    info["cred_tasks"] = cred_outputs
+                    techs = list({t.get("technique_id") for t in tasks if t.get("technique_id")})
+                    info["techniques"] = techs
+                    info["task_count"] = len(tasks)
+                except Exception:
+                    pass
+            self._json(json.dumps(info, default=str).encode()); return
+
         self.send_error(404)
 
     def do_DELETE(self):
@@ -855,6 +902,21 @@ class _MgmtHandler(http.server.BaseHTTPRequestHandler):
             if not ok:
                 self.send_error(404); return
             self._json(json.dumps({"status": "killed", "session": sid}).encode()); return
+
+        # DELETE /mgmt/socks5/{sid}
+        if len(parts) == 3 and parts[0] == "mgmt" and parts[1] == "socks5":
+            sid = parts[2]
+            result = socks5_stop(sid)
+            self._json(json.dumps(result).encode()); return
+
+        # DELETE /mgmt/findings/{id}
+        if len(parts) == 3 and parts[0] == "mgmt" and parts[1] == "findings":
+            if _ENGAGE_DB:
+                try:
+                    _ENGAGE_DB.delete_finding(int(parts[2]))
+                except Exception:
+                    pass
+            self._json(json.dumps({"status": "ok"}).encode()); return
 
         self.send_error(404)
 
@@ -878,6 +940,100 @@ class _MgmtHandler(http.server.BaseHTTPRequestHandler):
             if tid is None:
                 self.send_error(404); return
             self._json(json.dumps({"task_id": tid}).encode()); return
+
+        # POST /mgmt/{sid}/tool  body={"tool":"Rubeus","params":"..."}
+        if len(parts) == 3 and parts[0] == "mgmt" and parts[2] == "tool":
+            sid = parts[1]
+            try:
+                req = json.loads(body)
+            except Exception:
+                self.send_error(400); return
+            tool_name = req.get("tool", "")
+            params    = req.get("params")  # None = use catalog default
+            if not tool_name:
+                self.send_error(400); return
+            try:
+                from server.ui import _api_arsenal_run
+                import json as _json
+                run_body = _json.dumps({"session_id": sid, "tool_name": tool_name, **({"params": params} if params is not None else {})}).encode()
+                resp_body, status = _api_arsenal_run(run_body)
+                self._json(resp_body if isinstance(resp_body, bytes) else resp_body); return
+            except Exception as e:
+                self._json(json.dumps({"error": str(e)}).encode()); return
+
+        # POST /mgmt/socks5/{sid}  body={"port":1080}
+        if len(parts) == 3 and parts[0] == "mgmt" and parts[1] == "socks5":
+            sid = parts[2]
+            try:
+                port = int(json.loads(body).get("port", 1080))
+            except Exception:
+                port = 1080
+            result = socks5_start(sid, port)
+            self._json(json.dumps(result).encode()); return
+
+        # POST /mgmt/findings  body={"text":"...","session_id":"...","severity":"high"}
+        if parts == ["mgmt", "findings"]:
+            try:
+                req = json.loads(body)
+            except Exception:
+                self.send_error(400); return
+            if _ENGAGE_DB:
+                try:
+                    fid = _ENGAGE_DB.add_finding(
+                        session_id=req.get("session_id", ""),
+                        text=req.get("text", ""),
+                        severity=req.get("severity", "medium"),
+                    )
+                    self._json(json.dumps({"id": fid}).encode()); return
+                except Exception as e:
+                    self._json(json.dumps({"error": str(e)}).encode()); return
+            self._json(json.dumps({"error": "no db"}).encode()); return
+
+        # POST /mgmt/astaroth  body={"question":"...","session_id":"..."} — sync
+        if parts == ["mgmt", "astaroth"]:
+            try:
+                req = json.loads(body)
+            except Exception:
+                self.send_error(400); return
+            question   = req.get("question", "").strip()
+            session_id = req.get("session_id", "")
+            if not question:
+                self.send_error(400); return
+            try:
+                from server.astaroth import consult_sync, is_enabled
+                if not is_enabled():
+                    self._json(json.dumps({"error": "Astaroth disabled — set enabled: true in engagement.yaml"}).encode()); return
+                context: dict = {}
+                if session_id and _ENGAGE_DB:
+                    try:
+                        sessions = [s for s in _ENGAGE_DB.get_sessions() if s["id"] == session_id]
+                        if sessions:
+                            context["session"] = sessions[0]
+                        with _C2_LOCK:
+                            live = _C2_SESSIONS.get(session_id, {})
+                            if live:
+                                context["live"] = {"last_seen": str(live.get("last_seen", "")), "stale": False}
+                        tasks   = _ENGAGE_DB.get_tasks(session_id)
+                        results = _ENGAGE_DB.get_results_for_session(session_id)
+                        rmap    = {r["task_id"]: r for r in results}
+                        outputs = [{"command": t["command"], "output": rmap[t["id"]]["output"]}
+                                   for t in tasks if t.get("command") and rmap.get(t["id"], {}).get("output")]
+                        context["recent_outputs"] = outputs[-6:]
+                        creds = []
+                        for t in tasks:
+                            if rmap.get(t["id"], {}).get("has_creds"):
+                                try:
+                                    creds.extend(json.loads(rmap[t["id"]].get("cred_hints") or "[]"))
+                                except Exception:
+                                    pass
+                        context["credentials"] = creds
+                        context["techniques"] = list({t.get("technique_id") for t in tasks if t.get("technique_id")})
+                    except Exception:
+                        pass
+                answer = consult_sync(question, context, session_id=session_id)
+                self._json(json.dumps({"answer": answer}).encode()); return
+            except Exception as e:
+                self._json(json.dumps({"error": str(e)}).encode()); return
 
         self.send_error(404)
 

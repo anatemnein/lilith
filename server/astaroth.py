@@ -195,6 +195,22 @@ def is_enabled() -> bool:
     return True
 
 
+def consult_sync(question: str, context: dict, session_id: str = "") -> str:
+    """Blocking version for CLI — collects all tokens and returns the full answer."""
+    tokens: list[str] = []
+    done   = [False]
+
+    def _collect(event: dict) -> None:
+        t = event.get("type", "")
+        if t == "ast_token":
+            tokens.append(event.get("token", ""))
+        elif t == "ast_done":
+            done[0] = True
+
+    consult_stream(question, context, "cli_sync", _collect, session_id=session_id)
+    return "".join(tokens)
+
+
 def consult_stream(question: str, context: dict, stream_id: str, publish,
                    session_id: str = "") -> None:
     """Stream tokens to all SSE clients via publish(event). Runs in a background thread."""
