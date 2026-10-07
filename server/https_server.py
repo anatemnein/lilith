@@ -314,18 +314,11 @@ def _auto_analyze_result(session_id: str, task_id: str, output: str, has_creds: 
             return
         _AUTO_ANALYZE_TS[session_id] = now
 
-    # Skip silently if neither Claude API nor Ollama is configured
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        try:
-            import urllib.request as _ur
-            ollama = os.environ.get("ASTAROTH_OLLAMA_URL", "http://localhost:11434")
-            _ur.urlopen(f"{ollama}/api/tags", timeout=0.5)
-        except Exception:
-            return
-
     import secrets as _sec, threading
     try:
-        from server.astaroth import consult_stream
+        from server.astaroth import consult_stream, is_enabled
+        if not is_enabled():
+            return
     except Exception:
         return
 

@@ -118,14 +118,35 @@ Rules:
 _SESSION_HISTORY: dict[str, list[dict]] = {}
 _HISTORY_MAX = 6  # max past exchanges kept per session
 
+_CFG: dict = {}
+
+
+def configure(cfg: dict) -> None:
+    """Load Astaroth config from the engagement yaml astaroth: block."""
+    global _CFG
+    _CFG = cfg or {}
+
+
+def is_enabled() -> bool:
+    """Return True if Astaroth is enabled and a backend is reachable/configured."""
+    if not _CFG.get("enabled", True):
+        return False
+    backend = _CFG.get("backend", "anthropic")
+    if backend == "disabled":
+        return False
+    return True
+
 
 def consult_stream(question: str, context: dict, stream_id: str, publish,
                    session_id: str = "") -> None:
     """Stream tokens to all SSE clients via publish(event). Runs in a background thread."""
     prompt  = _build_prompt(question, context)
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    backend = _CFG.get("backend", "anthropic")
+    api_key = (_CFG.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
     history = _SESSION_HISTORY.get(session_id, []) if session_id else []
-    if api_key:
+    if backend == "ollama":
+        answer = _stream_ollama(prompt, stream_id, publish)
+    elif api_key:
         answer = _stream_claude(prompt, api_key, stream_id, publish, history)
     else:
         answer = _stream_ollama(prompt, stream_id, publish)
@@ -195,8 +216,8 @@ def _build_prompt(question: str, ctx: dict) -> str:
 
 
 def _stream_ollama(prompt: str, stream_id: str, publish) -> str:
-    base  = os.environ.get("ASTAROTH_OLLAMA_URL",    "http://localhost:11434")
-    model = os.environ.get("ASTAROTH_OLLAMA_MODEL",  "mistral:7b-instruct-q4_K_M")
+    base  = _CFG.get("ollama_url")   or os.environ.get("ASTAROTH_OLLAMA_URL",   "http://localhost:11434")
+    model = _CFG.get("ollama_model") or os.environ.get("ASTAROTH_OLLAMA_MODEL", "mistral:7b-instruct-q4_K_M")
     body  = json.dumps({
         "model":  model,
         "prompt": _SYSTEM + "\n\n" + prompt,
@@ -234,7 +255,7 @@ def _stream_ollama(prompt: str, stream_id: str, publish) -> str:
 
 def _stream_claude(prompt: str, api_key: str, stream_id: str, publish,
                    history: list[dict] | None = None) -> str:
-    model    = os.environ.get("ASTAROTH_MODEL", "claude-sonnet-5")
+    model    = _CFG.get("model") or os.environ.get("ASTAROTH_MODEL", "claude-sonnet-5-5")
     messages = list(history or []) + [{"role": "user", "content": prompt}]
     body  = json.dumps({
         "model":      model,

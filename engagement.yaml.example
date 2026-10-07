@@ -33,6 +33,17 @@ injection_profile: RuntimeBroker.exe
 # Lower = safer (fewer ms exposed to scanner), but adds CPU overhead on each poll
 # config_decode_window_s: 0        # 0 = re-encrypt immediately after URL build (default)
 
+# Astaroth AI — proactive C2 analysis and operator chat assistant
+# backend: anthropic | ollama | disabled
+# api_key: leave blank to use ANTHROPIC_API_KEY env var instead
+astaroth:
+  enabled: true
+  backend: anthropic              # anthropic | ollama
+  api_key: ""                     # Anthropic API key; falls back to env ANTHROPIC_API_KEY
+  model: claude-sonnet-5-5        # Anthropic model ID
+  ollama_url: http://localhost:11434
+  ollama_model: mistral:7b-instruct-q4_K_M
+
 tools:
   SharpUp:
     params: "audit"

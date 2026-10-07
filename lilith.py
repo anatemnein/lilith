@@ -921,6 +921,15 @@ def cmd_serve(args, cfg, ws):
     if restored:
         print(f"[+] C2 sessions   : {restored} restored from DB")
     print(f"[+] Engagement DB : {db_path}")
+    try:
+        from server.astaroth import configure as _ast_configure
+        _ast_cfg = cfg.get("astaroth", {})
+        _ast_configure(_ast_cfg)
+        _ast_backend = _ast_cfg.get("backend", "anthropic")
+        _ast_on = _ast_cfg.get("enabled", True) and _ast_backend != "disabled"
+        print(f"[+] Astaroth      : {'enabled (' + _ast_backend + ')' if _ast_on else 'disabled'}")
+    except Exception:
+        pass
     start_server(
         workspace       = ws.directory,
         lhost           = "0.0.0.0",
