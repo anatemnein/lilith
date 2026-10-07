@@ -1198,10 +1198,11 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
 #astaroth-panel {
   position:fixed; right:0; top:38px; bottom:0; width:380px;
   background:var(--surf); border-left:1px solid var(--border);
-  display:none; flex-direction:column; z-index:50;
-  transform:translateX(100%); transition:transform .2s ease;
+  display:flex; flex-direction:column; z-index:50;
+  visibility:hidden; pointer-events:none;
+  transform:translateX(100%); transition:transform .2s ease, visibility 0s .2s;
 }
-#astaroth-panel.open { display:flex; transform:translateX(0); }
+#astaroth-panel.open { visibility:visible; pointer-events:auto; transform:translateX(0); transition:transform .2s ease, visibility 0s 0s; }
 #ast-hdr {
   padding:10px 14px; border-bottom:1px solid var(--border);
   display:flex; align-items:center; gap:8px; flex-shrink:0;
@@ -1458,7 +1459,7 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
                       display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <span style="color:var(--dim2)">TARGET SESSION:</span>
             <select id="ars-sess-sel" onchange="onArsSessChange()" style="
-                background:var(--surf2);color:var(--fg);border:1px solid var(--border);
+                background:var(--surf2);color:var(--text);border:1px solid var(--border);
                 padding:2px 6px;font-size:10px;font-family:inherit;cursor:pointer;flex:1;min-width:160px">
               <option value="">— select session —</option>
             </select>
@@ -1666,7 +1667,7 @@ input[type=text]:focus { outline:none; border-color:var(--red); }
             <div style="color:var(--dim)">Loading…</div>
           </div>
           <div id="admin-op-create" style="display:none;background:var(--surf2);border:1px solid var(--border);
-               border-radius:3px;padding:12px;display:flex;flex-direction:column;gap:8px">
+               border-radius:3px;padding:12px;flex-direction:column;gap:8px">
             <span style="font-size:9px;letter-spacing:.1em;color:var(--dim)">CREATE OPERATOR</span>
             <div style="display:grid;grid-template-columns:80px 1fr;gap:6px 10px;align-items:center;font-size:11px">
               <span style="color:var(--dim)">Username</span>
@@ -3311,14 +3312,14 @@ function tlAppend(type, text) {
 
 function tlColorLine(line) {
   if (/HASH|:aad3b435|:31d6cfe0|\$krb5|error|FAILED|ACCESS.DENIED|[-]$/i.test(line)) {
-    if (/\$krb5|\$DCC2|\$NT\$|:aad3b435/i.test(line)) return 'tl-hash';
-    if (/error|FAILED|ACCESS.DENIED/i.test(line)) return 'tl-err';
+    if (/\$krb5|\$DCC2|\$NT\$|:aad3b435/i.test(line)) return 'hash';
+    if (/error|FAILED|ACCESS.DENIED/i.test(line)) return 'err';
   }
-  if (/\[\+\]|pwned!|SUCCESS|STATUS_SUCCESS|[+]/i.test(line)) return 'tl-ok';
-  if (/\[!\]|CRITICAL|ERROR/i.test(line)) return 'tl-err';
-  if (/\[\*\]|INFO/i.test(line)) return 'tl-info';
-  if (/WARNING|WARN/i.test(line)) return 'tl-warn';
-  if (/\$krb5|\$DCC2|\$NT\$/i.test(line)) return 'tl-hash';
+  if (/\[\+\]|pwned!|SUCCESS|STATUS_SUCCESS|[+]/i.test(line)) return 'ok';
+  if (/\[!\]|CRITICAL|ERROR/i.test(line)) return 'err';
+  if (/\[\*\]|INFO/i.test(line)) return 'info';
+  if (/WARNING|WARN/i.test(line)) return 'warn';
+  if (/\$krb5|\$DCC2|\$NT\$/i.test(line)) return 'hash';
   return '';
 }
 
@@ -3353,7 +3354,7 @@ function _handleLateralSSE(ev) {
       break;
     case 'lat_line': {
       const cls = tlColorLine(ev.line);
-      tlAppend(cls || 'tl-base', ev.line);
+      tlAppend(cls || 'base', ev.line);
       if (ev.done) {
         document.getElementById('tools-status-dot').style.background =
           (ev.rc === 0) ? '#4ade80' : '#f87171';
