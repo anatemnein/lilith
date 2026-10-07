@@ -25,7 +25,6 @@ reverse_shell_example.md
 find_payload.txt
 
 # Third-party tool collections — users supply their own binaries after cloning
-# See README: "Binary not found for a tool" → place .exe in ./windows/ or ./potatoes/
+# See README: "Binary not found for a tool" → place .exe in ./windows/
 windows/
-potatoes/
 windows-binaries/
