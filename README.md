@@ -149,7 +149,9 @@ python3 lilith.py build --byovd \
 | `g++-mingw-w64-x86-64` | `apt install g++-mingw-w64-x86-64` (BYOVD kit) |
 | `donut` | `pip install donut-shellcode` |
 | `openssl` | `apt install openssl` |
-| `pefile` | `pip install pefile` — PE analysis for `lilith patch` |
+| `pefile` | included in `requirements.txt` — PE analysis + signature stripping |
+| `pycdlib` | included in `requirements.txt` — ISO creation for `--smuggle` |
+| `PyYAML` | included in `requirements.txt` — `engagement.yaml` parsing |
 | `dotnet` SDK 6+ | [dotnet.microsoft.com](https://dotnet.microsoft.com/download) — AMSI/inject DLL compilation |
 | `msfvenom` (optional) | raw shellcode payloads |
 
@@ -162,15 +164,52 @@ python3 lilith.py check
 
 ## Installation
 
+### Local attacker machine
+
 ```bash
 git clone <repo>
 cd lilith
 python3 -m venv env
 source env/bin/activate
-pip install donut-shellcode pyyaml pefile
+pip install -r requirements.txt
+pip install donut-shellcode     # optional — native PE → shellcode conversion
+```
+
+Place your offensive `.exe` binaries in `./windows/`:
+```
+windows/
+  Rubeus.exe
+  mimikatz.exe
+  SharpHound.exe
+  ...
 ```
 
 > Always activate the venv before running: `source env/bin/activate`
+
+### VPS deployment
+
+```bash
+# On your machine — push the repo
+git push origin master
+
+# On the VPS
+git clone <repo> ~/lilith
+cd ~/lilith
+python3 -m venv env
+source env/bin/activate
+pip install -r requirements.txt
+
+# Copy binaries (gitignored — transfer separately)
+rsync -av ./windows/ vps:~/lilith/windows/
+
+# Configure and build
+python3 lilith.py init
+nano engagement.yaml           # set lhost = VPS public IP
+python3 lilith.py build --all
+python3 lilith.py serve --port 443
+```
+
+> Run `lilith serve` behind a screen/tmux session on the VPS so it persists.
 
 ---
 
@@ -1174,6 +1213,38 @@ Commands are mapped to ATT&CK techniques at dispatch time. Examples:
 
 ---
 
+## Static signature eradicator
+
+Every `.exe` in the tool catalog is automatically stripped of static AV/EDR signatures before encoding — no manual intervention needed. The eradicator runs inside `build --tool` and `build --tools` / `build --all`.
+
+### What gets patched
+
+| Layer | What changes |
+|---|---|
+| **PE headers** | Rich header zeroed, `TimeDateStamp` randomised, section names randomised, debug directory pointer zeroed |
+| **Win32 version resource** | `ProductName`, `FileDescription`, `CompanyName`, all string table entries zeroed |
+| **RSDS debug records** | Embedded PDB path strings (e.g. `C:\Users\user\source\repos\Tool\...pdb`) zeroed — removes build-machine identity |
+| **Build/source paths** | Any `C:\Users\`, `/home/`, `C:\source\`, `C:\dev\`, etc. in the binary zeroed in-place |
+| **.NET #GUID heap** | Module MVID replaced with a random GUID per build |
+| **.NET #Strings heap** | Namespace tokens matching the tool name replaced in-place with a random same-length string (offsets unchanged) |
+| **.NET #US heap** | User-facing strings with tool name swept (UTF-16LE + ASCII, same length) |
+| **Go build ID** | `\xff Go build ID: "..."` field replaced with random hex of the same length |
+| **Binary sweep** | Toolname variants + catalog of 31 known-bad strings (`mimikatz`, `sekurlsa`, `SharpHound`, `Rubeus`, etc.) → random same-length alphanumeric |
+| **PE checksum** | Recalculated after all patches |
+
+All replacements are the **same byte length** as the original — no metadata offset fixup required.
+
+### Standalone use
+
+Patch a single binary outside of the encode pipeline:
+
+```bash
+python3 builders/pe_patcher.py windows/Rubeus.exe rubeus_clean.exe
+python3 builders/pe_patcher.py windows/mimikatz.exe mimi_clean.exe
+```
+
+---
+
 ## Known limitations
 
 | Area | Detail |
@@ -1204,7 +1275,7 @@ apt install gcc-mingw-w64
 ```
 
 **Binary not found for a tool (`✗` in `list`)**  
-Place the `.exe` in `./windows/` or `./potatoes/` inside the project directory.
+Place the `.exe` in `./windows/` inside the project directory.
 
 **Stager runs but nothing comes back**
 - Confirm `lhost` in `engagement.yaml` is reachable from the target — rebuild stagers after changing it
