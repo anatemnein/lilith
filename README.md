@@ -164,8 +164,33 @@ python3 lilith.py check
 
 ## Installation
 
-### Local attacker machine
+### Local attacker machine (Ubuntu 22.04+)
 
+**1. System dependencies**
+```bash
+sudo apt install -y \
+  gcc-mingw-w64 \
+  g++-mingw-w64-x86-64 \
+  openssl \
+  python3-pip \
+  python3-venv \
+  python3-dev
+```
+
+> Ubuntu 20.04: Python 3.10 is not included — install via `deadsnakes/ppa` first:
+> ```bash
+> sudo add-apt-repository ppa:deadsnakes/ppa
+> sudo apt install python3.10 python3.10-venv python3.10-dev
+> ```
+
+**2. .NET SDK** (required for AMSI bypass DLL + inject DLL compilation)
+```bash
+wget https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb
+sudo dpkg -i packages-microsoft-prod.deb
+sudo apt install -y dotnet-sdk-8.0
+```
+
+**3. Python environment**
 ```bash
 git clone <repo>
 cd lilith
@@ -175,7 +200,7 @@ pip install -r requirements.txt
 pip install donut-shellcode     # optional — native PE → shellcode conversion
 ```
 
-Place your offensive `.exe` binaries in `./windows/`:
+**4. Place your tool binaries in `./windows/`**
 ```
 windows/
   Rubeus.exe
@@ -184,23 +209,25 @@ windows/
   ...
 ```
 
+**5. Verify everything**
+```bash
+python3 lilith.py check
+```
+
 > Always activate the venv before running: `source env/bin/activate`
 
-### VPS deployment
+### VPS deployment (Ubuntu 22.04+)
 
 ```bash
-# On your machine — push the repo
-git push origin master
-
-# On the VPS
+# Same apt + dotnet steps as above, then:
 git clone <repo> ~/lilith
 cd ~/lilith
 python3 -m venv env
 source env/bin/activate
 pip install -r requirements.txt
 
-# Copy binaries (gitignored — transfer separately)
-rsync -av ./windows/ vps:~/lilith/windows/
+# Copy binaries (gitignored — transfer separately from your machine)
+rsync -av ./windows/ user@vps:~/lilith/windows/
 
 # Configure and build
 python3 lilith.py init
@@ -209,7 +236,7 @@ python3 lilith.py build --all
 python3 lilith.py serve --port 443
 ```
 
-> Run `lilith serve` behind a screen/tmux session on the VPS so it persists.
+> Run `lilith serve` inside a `tmux` or `screen` session so it persists after SSH disconnect.
 
 ---
 
