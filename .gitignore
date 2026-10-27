@@ -17,6 +17,10 @@ server.crt
 server.key
 byovd.exe
 
+# Presentation / proposal documents
+lilith_accenture*
+lilith_requirements*
+
 # Personal session notes — not part of the framework
 session.txt
 session2.txt
