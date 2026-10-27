@@ -17,6 +17,10 @@ server.crt
 server.key
 byovd.exe
 
+# Local dev tooling — machine-specific paths
+.mcp.json
+.claude/
+
 # Presentation / proposal documents
 lilith_accenture*
 lilith_requirements*
